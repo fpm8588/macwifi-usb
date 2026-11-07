@@ -8,7 +8,8 @@ because later phases port code from the AIC8800 Linux driver, which is GPL-2.0-o
 Files written from scratch for this project are **additionally** available under the MIT license
 (Copyright (c) 2026 fpm8588), so they can be reused elsewhere:
 `Sources/Shared/aic8800.h`, `Sources/Shared/aic_msg.[ch]`, `Sources/Shared/ieee80211.[ch]`,
-`Sources/Shared/wpa.[ch]`, `Sources/Shared/crypto_backend.c`, `Sources/macwifictl/*`, `Tests/*`, `build.sh`,
+`Sources/Shared/wpa.[ch]`, `Sources/Shared/crypto_backend.c`, `Sources/macwifictl/descdump.[ch]`,
+`Sources/macwifictl/main.c` (except `fwload`), `Tests/*`, `build.sh`,
 `scripts/*`.
 
 ## AIC8800 Linux driver (GPL-2.0-only)
@@ -18,7 +19,12 @@ names) come from github.com/shenmintao/aic8800d80 (derived from AICsemi's refere
 GPLv2 for the released source, see that repository's README and radxa-pkg/aic8800). Files ported from it in
 later phases keep their original copyright lines and are listed here:
 
-- (none yet)
+- `Sources/Shared/aic_fwload.h`, `Sources/Shared/aic_fwload.c`: from `aic_load_fw/aicbluetooth.c`
+  (`aicbt_patch_table_alloc`, `aicbt_patch_info_unpack`, `aicbt_patch_table_load`,
+  `rwnx_plat_bin_fw_upload_android`) and `aic_load_fw/aic_compat_8800d80.c` (`aicwf_patch_config_8800d80`,
+  `patch_tbl_d80`). Copyright (C) AICSemi 2018-2020. GPL-2.0-only.
+- The `fwload` command in `Sources/macwifictl/main.c` follows `aicfw_download_fw_8800d80` and
+  `system_config_8800d80`; that part of the file is GPL-2.0-only.
 
 ## Firmware
 

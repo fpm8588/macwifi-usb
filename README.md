@@ -16,27 +16,39 @@ in its own menu bar app; it won't appear in the system Wi-Fi menu. Background an
 
 | Phase | What | State |
 |---|---|---|
-| 1 | `macwifictl`: find the adapter, switch it out of driver-CD mode, read the chip revision through the ROM; message framing + WPA2 crypto + 802.11 parsing libraries with tests | Code done; **needs a run on the adapter** |
-| 2 | Firmware upload, FullMAC bring-up, MAC address | Next |
+| 1 | `macwifictl`: find the adapter, switch it out of driver-CD mode, read the chip revision through the ROM; message framing + WPA2 crypto + 802.11 parsing libraries with tests | **Passed on the adapter** (2026-11-07) |
+| 2a | `macwifictl fwload`: upload the ROM patches and Wi-Fi firmware, start it | Code done; **needs a run on the adapter** |
+| 2b | FullMAC bring-up, MAC address | Next |
 | 3 | Scan, connect, WPA2-PSK handshake, data path | Planned |
 | 4 | macOS networking via a feth (virtual Ethernet) pair | Planned |
 | 5 | LaunchDaemon, menu bar app, installer | Planned |
 
-The phase-by-phase plan, written as a Claude Code prompt: [docs/PROMPT.md](docs/PROMPT.md).
+The phase-by-phase plan, written as a Claude Code prompt: [docs/PROMPT.md](docs/PROMPT.md). Results from the
+real adapter: [docs/HARDWARE_LOG.md](docs/HARDWARE_LOG.md).
 
-## Try Phase 1
+## Try it
+
+Install the free Xcode Command Line Tools once with `xcode-select --install`. Then paste this (it has no
+comments, so it pastes cleanly into zsh):
 
 ```bash
-xcode-select --install          # once, free
 git clone https://github.com/fpm8588/macwifi-usb.git && cd macwifi-usb
-./build.sh test                 # hardware-free tests
-./build.sh cli
-build/macwifictl list           # should show a69c:5723 in driver-CD mode
-build/macwifictl modeswitch     # ejects the virtual driver disc -> Wi-Fi mode
-build/macwifictl list           # note the new USB ID
-build/macwifictl info           # endpoints of the Wi-Fi interface
-build/macwifictl identify       # reads the chip revision through the chip's ROM
+./build.sh test && ./build.sh cli
+scripts/fetch-firmware.sh
+build/macwifictl modeswitch
+build/macwifictl fwload
 ```
+
+What each command does:
+
+- `./build.sh test` runs the hardware-free tests; `./build.sh cli` builds `build/macwifictl` (arm64).
+- `scripts/fetch-firmware.sh` downloads AICsemi's firmware into `firmware/` (not part of this repository) from a
+  pinned commit of the Linux driver and checks every file's SHA-256.
+- `macwifictl modeswitch` ejects the adapter's virtual driver CD, which switches it to Wi-Fi mode (`a69c:8d80`).
+  Needed after every plug-in.
+- `macwifictl fwload` uploads the firmware to the adapter's RAM and starts it; the adapter then reconnects as
+  `a69c:8d81`. Nothing is written to the adapter's flash; unplugging it returns it to factory state.
+- Also: `list` (find the adapter), `info` (USB descriptors), `identify` (chip revision through the ROM).
 
 If anything looks off, rerun with `MACWIFI_DEBUG=1` in front of the command to see every USB transfer.
 

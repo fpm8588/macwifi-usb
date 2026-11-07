@@ -51,7 +51,7 @@ Tests/              unit tests and recorded fixtures
 docs/               RESEARCH.md, PROMPT.md, HARDWARE_LOG.md
 ```
 
-## Phase 1: reach the chip (code written; run it on the adapter)
+## Phase 1: reach the chip (PASSED on the adapter 2026-11-07, see HARDWARE_LOG.md)
 
 | Step | Command | Expected |
 |---|---|---|
@@ -60,7 +60,7 @@ docs/               RESEARCH.md, PROMPT.md, HARDWARE_LOG.md
 | 3 | `build/macwifictl info` | mass-storage interface (class 0x08) |
 | 4 | `build/macwifictl modeswitch` | "Switched: … Wi-Fi mode" (expected `a69c:8d80` or `8d81`) |
 | 5 | `build/macwifictl list` and `build/macwifictl info` | Wi-Fi mode; vendor-class (0xFF) interface with bulk IN/OUT endpoints. **Record the IDs and endpoints.** |
-| 6 | `build/macwifictl identify` | `[0x40500000]` → chip revision (U02 = 0x03 expected for D80), sub-revision; "ROM answered" |
+| 6 | `build/macwifictl identify` | `[0x40500000]` → chip revision (the user's adapter: 0x07 = U03), sub-revision; "ROM answered" |
 
 If step 4 fails (macOS doesn't create a disk, or eject doesn't switch): try Finder's eject; then try sending
 the SCSI START STOP UNIT (eject) command directly over the mass-storage interface's bulk endpoints (a 31-byte
@@ -70,22 +70,39 @@ endpoint layout than Linux expects, record it before changing code.
 
 ## Phase 2: load the firmware
 
-Port `aicfw_download_fw_8800d80` (`aic_load_fw/aic_compat_8800d80.c`) and what it calls:
+### 2a: upload and start (code written; run it on the adapter)
 
-1. `macwifictl fwload` (as root isn't needed for USB): `system_config` writes for the chip revision
-   (`aicwf_usb.c` `system_config_8800*` / D80 equivalents); parse `fw_patch_table_8800d80_u02.bin`
-   (`aicbt_patch_table_alloc` / `aicbt_patch_info_unpack`, pure parser with unit tests against the real file's
-   SHA-256-pinned layout); upload ADID, patch, ext patch (`aicbt_ext_patch_data_load`), patch-table entries
-   (`aicbt_patch_table_load`), then `fmacfw_8800d80_u02.bin` (or the `_h_` variant per `IS_CHIP_ID_H()`), all
-   via `DBG_MEM_BLOCK_WRITE` in 1 KiB chunks with CFM checks (`rwnx_plat_bin_fw_upload_android`);
-   `aicwf_patch_config_8800d80`; `DBG_START_APP` (`HOST_START_APP_AUTO`).
-2. After start-app the device may **re-enumerate**: handle reopening (Linux splits this into the `aic_load_fw`
-   and `aic8800_fdrv` modules).
-3. FullMAC bring-up, from `aic8800_fdrv/rwnx_main.c` (`rwnx_platform_on` area, ~lines 9000-9430):
+Ported from `aicfw_download_fw_8800d80` (`aic_load_fw/aic_compat_8800d80.c`) and what it calls. Pure logic in
+`Sources/Shared/aic_fwload.[ch]` (patch-table parser, its register writes with the D80 BT-mode values,
+`aicwf_patch_config_8800d80` writes, 1 KiB chunking), tested in `Tests/test_fwload.c`, including against the
+real pinned firmware in CI. I/O in `macwifictl fwload`:
+
+1. `system_config_8800d80`: read `[0x40500000]`; U02/U03 only; if bit 25 is clear set bit 0 of `0x40100020`.
+2. Parse `fw_patch_table_8800d80_u02.bin`; its INF record gives the ADID/patch addresses and the ext patches.
+3. Upload ADID, patch, ext patches (`DBG_MEM_BLOCK_WRITE`, CFM per chunk), then the patch-table writes
+   (`DBG_MEM_WRITE`, 100 ms after the power-on record).
+4. Upload `fmacfw_8800d80_u02.bin` (or `_h_` per `IS_CHIP_ID_H()`) to 0x120000.
+5. Read version / config base / patch struct / patch buffer back from the image (must equal the file, else stop
+   before starting), then the 14 patch-config writes.
+6. `DBG_START_APP(0x120000, AUTO)`: no confirmation; watch for re-enumeration.
+
+| Step | Command | Expected |
+|---|---|---|
+| 1 | `scripts/fetch-firmware.sh` | "OK: firmware in firmware/aic8800D80" |
+| 2 | `build/macwifictl modeswitch` | `a69c:8d80` |
+| 3 | `build/macwifictl fwload` | each upload "ok"; "read-back matches the file"; "came back as a69c:8d81"; descriptors of the new device. **Record the 8d81 interfaces and endpoints** (Linux uses a second bulk OUT for messages on 8d81, and may expose a BT interface). |
+
+If it fails, rerun with `MACWIFI_DEBUG=1` and record the last transfers. If the adapter comes back with another
+ID, add it to `kAicIds` with a hardware-log citation.
+
+### 2b: FullMAC bring-up (next)
+
+1. Open `a69c:8d81` (pick the vendor interface the Linux fdrv binds; messages on the second bulk OUT if present).
+2. FullMAC bring-up, from `aic8800_fdrv/rwnx_main.c` (`rwnx_platform_on` area, ~lines 9000-9430):
    D80 RF config (`aicwf_set_rf_config_8800d80`: txpwr lvl v3, lvl adj, ofst2x, `rf_calib`), userconfig file
    (`aic_userconfig_8800d80.txt` → `rwnx_cfgfile.c`), `MM_GET_MAC_ADDR` (eFuse MAC), `MM_RESET`, `ME_CONFIG`,
    `ME_CHAN_CONFIG` (country code; default "00"/world-safe), `MM_START`, `MM_ADD_IF` (station).
-   → **Checkpoint: `macwifictl fwload` prints the firmware version and the MAC address printed on your adapter.**
+   → **Checkpoint: `macwifictl up` (fwload + bring-up) prints the MAC address printed on your adapter.**
 
 ## Phase 3: scan and connect
 

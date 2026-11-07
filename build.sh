@@ -27,13 +27,20 @@ run_tests() {
     "$B/test_aic"
     $cc "${CFLAGS[@]}" -I Sources/macwifictl Tests/test_descdump.c Sources/macwifictl/descdump.c -o "$B/test_descdump"
     "$B/test_descdump" > /dev/null && echo "descdump: OK"
+    $cc "${CFLAGS[@]}" Tests/test_fwload.c "$S/aic_fwload.c" "$S/aic_msg.c" -o "$B/test_fwload"
+    # With the firmware downloaded (scripts/fetch-firmware.sh), also check the loader against the real files.
+    if [[ -f firmware/aic8800D80/fw_patch_table_8800d80_u02.bin ]]; then
+        "$B/test_fwload" firmware/aic8800D80
+    else
+        "$B/test_fwload"
+    fi
 }
 
 build_cli() {
     [[ "$(uname)" == "Darwin" ]] || { echo "macwifictl needs macOS (IOKit)"; exit 1; }
     echo "== macwifictl (arm64)"
     clang "${CFLAGS[@]}" -arch arm64 -mmacosx-version-min=$MINOS -Wno-deprecated-declarations \
-        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c "$S/aic_msg.c" \
+        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c "$S/aic_msg.c" "$S/aic_fwload.c" \
         -framework IOKit -framework CoreFoundation -o "$B/macwifictl"
     codesign --force --sign - "$B/macwifictl"
     file "$B/macwifictl"

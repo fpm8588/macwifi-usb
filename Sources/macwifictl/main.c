@@ -21,10 +21,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include "aic8800.h"
+#include "aic_fwload.h"
 #include "aic_msg.h"
 #include "descdump.h"
 
@@ -34,12 +36,13 @@ typedef IOUSBDeviceInterface320 **Dev;
 typedef IOUSBInterfaceInterface300 **Intf;
 
 static int gDebug = 0;
+static size_t gDumpLimit = 256;   // bytes shown per transfer with MACWIFI_DEBUG=1 (lowered during uploads)
 
 static void hexdump(const char *tag, const uint8_t *p, size_t n) {
     if (!gDebug) return;
     fprintf(stderr, "%s (%zu bytes):", tag, n);
-    for (size_t i = 0; i < n && i < 256; i++) fprintf(stderr, "%s%02x", (i % 16) ? " " : "\n  ", p[i]);
-    fprintf(stderr, "%s\n", n > 256 ? "\n  ..." : "");
+    for (size_t i = 0; i < n && i < gDumpLimit; i++) fprintf(stderr, "%s%02x", (i % 16) ? " " : "\n  ", p[i]);
+    fprintf(stderr, "%s\n", n > gDumpLimit ? "\n  ..." : "");
 }
 
 // ---------------------------------------------------------------- enumeration
@@ -418,8 +421,247 @@ static int cmd_identify(void) {
     return 0;
 }
 
+
+// ---------------------------------------------------------------- Phase 2: firmware upload
+
+static double now_s(void) {
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (double)tv.tv_sec + tv.tv_usec / 1e6;
+}
+
+static uint8_t *read_file(const char *dir, const char *name, size_t *len) {
+    char path[1024];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    FILE *f = fopen(path, "rb");
+    if (!f) { fprintf(stderr, "Missing firmware file %s\n", path); return NULL; }
+    fseek(f, 0, SEEK_END);
+    long n = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    uint8_t *b = (n > 0 && n < 16 * 1024 * 1024) ? malloc((size_t)n) : NULL;
+    if (!b || fread(b, 1, (size_t)n, f) != (size_t)n) {
+        fprintf(stderr, "Could not read %s\n", path);
+        free(b);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *len = (size_t)n;
+    return b;
+}
+
+// rwnx_plat_bin_fw_upload_android: DBG_MEM_BLOCK_WRITE in 1 KiB chunks, each confirmed by the ROM.
+static int upload(Link *l, const char *dir, const char *name, uint32_t addr) {
+    size_t len = 0;
+    uint8_t *data = read_file(dir, name, &len);
+    if (!data) return -1;
+    printf("  %-32s %7zu bytes -> 0x%08x ", name, len, addr);
+    fflush(stdout);
+    double t0 = now_s();
+    size_t saved = gDumpLimit;
+    gDumpLimit = 32;
+    uint8_t cmd[16 + 8 + AIC_BLOCK_WRITE_MAX];
+    int rc = 0;
+    uint32_t chunks = 0;
+    for (uint32_t off = 0, c; (c = aic_upload_chunk((uint32_t)len, off)) != 0; off += c, chunks++) {
+        size_t n = aic_build_block_write(cmd, sizeof cmd, addr + off, data + off, c);
+        if (!n || link_send(l, cmd, n) || link_wait_msg(l, AIC_DBG_MEM_BLOCK_WRITE_CFM, NULL, 0, NULL, 2000)) {
+            fprintf(stderr, "\nUpload of %s failed at offset %u (address 0x%08x).\n", name, off, addr + off);
+            rc = -1;
+            break;
+        }
+        if (chunks % 32 == 31) { putchar('.'); fflush(stdout); }
+    }
+    gDumpLimit = saved;
+    if (!rc) printf(" ok (%u chunks, %.1f s)\n", chunks, now_s() - t0);
+    free(data);
+    return rc;
+}
+
+static int write_ops(Link *l, const AicMemOp *ops, int n) {
+    for (int i = 0; i < n; i++) {
+        if (mem_write(l, ops[i].addr, ops[i].value)) {
+            fprintf(stderr, "Write [0x%08x] <- 0x%08x failed.\n", ops[i].addr, ops[i].value);
+            return -1;
+        }
+        if (ops[i].delay_ms_after) usleep(ops[i].delay_ms_after * 1000);
+    }
+    return 0;
+}
+
+// Reads a word of the uploaded image and checks it against the file, so a bad upload stops before START_APP.
+static int read_check(Link *l, const uint8_t *img, size_t img_len, uint32_t ofs, uint32_t *val) {
+    if (mem_read(l, AIC_D80_RAM_FMAC_FW_ADDR + ofs, val)) return -1;
+    if (ofs + 4 <= img_len && aic_le32(img + ofs) != *val) {
+        fprintf(stderr, "Read-back mismatch at 0x%08x: chip has 0x%08x, file has 0x%08x. Not starting firmware.\n",
+                AIC_D80_RAM_FMAC_FW_ADDR + ofs, *val, aic_le32(img + ofs));
+        return -1;
+    }
+    return 0;
+}
+
+static const char *fw_dir(int argc, char **argv) {
+    for (int i = 2; i + 1 < argc; i++)
+        if (!strcmp(argv[i], "--fw")) return argv[i + 1];
+    const char *e = getenv("MACWIFI_FW");
+    return (e && *e) ? e : "firmware/aic8800D80";
+}
+
+static int fwload_steps(Link *l, const char *dir) {
+    // 1. Chip revision and system config (system_config_8800d80).
+    uint32_t chip = 0;
+    if (mem_read(l, AIC_ADDR_CHIP_ID, &chip)) return 1;
+    uint8_t rev = (uint8_t)(chip >> 16);
+    int h = (rev & AIC_D80_CHIP_ID_H_MASK) == AIC_D80_CHIP_ID_H_MASK;
+    int mcu = ((chip >> AIC_D80_MCU_BIT) & 1u) == 0;
+    printf("Chip: [0x%08x] = 0x%08x -> revision 0x%02x (%s)%s%s\n", AIC_ADDR_CHIP_ID, chip, rev, aic_chip_rev_name(rev),
+           h ? ", H variant" : "", mcu ? ", MCU id" : "");
+    if (rev != AIC_CHIP_REV_U02 && rev != AIC_CHIP_REV_U03) {
+        fprintf(stderr, "Only U02/U03 AIC8800D80 chips are supported so far (the _u02 firmware set). Record this in\n"
+                        "docs/HARDWARE_LOG.md.\n");
+        return 1;
+    }
+    if (mcu) {
+        uint32_t v = 0;
+        if (mem_read(l, AIC_D80_CACHE_CTRL_ADDR, &v) || mem_write(l, AIC_D80_CACHE_CTRL_ADDR, v | 1u)) return 1;
+        printf("System config: [0x%08x] 0x%08x -> 0x%08x\n", AIC_D80_CACHE_CTRL_ADDR, v, v | 1u);
+    }
+
+    // 2. Patch table.
+    size_t tlen = 0;
+    uint8_t *table = read_file(dir, AIC_D80_FW_PATCH_TABLE, &tlen);
+    if (!table) return 4;
+    AicPatchTable pt;
+    if (aic_pt_parse(table, tlen, AIC_D80_RAM_ADID_ADDR, AIC_D80_RAM_PATCH_ADDR, &pt)) {
+        fprintf(stderr, "%s is not a valid patch table.\n", AIC_D80_FW_PATCH_TABLE);
+        free(table);
+        return 4;
+    }
+    printf("Patch table: %d records, ADID -> 0x%08x, patch -> 0x%08x, %u ext patch(es), version \"%s\"\n", pt.n,
+           pt.addr_adid, pt.addr_patch, pt.ext_patch_nb, pt.version);
+
+    // 3. ROM patches.
+    printf("Uploading:\n");
+    int rc = 1;
+    AicMemOp ops[512];
+    int nops = 0;
+    if (upload(l, dir, AIC_D80_FW_ADID, pt.addr_adid) || upload(l, dir, AIC_D80_FW_PATCH, pt.addr_patch)) goto out;
+    for (uint32_t i = 0; i < pt.ext_patch_nb; i++) {
+        uint32_t id = 0, addr = 0;
+        char name[64];
+        if (aic_pt_ext_patch(&pt, i, &id, &addr)) goto out;
+        snprintf(name, sizeof name, AIC_D80_FW_PATCH_EXT_FMT, id);
+        if (upload(l, dir, name, addr)) goto out;
+    }
+    nops = aic_pt_writes(&pt, ops, sizeof ops / sizeof ops[0]);
+    if (nops < 0) { fprintf(stderr, "Patch table has an unexpected BT-mode record.\n"); goto out; }
+    printf("  patch table: %d register writes ", nops);
+    fflush(stdout);
+    if (write_ops(l, ops, nops)) goto out;
+    printf("ok\n");
+
+    // 4. Wi-Fi firmware.
+    const char *fmac = h ? AIC_D80_FMACFW_H : AIC_D80_FMACFW;
+    if (upload(l, dir, fmac, AIC_D80_RAM_FMAC_FW_ADDR)) goto out;
+
+    // 5. Patch config (aicwf_patch_config_8800d80), reading pointers back from the uploaded image.
+    {
+        size_t ilen = 0;
+        uint8_t *img = read_file(dir, fmac, &ilen);
+        if (!img) goto out;
+        uint32_t version = 0, config_base = 0, patch_str = 0, patch_buff = 0;
+        int bad = read_check(l, img, ilen, AIC_D80_FW_OFS_VERSION, &version) ||
+                  read_check(l, img, ilen, AIC_D80_FW_OFS_CONFIG_BASE, &config_base) ||
+                  read_check(l, img, ilen, AIC_D80_FW_OFS_PATCH_STR, &patch_str) ||
+                  (aic_d80_needs_patch_buff(version) &&
+                   read_check(l, img, ilen, AIC_D80_FW_OFS_PATCH_BUFF, &patch_buff));
+        free(img);
+        if (bad) goto out;
+        printf("Firmware version 0x%08x (%u.%u.%u.%u); read-back matches the file.\n", version, version >> 24,
+               (version >> 16) & 0xff, (version >> 8) & 0xff, version & 0xff);
+        nops = aic_d80_patch_config_writes(config_base, patch_str, version, patch_buff, ops, sizeof ops / sizeof ops[0]);
+        if (nops < 0 || write_ops(l, ops, nops)) goto out;
+        printf("Patch config: %d writes (config base 0x%08x, patch struct 0x%08x, pairs at 0x%08x)\n", nops,
+               config_base, patch_str, ops[2].value);
+    }
+
+    // 6. Start the firmware. The ROM does not confirm this; the chip reboots into the firmware.
+    {
+        uint8_t cmd[64];
+        size_t n = aic_build_start_app(cmd, sizeof cmd, AIC_D80_RAM_FMAC_FW_ADDR, AIC_HOST_START_APP_AUTO);
+        if (!n) goto out;
+        // The chip may reset before the transfer completes, so a send error here is not a failure by itself;
+        // the re-enumeration check below decides.
+        if (link_send(l, cmd, n)) printf("START_APP sent; the adapter dropped the transfer (it may be restarting).\n");
+        else printf("START_APP sent (boot 0x%08x).\n", AIC_D80_RAM_FMAC_FW_ADDR);
+    }
+    rc = 0;
+out:
+    free(table);
+    return rc;
+}
+
+static int cmd_fwload(int argc, char **argv) {
+    const char *dir = fw_dir(argc, argv);
+    char probe[1024];
+    snprintf(probe, sizeof probe, "%s/%s", dir, AIC_D80_FW_PATCH_TABLE);
+    if (access(probe, R_OK) != 0) {
+        fprintf(stderr, "Firmware not found in %s. Run scripts/fetch-firmware.sh first (or pass --fw DIR).\n", dir);
+        return 4;
+    }
+    const AicId *id = NULL;
+    io_service_t svc = find_adapter(AIC_MODE_WIFI, &id);
+    if (svc) {
+        IOObjectRelease(svc);
+        if (id->pid == AIC_PID_D80_FW) {
+            printf("The adapter is already running firmware (a69c:8d81). To start over, unplug it, plug it back in and\n"
+                   "run `macwifictl modeswitch` again.\n");
+            return 0;
+        }
+        if (id->pid != AIC_PID_D80_ROM) {
+            fprintf(stderr, "fwload supports the AIC8800D80 (a69c:8d80) only; found %s.\n", id->name);
+            return 1;
+        }
+    }
+    Link l;
+    int rc = link_open(&l);
+    if (rc) return rc;
+    double t0 = now_s();
+    rc = fwload_steps(&l, dir);
+    link_close(&l);
+    if (rc) {
+        fprintf(stderr, "Firmware load stopped. Unplug and replug the adapter to reset it (then `modeswitch`).\n");
+        return rc;
+    }
+
+    // 7. Watch the adapter re-enumerate. Linux expects it back as a69c:8d81 (see aic8800.h).
+    printf("Waiting for the adapter to restart with its firmware");
+    fflush(stdout);
+    int gone = 0;
+    for (int i = 0; i < 40; i++) {
+        usleep(250 * 1000);
+        const AicId *now = NULL;
+        io_service_t s = find_adapter(AIC_MODE_NONE, &now);
+        if (s) IOObjectRelease(s);
+        if (!s || now->pid != AIC_PID_D80_ROM) gone = 1;
+        if (s && now->pid != AIC_PID_D80_ROM) {
+            printf("\nThe adapter came back as %04x:%04x (%s) %.1f s after the upload started.\n", now->vid, now->pid,
+                   now->name, now_s() - t0);
+            printf("\n");
+            cmd_info();
+            printf("\nPhase 2a hardware check %s.\n", now->pid == AIC_PID_D80_FW ? "passed" : "finished (unexpected ID: record it)");
+            return now->pid == AIC_PID_D80_FW ? 0 : 1;
+        }
+        if (i % 4 == 3) { putchar('.'); fflush(stdout); }
+    }
+    printf("\n%s\n", gone ? "The adapter disconnected and has not come back within 10 s. Run `macwifictl list --all`."
+                          : "The adapter is still a69c:8d80 after 10 s (no restart seen). Run `macwifictl list --all`.");
+    return 1;
+}
+
 static void usage(void) {
-    fprintf(stderr, "usage: macwifictl list [--all] | modeswitch | info | identify | memr <addr> | memw <addr> <val>\n"
+    fprintf(stderr, "usage: macwifictl list [--all] | modeswitch | info | identify | fwload [--fw DIR] | memr <addr> |\n"
+                    "       memw <addr> <val>\n"
                     "Supported: AICsemi AIC8800 family, e.g. UGREEN AX900 (CM762). MACWIFI_DEBUG=1 dumps USB traffic.\n");
 }
 
@@ -431,6 +673,7 @@ int main(int argc, char **argv) {
     if (!strcmp(c, "info")) return cmd_info();
     if (!strcmp(c, "modeswitch")) return cmd_modeswitch();
     if (!strcmp(c, "identify")) return cmd_identify();
+    if (!strcmp(c, "fwload")) return cmd_fwload(argc, argv);
     if ((!strcmp(c, "memr") && argc > 2) || (!strcmp(c, "memw") && argc > 3)) {
         Link l;
         int rc = link_open(&l);
