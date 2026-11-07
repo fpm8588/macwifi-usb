@@ -1,125 +1,128 @@
-# A $0 USB Wi-Fi driver for Apple Silicon on macOS 27 Golden Gate
+# A $0 driver for the UGREEN AX900 (AICsemi AIC8800) on Apple Silicon, macOS 27 Golden Gate
 
 Research date: 7 November 2026. Claims were checked against primary sources: Apple developer documentation,
-Linux kernel driver source, the source and READMEs of the existing projects named below, and reference
-cryptographic vectors computed independently. Sources are listed at the end.
+the AIC8800 Linux driver source and udev rules, the source and READMEs of the projects named below, your own
+System Information output, and cryptographic reference vectors. Sources are at the end.
 
 ---
 
-## 1. Why there are no USB Wi-Fi dongle drivers for Apple Silicon Macs
+## 1. Your adapter
 
-| Route | Status on Apple Silicon | Why |
+| Field (System Information) | Value | Meaning |
 |---|---|---|
-| Vendor kernel extensions (e.g. the Realtek packages) | **Don't work** | chris1111's Wireless-USB-Big-Sur-Adapter (Realtek, up to Tahoe) says outright that it only works on Intel Macs. Third-party kexts on Apple Silicon also need Reduced Security. |
-| Apple's DriverKit (NetworkingDriverKit) | **No Wi-Fi support** | Apple's documentation: "Ethernet is the only networking interface currently supported by NetworkingDriverKit." DriverKit also needs a paid developer account in practice. |
-| macOS's own Wi-Fi stack (Wi-Fi menu, `airportd`, IO80211 family) | **Closed to third parties** | Private Apple frameworks, used only by Apple's own Wi-Fi hardware. Hackintosh projects (itlwm, AirportMtkWlan) hook into it with **kexts on Intel PCs**, not Apple Silicon. |
-| **User-space driver** (USB from an ordinary program, network via a virtual interface) | **Works, $0** | Proven for the MT7601U on Apple Silicon (see §2). No kext, no DriverKit, no SIP change. Needs a root helper for the network plumbing. |
+| Name / manufacturer | "Aic MSC" / aicsemi | AICsemi chip, **mass-storage ("driver CD") mode** |
+| USB ID | `a69c:5723` | Listed in the Linux driver's udev rules as an AIC8800 driver-CD ID; UGREEN's own Linux installer for the **CM762 AX900** switches exactly this ID |
+| Product version | `0x0200` | bcdDevice 2.00 |
+| Link speed | 480 Mb/s | USB 2.0 high speed (what the chip needs) |
 
-So a $0 driver can do everything **except appear in the Wi-Fi menu**. It shows up as a network interface (like
-Ethernet), and you pick networks in its own menu bar app. Built-in Wi-Fi, AirDrop and Continuity keep running on
-the Mac's own Wi-Fi hardware, untouched.
+UGREEN sells the "AX900" with more than one chip. Yours is the **AIC8800 family**: UGREEN's 2025 CM762 Linux
+package is `aic8800d80fdrvpackage`, and other AX900 units report as Realtek RTL8851BU (`0bda:b851`).
 
-## 2. Prior art (all open source)
+**Two modes.** It first appears as a small virtual CD holding the Windows driver. Linux's rules switch it by
+**ejecting** that disc, after which it re-enumerates as the Wi-Fi device, expected to be `a69c:8d80`
+(AIC8800D80) or `a69c:8d81`. `macwifictl modeswitch` does this with `diskutil eject`. The Wi-Fi-mode ID still
+has to be confirmed on your unit.
 
-| Project | Chip | What it proves | License |
-|---|---|---|---|
-| **mt7601u-macos** (ZemichaelMD, Rust) | MT7601U, 2.4 GHz 802.11n 150 Mbps | **The whole chain on Apple Silicon:** firmware, scan, association, WPA2 4-way handshake, a real DHCP lease, ARP and ping to 8.8.8.8, verified on hardware 16 Oct 2026. Hands IP to macOS through a `utun` tunnel and a root helper. | MIT OR Apache-2.0 |
-| **userspace-wifi** (dragorn, Kismet's author) | mt76x2u, mt7921u/mt7925u, rtw88, MM8108 | The real Linux drivers compiled into user space on libusb. On macOS: capture and transmit. On Linux, driven by a full stack (mac80211_hwsim): **mt76x2u scans, connects with WPA2 and passes IP traffic**; **mt7921u/mt7925u can't**, because their firmware doesn't ACK frames in that mode so authentication times out. | GPL-2 |
-| **mt76-usb-macos** (Network-Weather) | MT7921U, MT7925U | Monitor-mode capture on macOS, including a pure-C IOKit variant with no dependencies | (see repo) |
-| Kismet "USB userspace" source | mt76 + rtw88 | Monitor capture on macOS with no kext/VM; ships the linux-firmware blobs | GPL-2 |
-| Wireless-USB-Big-Sur-Adapter (chris1111) | Realtek 8811/8812 etc. | Intel Macs only | (see repo) |
-| itlwm / AirportMtkWlan / SimpleMtkWlan / mt76wm | Intel / MediaTek **PCIe** | Native Wi-Fi menu via kexts on Intel hackintoshes; not USB, not Apple Silicon | GPL-2 / various |
+## 2. Why nothing works on Apple Silicon today
 
-## 3. Choosing the chipset
+| Route | Status | Why |
+|---|---|---|
+| Vendor macOS drivers | **None for Apple Silicon** | AICsemi/UGREEN ship Windows and Linux drivers only |
+| Kernel extensions | **Dead end** | Need Reduced Security on Apple Silicon; the existing Wi-Fi kexts (Realtek USB, itlwm, AirportMtkWlan) are Intel-only |
+| DriverKit (NetworkingDriverKit) | **No Wi-Fi support** | Apple: "Ethernet is the only networking interface currently supported by NetworkingDriverKit." DriverKit also needs a paid account in practice |
+| macOS Wi-Fi menu (IO80211 family) | **Closed** | Private to Apple's own Wi-Fi hardware |
+| **User-space driver + virtual Ethernet interface** | **Works, $0** | Proven on Apple Silicon by mt7601u-macos (full WPA2 → DHCP → internet, verified on hardware 16 Oct 2026) |
 
-You said you'd use whatever chip it takes, so the choice optimizes for **odds of success × usefulness**:
+So the driver shows up as a **network interface**, not in the Wi-Fi menu, and you choose networks in its own
+menu bar app. Built-in Wi-Fi, AirDrop and Continuity are untouched.
 
-| Chip | Bands / speed | Station mode from user space | Reference driver | Verdict |
-|---|---|---|---|---|
-| **MediaTek MT7612U** (mt76x2u) | 2.4 + 5 GHz, 802.11ac 2×2 (867 Mbps PHY) | **Yes**: proven with WPA2 + IP by userspace-wifi | Linux mt76, **BSD-3-Clause-Clear** (permissive) | **Chosen** |
-| MediaTek MT7601U | 2.4 GHz only, 150 Mbps | Yes, already working on Apple Silicon | mt7601u-macos (MIT) | **Budget fallback**: buy one and run the existing project today |
-| MediaTek MT7921AU / MT7925U | Wi-Fi 6/6E/7 | **No**: firmware offload blocks association in user space (per userspace-wifi) | mt76 | Avoid for now |
-| Realtek RTL8812AU/8814AU (rtw88) | 2.4 + 5 GHz ac | Yes for 8814AU via hwsim | rtw88 (Linux) | Possible, but the driver is far bigger and messier |
+## 3. Why the AIC8800 is a good fit for a user-space driver
 
-Why the MT7612U wins: its MAC is **host-controlled** (register tables, TXWI/RXWI descriptors, WCID and key tables,
-the same mt76x02 design family as the MT7601U that's already working), the firmware is small, Linux support is
-mature, and the license lets us port code directly with attribution.
+The AIC8800 is a **FullMAC** chip (its Linux driver, `aic8800_fdrv`, descends from the CEVA RivieraWaves
+"rwnx" FullMAC design):
 
-**What to buy:** any adapter that `macwifictl list --all` identifies as one of the IDs in
-`Sources/Shared/mt76x2u.h`. Common ones: **Alfa AWUS036ACM** (`0e8d:7612`), **Netgear A6210** (`0846:9053`),
-**Asus USB-AC55/AC54**, **TP-Link TL-WDN6200**, **Edimax EW-7722UAC**, and generics sold as "MT7612U". Check the
-USB ID before relying on a product name: vendors sometimes change chips between revisions.
+- **The firmware runs the MAC**: scanning, authentication, association, rate control, aggregation and
+  encryption happen on the chip. The host sends commands as messages (`SCANU_START_REQ`, `SM_CONNECT_REQ`,
+  `MM_KEY_ADD_REQ`…) and gets confirmations and indications back.
+- **Data frames cross USB as Ethernet frames** plus a small descriptor, so bridging to a macOS virtual
+  Ethernet interface needs almost no 802.11 handling on our side.
+- **The WPA2 4-way handshake runs on the host** (as with Linux `wpa_supplicant`): EAPOL frames arrive on the
+  data path and keys go back to the chip with `MM_KEY_ADD_REQ`. Our tested WPA2 library (`Sources/Shared/wpa.c`)
+  covers exactly that.
 
-## 4. Architecture
+Compared with SoftMAC chips (MediaTek mt76x2u, Realtek rtw89), there's far less code to get right: no RF
+calibration tables, no TX/RX descriptor-level 802.11, no rate control.
+
+## 4. Protocol facts verified so far (all in `Sources/Shared/aic8800.h`)
+
+| Item | Fact | Linux source |
+|---|---|---|
+| Command framing | `[len+4 (12-bit)] [0x11] [0] [4 zero bytes] [u16 id] [u16 dest task] [u16 src=100] [u16 param_len] [params]`, sent as `len + 8` bytes | `aicbluetooth_cmds.c` `aicwf_set_cmd_tx` |
+| Message ids | `(task << 10) | index`; debug task 1: `DBG_MEM_READ_REQ 0x400`, `_CFM 0x401`, `MEM_WRITE 0x402`, `BLOCK_WRITE 0x40B` (always a full 8+1024-byte struct), `START_APP 0x40D`, `MASK_WRITE 0x411` | `aicbluetooth_cmds.h` |
+| RX stream | packets `[u16 len][type]…`; config packets (type & 0x10) carry a message at +4 with a 4-byte pattern before params and occupy `roundup(len,4)+4`; data packets occupy `roundup(len+60,4)` | `aic_txrxif.c` |
+| Endpoints | first bulk IN = RX; first bulk OUT = TX; second bulk OUT = message endpoint on 8801/D81-family only | `aicwf_usb.c` `aicwf_parse_usb` |
+| Chip revision | `DBG_MEM_READ 0x40500000` → rev = bits 23..16 (U02 = 0x03); `0x00000004` → sub-rev = bits 11..4 | `aicwf_usb.c` `system_config_8800` |
+| D80 firmware load | patch table → ADID → patch → ext patch → patch-table entries → `fmacfw_8800d80_u02.bin` → patch config → `DBG_START_APP` | `aic_compat_8800d80.c` `aicfw_download_fw_8800d80` |
+| Firmware files | `fw_patch_table_8800d80_u02.bin` (1,384 B), `fw_adid_8800d80_u02.bin` (1,708 B), `fw_patch_8800d80_u02.bin` (32,700 B), `fw_patch_8800d80_u02_ext0.bin` (16,136 B), `fmacfw_8800d80_u02.bin` (358,072 B), plus an "H" variant | `fw/aic8800D80/` at commit `2e75f88` |
+
+The ROM answers debug-task messages **before** any firmware is loaded, which is what `macwifictl identify` uses
+to prove the USB link works.
+
+## 5. Architecture
 
 ```
  ┌──────────────── macOS (Apple Silicon) ──────────────────────────────────────────────┐
- │  Apps ── TCP/IP ── feth0 (Ethernet-like interface, gets DHCP/ARP/IPv6 from macOS)   │
- │                      │ paired with feth1 (raw frame I/O: BPF read, AF_NDRV write)    │
+ │  Apps ── TCP/IP ── fethA (virtual Ethernet; macOS runs DHCP, ARP, IPv6, DNS)        │
+ │                      │ peered with fethB (raw I/O: BPF read, AF_NDRV write)          │
  │  macwifid (root LaunchDaemon)                                                        │
- │    ├─ bridge:  Ethernet  <->  802.11 data + LLC/SNAP     (Sources/Shared/ieee80211.c)│
- │    ├─ station: scan, auth, assoc, WPA2-PSK 4-way + GTK   (Sources/Shared/wpa.c)      │
- │    └─ chip:    mt76x2u bring-up, firmware, RX/TX rings   (ported from Linux mt76)    │
- │           │ IOKit USB (vendor control + bulk), no kext, no DriverKit                 │
- │  Wi-Fi menu bar app ── Unix socket ── macwifid                                       │
+ │    ├─ bridge:  Ethernet frames  <->  AIC TX/RX descriptors (FullMAC, no 802.11 work) │
+ │    ├─ station: scan / connect / disconnect commands; WPA2-PSK 4-way + group keys     │
+ │    └─ chip:    mode switch, firmware upload (patch + fmacfw), message transport      │
+ │           │ IOKit USB (bulk), no kext, no DriverKit                                  │
+ │  Menu bar app ── Unix socket ── macwifid                                             │
  └───────────┼──────────────────────────────────────────────────────────────────────────┘
-             ▼  MT7612U dongle (USB 2.0/3.0)
+             ▼  UGREEN AX900 (AIC8800D80), USB 2.0
 ```
 
-**Why feth instead of utun:** `feth` ("fake Ethernet") interface pairs are built into macOS and have been used
-in place of the old tap kext (ZeroTier ships this). They need root but no entitlement. A feth interface is
-**layer 2**, so macOS's own DHCP client, ARP, IPv6 and routing run on it unchanged, and the driver only translates
-Ethernet frames to 802.11 data frames and back, just like Linux mac80211 does. `utun` is layer 3. The MT7601U
-project had to write its own DHCP client, can't do ARP, and notes that on macOS 15+ DNS through a non-system-extension
-tunnel is only "supplemental", so some apps ignore it. Whether a feth service can become the **primary** DNS
-service without a signed extension is the main open question. Phase 4 tests it, and keeps `utun` + a custom DHCP
-client as the fallback.
+**feth vs utun.** `feth` pairs are built into macOS and are what ZeroTier uses instead of the old tap kext;
+they need root but no entitlement. Being layer 2, macOS's own DHCP client, ARP and IPv6 work unchanged, and a
+FullMAC chip already speaks Ethernet. `utun` (what mt7601u-macos uses) is layer 3: it needs a custom DHCP
+client, and that project notes DNS on macOS 15+ is only "supplemental" through such a tunnel. Whether a feth
+service becomes the **primary** DNS service on macOS 27 is the main open question. Phase 4 tests it, with
+`utun` as the fallback.
 
-**What costs $0:** Xcode Command Line Tools, CommonCrypto (system library) for WPA2 crypto, ad-hoc signing,
-GitHub Actions on a public repo, firmware from linux-firmware (redistributable). The only purchase is the adapter.
+## 6. Licensing decision
 
-## 5. What it won't do (honest limits)
+- The AIC8800 Linux driver is **GPL-2.0-only** (AIC approved GPLv2 for the released driver source, per the
+  shenmintao/aic8800d80 and radxa-pkg/aic8800 records). Phase 2 onward ports parts of it (firmware-load
+  sequence, patch tables, message structs), so **this repository is GPL-2.0-only**. It's still $0 and open
+  source; the only obligation is that redistributed modified versions also ship their source.
+- Files written from scratch for this project (`Sources/Shared/ieee80211.*`, `wpa.*`, `crypto_backend.c`,
+  `aic_msg.*`, `aic8800.h`, `macwifictl`) are **also** offered under MIT (see `NOTICE.md`).
+- **Firmware** blobs aren't open source and have no stated redistribution license, so they're **never
+  committed**. `scripts/fetch-firmware.sh` downloads them onto your Mac from the driver repository, pinned to a
+  commit and checked against SHA-256 hashes.
 
-- Appear in the **Wi-Fi menu**, or support AirDrop/Continuity through the dongle (Apple-private).
-- **WPA3-SAE** and **Enterprise (802.1X)** at first: WPA2-Personal (CCMP) and open networks only. SAE can be
-  added later in user space.
-- Throughput will be below Linux: user-space copies plus USB bulk transfers. Expect "fast enough for normal use",
-  not the 867 Mbps link rate. Measure it in Phase 4 rather than guess.
-- It needs a root helper (LaunchDaemon), installed once with your password.
+## 7. What it won't do (honest limits)
 
-## 6. Verification done so far
-
-- WPA2 crypto checked against IEEE 802.11i-2004 Annex H vectors (PMK for "password"/"IEEE",
-  `f42c6fc5…a12e`; PRF test case 1, `bcd4c650…0606`), RFC 3394 §4.1 (AES key wrap), and PTK/MIC vectors computed
-  independently with Python's `hashlib`/`hmac`. The tests run against **CommonCrypto on macOS** and OpenSSL on
-  Linux in CI.
-- Register-access encoding (`bRequest`, `wValue`, `wIndex`, CFG/EEPROM address spaces, retry policy) transcribed
-  from Linux `mt76/usb.c`, and the USB ID table from `mt76x2/usb.c`.
-- Firmware names `mt7662_rom_patch.bin` and `mt7662.bin` (from `mt76x2.h`); linux-firmware ships them under
-  `mediatek/` (`mt7662.bin` 81,908 bytes, `mt7662_rom_patch.bin` 26,350 bytes).
-
-## 7. Licensing
-
-- **mt76** (Linux/OpenWrt) is **BSD-3-Clause-Clear**: porting its code is allowed. Keep its copyright notice in
-  ported files and in `NOTICE.md`.
-- **mt7601u-macos** is MIT/Apache-2.0: ideas and code may be adapted with attribution.
-- **userspace-wifi** and **Kismet** are GPL-2: read them for facts only, don't copy code into this MIT repo.
-- **Firmware** blobs are MediaTek's, redistributable under linux-firmware's
-  `LICENCE.ralink_a_mediatek_company_firmware`. They're downloaded by a script, not committed.
+- Appear in the Wi-Fi menu, or carry AirDrop/Continuity through the dongle.
+- **WPA3-SAE** and **802.1X Enterprise** at first: WPA2-Personal and open networks only. The firmware may
+  support SAE offload; that's investigated later.
+- Need no admin rights: a root helper is installed once.
+- Match Linux throughput: user-space copies over USB 2.0 bulk. Measured in Phase 4, not guessed.
 
 ## 8. Sources
 
-- Apple: NetworkingDriverKit documentation ("Ethernet is the only networking interface currently supported");
-  USBDriverKit documentation; DriverKit entitlements documentation.
-- Apple Community thread 256283724 (no Wi-Fi adapters for Apple Silicon; quotes the NetworkingDriverKit limitation).
-- github.com/chris1111/Wireless-USB-Big-Sur-Adapter (Intel-only note).
-- github.com/ZemichaelMD/MacOS-M1-mt7601u-userspace-wifi-driver-app (README, `docs/macos-networking.md`).
-- github.com/dragorn/userspace-wifi (README: transmit and hwsim tables).
-- github.com/Network-Weather/mt76-usb-macos; Kismet docs, "Wi-Fi: USB userspace".
-- github.com/openwrt/mt76: `usb.c`, `mt76.h`, `mt76x02.h`, `mt76x02_regs.h`, `mt76x2/usb.c`,
-  `mt76x2/usb_init.c`, `mt76x2/mt76x2.h`, `LICENSE`.
-- ZeroTier `osdep/MacEthernetTapAgent.c` (feth pair + BPF + AF_NDRV design); openssh-unix-dev, "Support for
-  macOS feth devices" (2020).
-- IEEE 802.11i-2004 Annex H; RFC 3394.
-- github.com/OpenIntelWireless/itlwm, github.com/Arxusion/AirportMtkWlan, github.com/lidiaoo/SimpleMtkWlan,
-  github.com/seaurching/mt76wm (Intel-hackintosh PCIe kexts, for contrast).
+- Your System Information screenshots (a69c:5723, "Aic MSC", aicsemi, 480 Mb/s).
+- github.com/shenmintao/aic8800d80 @ `2e75f88`: `aic.rules` (a69c:5723/5724 eject rules, "ugreenax900"),
+  `drivers/aic8800/aic_load_fw/{aicwf_usb.[ch], aicbluetooth_cmds.[ch], aic_txrxif.[ch],
+  aic_compat_8800d80.[ch]}`, `drivers/aic8800/aic8800_fdrv/aicwf_usb.h`, `fw/aic8800D80/`, `README.md`
+  (license history).
+- github.com/davidcawork/ugreen-AX900-USB-WiFi6 (`install.sh`: `usb_modeswitch -v a69c -p 5723`, UGREEN CM762
+  `aic8800d80fdrvpackage.deb`).
+- 24wireless.info, "UGREEN CM762… AICsemi製チップセットを搭載"; techinfodepot / retailer listings (RTL8851BU
+  AX900 variants); Manjaro forum "Ugreen AX900 et Linux" (0bda:b851).
+- Apple: NetworkingDriverKit documentation; Apple Community thread 256283724.
+- github.com/ZemichaelMD/MacOS-M1-mt7601u-userspace-wifi-driver-app (`README.md`, `docs/macos-networking.md`).
+- ZeroTier `osdep/MacEthernetTapAgent.c`; openssh-unix-dev "Support for macOS feth devices" (2020).
+- IEEE 802.11i-2004 Annex H; RFC 3394 (crypto test vectors in `Tests/test_wifi.c`).

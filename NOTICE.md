@@ -1,23 +1,33 @@
 # Notices
 
-## Linux mt76 (BSD-3-Clause-Clear)
+## License of this repository
 
-Hardware facts in `Sources/Shared/mt76x2u.h` (USB IDs, vendor requests, register addresses, retry policy,
-firmware names) come from the Linux mt76 driver, https://github.com/openwrt/mt76
-(`usb.c`, `mt76.h`, `mt76x02.h`, `mt76x02_regs.h`, `mt76x2/usb.c`, `mt76x2/usb_init.c`, `mt76x2/mt76x2.h`).
-The RXWI/TXWI/DMA buffer formats in `Sources/Shared/mt76x02_frames.[ch]` come from `mt76x02_mac.h`,
-`mt76x02_mac.c`, `mt76x02_dma.h`, `dma.h` and `mt76x02_usb_core.c` (re-implemented, not copied).
-Copyright (C) Felix Fietkau, Lorenzo Bianconi, MediaTek Inc. and contributors.
-Files ported from mt76 in later phases keep their original copyright and SPDX lines and are listed here.
+The repository as a whole is distributed under the **GNU General Public License v2.0 only** (see `LICENSE`),
+because later phases port code from the AIC8800 Linux driver, which is GPL-2.0-only.
+
+Files written from scratch for this project are **additionally** available under the MIT license
+(Copyright (c) 2026 fpm8588), so they can be reused elsewhere:
+`Sources/Shared/aic8800.h`, `Sources/Shared/aic_msg.[ch]`, `Sources/Shared/ieee80211.[ch]`,
+`Sources/Shared/wpa.[ch]`, `Sources/Shared/crypto_backend.c`, `Sources/macwifictl/*`, `Tests/*`, `build.sh`,
+`scripts/*`.
+
+## AIC8800 Linux driver (GPL-2.0-only)
+
+Hardware facts in `Sources/Shared/aic8800.h` (USB IDs, message ids and layouts, framing, addresses, firmware
+names) come from github.com/shenmintao/aic8800d80 (derived from AICsemi's reference driver; AIC approved
+GPLv2 for the released source, see that repository's README and radxa-pkg/aic8800). Files ported from it in
+later phases keep their original copyright lines and are listed here:
+
+- (none yet)
 
 ## Firmware
 
-`mt7662_rom_patch.bin` and `mt7662.bin` are MediaTek firmware from linux-firmware, redistributable under
-`LICENCE.ralink_a_mediatek_company_firmware`. They are downloaded by `scripts/fetch-firmware.sh` and are not
-part of this repository.
+The AIC8800D80 firmware (`fw_patch_*`, `fw_adid_*`, `fmacfw_*`) is AICsemi's. It has no stated open-source
+license, so it is **not** part of this repository; `scripts/fetch-firmware.sh` downloads it onto the user's
+Mac from the driver repository at a pinned commit and verifies SHA-256 hashes.
 
-## Prior art consulted
+## Prior art consulted (facts only)
 
-- mt7601u-macos (MIT OR Apache-2.0): architecture of a user-space Wi-Fi station on Apple Silicon.
-- userspace-wifi and Kismet (GPL-2): consulted for facts only; no code copied.
-- ZeroTier's MacEthernetTapAgent (feth + BPF + AF_NDRV design): consulted for facts only.
+- mt7601u-macos (MIT OR Apache-2.0): user-space Wi-Fi station architecture on Apple Silicon.
+- ZeroTier MacEthernetTapAgent: feth + BPF + AF_NDRV design.
+- userspace-wifi / Kismet (GPL-2): user-space USB Wi-Fi on macOS.

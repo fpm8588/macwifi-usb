@@ -12,7 +12,7 @@ B=build
 MINOS=13.0
 S=Sources/Shared
 CFLAGS=(-std=gnu11 -O2 -g -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration -I "$S")
-SHARED=("$S/ieee80211.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/mt76x02_frames.c")
+SHARED=("$S/ieee80211.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/aic_msg.c")
 mkdir -p "$B"
 
 run_tests() {
@@ -21,6 +21,8 @@ run_tests() {
     echo "== unit tests ($cc, $(uname))"
     $cc "${CFLAGS[@]}" Tests/test_wifi.c "${SHARED[@]}" "${libs[@]}" -o "$B/test_wifi"
     "$B/test_wifi"
+    $cc "${CFLAGS[@]}" Tests/test_aic.c "$S/aic_msg.c" -o "$B/test_aic"
+    "$B/test_aic"
     $cc "${CFLAGS[@]}" -I Sources/macwifictl Tests/test_descdump.c Sources/macwifictl/descdump.c -o "$B/test_descdump"
     "$B/test_descdump" > /dev/null && echo "descdump: OK"
 }

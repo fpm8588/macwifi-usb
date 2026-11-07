@@ -4,8 +4,6 @@
 //  - AES Key Wrap: RFC 3394 §4.1
 //  - PTK and MIC: computed independently with Python's hashlib/hmac (see docs/RESEARCH.md §6)
 #include "ieee80211.h"
-#include "mt76x02_frames.h"
-#include "mt76x2u.h"
 #include "wpa.h"
 
 #include <stdio.h>
@@ -20,21 +18,6 @@ static void hex(const char *s, uint8_t *out, size_t n) {
         sscanf(s + 2 * i, "%2x", &v);
         out[i] = (uint8_t)v;
     }
-}
-
-static void test_mt76x2u(void) {
-    CHECK(mt76x2u_lookup(0x0e8d, 0x7612) != NULL);
-    CHECK(mt76x2u_lookup(0x0846, 0x9053) != NULL);          // Netgear A6210
-    CHECK(mt76x2u_lookup(0x0e8d, 0x7961) == NULL);          // MT7921AU: different family, not supported
-    CHECK(mt76x2u_read_req(MT_ASIC_VERSION) == MT_VEND_MULTI_READ);
-    CHECK(mt76x2u_read_req(MT_WLAN_MTC_CTRL_CFG) == MT_VEND_READ_CFG);
-    CHECK(mt76x2u_write_req(MT_WLAN_MTC_CTRL_CFG) == MT_VEND_WRITE_CFG);
-    CHECK(mt76x2u_write_req(MT_MAC_CSR0) == MT_VEND_MULTI_WRITE);
-    CHECK(mt76x2u_wvalue(MT_WLAN_MTC_CTRL_CFG) == 0 && mt76x2u_windex(MT_WLAN_MTC_CTRL_CFG) == 0x148);
-    CHECK(mt76x2u_wvalue(0x00120034) == 0x0012 && mt76x2u_windex(0x00120034) == 0x0034);
-    CHECK(mt76x2u_is_supported_chip(0x76120044));
-    CHECK(mt76x2u_is_supported_chip(0x76620000));
-    CHECK(!mt76x2u_is_supported_chip(0x76010001));          // MT7601U
 }
 
 static void test_wpa(void) {
@@ -166,82 +149,11 @@ static void test_data(void) {
 }
 
 
-static void test_frames(void) {
-    // A QoS data frame (26-byte header -> needs a 2-byte pad to align the body).
-    uint8_t f[64];
-    memset(f, 0, sizeof f);
-    f[0] = 0x88; f[1] = 0x01;
-    for (int i = 26; i < 60; i++) f[i] = (uint8_t)i;
-    CHECK(mt76_80211_hdrlen(f, 60) == 26);
-    uint8_t beacon[40] = {0x80, 0x00};
-    CHECK(mt76_80211_hdrlen(beacon, 40) == 24);
-    uint8_t ack[10] = {0xD4, 0x00};
-    CHECK(mt76_80211_hdrlen(ack, 10) == 10);
-
-    Mt76TxParams p = {.wcid = 1, .rate = MT_RATE_OFDM_6M, .ack = true, .hw_seq = true, .hw_key = false,
-                      .qsel = MT_QSEL_EDCA, .pktid = 7};
-    uint8_t out[160];
-    size_t n = mt76x2u_tx_pack(f, 60, &p, out, sizeof out);
-    // TXWI(20) + frame(60) + pad(2) = 82 -> aligned 84; + TXINFO 4 + trailing 4 = 92
-    CHECK(n == 92);
-    uint32_t txinfo = (uint32_t)out[0] | ((uint32_t)out[1] << 8) | ((uint32_t)out[2] << 16) | ((uint32_t)out[3] << 24);
-    CHECK((txinfo & 0xFFFF) == 84);
-    CHECK(txinfo & MT_TXD_INFO_80211);
-    CHECK(txinfo & MT_TXD_INFO_WIV);                          // no hardware key yet
-    CHECK(((txinfo >> MT_TXD_INFO_QSEL_SHIFT) & 3) == MT_QSEL_EDCA);
-    CHECK(out[4 + 5] == 1 && out[4 + 4] == (MT_TXWI_ACK_CTL_REQ | MT_TXWI_ACK_CTL_NSEQ));
-    CHECK((out[4 + 6] | (out[4 + 7] << 8)) == 60);            // len_ctl excludes the pad
-    CHECK(out[4 + 19] == 7 && out[4 + 2] == 0x00 && out[4 + 3] == 0x20);  // pktid; rate = OFDM idx 0
-    CHECK(memcmp(out + 24, f, 26) == 0);                      // header
-    CHECK(out[24 + 26] == 0 && out[24 + 27] == 0);            // pad
-    CHECK(memcmp(out + 24 + 28, f + 26, 34) == 0);            // body after the pad
-    CHECK(out[88] == 0 && out[91] == 0);
-    CHECK(mt76x2u_tx_pack(f, 60, &p, out, 80) == 0);          // too small
-    p.hw_key = true;
-    n = mt76x2u_tx_pack(beacon, 40, &p, out, sizeof out);
-    txinfo = (uint32_t)out[0] | ((uint32_t)out[1] << 8) | ((uint32_t)out[2] << 16) | ((uint32_t)out[3] << 24);
-    CHECK(n > 0 && !(txinfo & MT_TXD_INFO_WIV) && (out[4] & MT_TXWI_FLAGS_TS));
-
-    // RX: same QoS frame, decrypted by hardware, with L2 pad and an 8-byte CCMP IV still in the buffer.
-    uint8_t rx[256];
-    memset(rx, 0, sizeof rx);
-    size_t mpdu = 26 + 8 + 34;                                // header + IV + body (pad excluded)
-    size_t frame_bytes = 26 + 2 + 8 + 34;
-    size_t dma = 32 + ((frame_bytes + 3) & ~(size_t)3);
-    rx[0] = (uint8_t)dma; rx[1] = (uint8_t)(dma >> 8);
-    uint32_t rxinfo = MT_RXINFO_DATA | MT_RXINFO_UNICAST | MT_RXINFO_L2PAD | MT_RXINFO_DECRYPT |
-                      (2u << MT_RXINFO_PN_LEN_SHIFT);
-    uint32_t ctl = 3u | ((uint32_t)mpdu << 16);               // wcid 3
-    for (int i = 0; i < 4; i++) { rx[4 + i] = (uint8_t)(rxinfo >> (8 * i)); rx[8 + i] = (uint8_t)(ctl >> (8 * i)); }
-    rx[4 + 10] = 0x07; rx[4 + 11] = 0x40;                     // rate: HT (phy 2) MCS 7
-    rx[4 + 12] = (uint8_t)-40;
-    uint8_t *fr = rx + 4 + 32;
-    memcpy(fr, f, 26);
-    memset(fr + 28, 0xEE, 8);                                 // IV
-    memcpy(fr + 36, f + 26, 34);
-    size_t rxlen = 4 + dma + 4;
-    uint8_t got[128];
-    Mt76RxInfo ri;
-    long gl = mt76x2u_rx_unpack(rx, rxlen, &ri, got, sizeof got);
-    CHECK(gl == 60);
-    CHECK(memcmp(got, f, 60) == 0);                           // pad and IV removed
-    CHECK(ri.wcid == 3 && ri.decrypted && ri.unicast && ri.phy == MT_PHY_HT && ri.mcs == 7 && ri.rssi[0] == -40);
-
-    rx[0] = 0x03;                                             // dma_len not a multiple of 4
-    CHECK(mt76x2u_rx_unpack(rx, rxlen, &ri, got, sizeof got) == -1);
-    rx[0] = (uint8_t)dma;
-    CHECK(mt76x2u_rx_unpack(rx, 20, &ri, got, sizeof got) == -1);   // too short
-    ctl = 3u | (200u << 16);                                  // MPDU longer than the buffer
-    for (int i = 0; i < 4; i++) rx[8 + i] = (uint8_t)(ctl >> (8 * i));
-    CHECK(mt76x2u_rx_unpack(rx, rxlen, &ri, got, sizeof got) == -1);
-}
 
 int main(void) {
-    test_mt76x2u();
     test_wpa();
     test_bss();
     test_data();
-    test_frames();
     printf("%d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

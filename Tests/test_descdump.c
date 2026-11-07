@@ -1,4 +1,4 @@
-// Descriptor printer test: a vendor-class interface with bulk endpoints, like the MT7612U's.
+// Descriptor printer test: a vendor-class interface with bulk endpoints, like the AIC8800's Wi-Fi interface.
 #include "descdump.h"
 
 #include <stdio.h>
