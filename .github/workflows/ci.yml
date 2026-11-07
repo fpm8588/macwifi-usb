@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  tests-linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - run: sudo apt-get install -y libssl-dev && chmod +x build.sh && ./build.sh test
+
+  macos-arm64:
+    # macos-latest is an Apple Silicon (arm64) runner. Free for public repositories.
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Toolchain
+        run: |
+          sw_vers
+          uname -m
+          clang --version
+          xcrun --show-sdk-version
+      - name: Unit tests
+        run: chmod +x build.sh && ./build.sh test
+      - name: Build macwifictl
+        run: ./build.sh cli
+      - name: Smoke test (no adapter on the runner)
+        run: |
+          set +e
+          ./build/macwifictl --help;     [ $? -eq 2 ] || exit 1
+          ./build/macwifictl identify;   [ $? -eq 3 ] || exit 1   # 3 = no adapter on the runner, the expected answer
+          ./build/macwifictl list --all; echo "list exit $?"
+          lipo -archs build/macwifictl | grep -q arm64 || exit 1
+          codesign --verify --verbose build/macwifictl || exit 1
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macwifictl-arm64
+          path: build/macwifictl

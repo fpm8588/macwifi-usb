@@ -1,0 +1,44 @@
+#!/usr/bin/env bash
+# build.sh — builds with the free Xcode Command Line Tools (xcode-select --install). $0, ad-hoc signing only.
+#
+#   ./build.sh test     hardware-free unit tests (macOS uses CommonCrypto; Linux uses OpenSSL libcrypto)
+#   ./build.sh cli      build/macwifictl (arm64, macOS 13+)
+#   ./build.sh all      test + cli
+#   ./build.sh clean
+set -euo pipefail
+cd "$(dirname "$0")"
+
+B=build
+MINOS=13.0
+S=Sources/Shared
+CFLAGS=(-std=gnu11 -O2 -g -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration -I "$S")
+SHARED=("$S/ieee80211.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/mt76x02_frames.c")
+mkdir -p "$B"
+
+run_tests() {
+    local cc=${CC:-cc} libs=()
+    [[ "$(uname)" == "Darwin" ]] || libs=(-lcrypto)
+    echo "== unit tests ($cc, $(uname))"
+    $cc "${CFLAGS[@]}" Tests/test_wifi.c "${SHARED[@]}" "${libs[@]}" -o "$B/test_wifi"
+    "$B/test_wifi"
+    $cc "${CFLAGS[@]}" -I Sources/macwifictl Tests/test_descdump.c Sources/macwifictl/descdump.c -o "$B/test_descdump"
+    "$B/test_descdump" > /dev/null && echo "descdump: OK"
+}
+
+build_cli() {
+    [[ "$(uname)" == "Darwin" ]] || { echo "macwifictl needs macOS (IOKit)"; exit 1; }
+    echo "== macwifictl (arm64)"
+    clang "${CFLAGS[@]}" -arch arm64 -mmacosx-version-min=$MINOS -Wno-deprecated-declarations \
+        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c \
+        -framework IOKit -framework CoreFoundation -o "$B/macwifictl"
+    codesign --force --sign - "$B/macwifictl"
+    file "$B/macwifictl"
+}
+
+case "${1:-all}" in
+    test)  run_tests ;;
+    cli)   build_cli ;;
+    all)   run_tests; if [[ "$(uname)" == "Darwin" ]]; then build_cli; fi ;;
+    clean) rm -rf "$B" ;;
+    *)     echo "usage: $0 test|cli|all|clean"; exit 2 ;;
+esac

@@ -1,0 +1,7 @@
+build/
+*.o
+*.dSYM/
+.DS_Store
+xcuserdata/
+DerivedData/
+firmware/
