@@ -16,10 +16,12 @@ SHARED=("$S/ieee80211.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/aic_msg.c")
 mkdir -p "$B"
 
 run_tests() {
-    local cc=${CC:-cc} libs=()
-    [[ "$(uname)" == "Darwin" ]] || libs=(-lcrypto)
+    # macOS ships Bash 3.2, where "${empty[@]}" trips `set -u`, so keep the extra flags in a plain string.
+    local cc=${CC:-cc} libs=""
+    [[ "$(uname)" == "Darwin" ]] || libs="-lcrypto"
     echo "== unit tests ($cc, $(uname))"
-    $cc "${CFLAGS[@]}" Tests/test_wifi.c "${SHARED[@]}" "${libs[@]}" -o "$B/test_wifi"
+    # shellcheck disable=SC2086
+    $cc "${CFLAGS[@]}" Tests/test_wifi.c "${SHARED[@]}" $libs -o "$B/test_wifi"
     "$B/test_wifi"
     $cc "${CFLAGS[@]}" Tests/test_aic.c "$S/aic_msg.c" -o "$B/test_aic"
     "$B/test_aic"
