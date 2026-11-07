@@ -33,7 +33,7 @@ build_cli() {
     [[ "$(uname)" == "Darwin" ]] || { echo "macwifictl needs macOS (IOKit)"; exit 1; }
     echo "== macwifictl (arm64)"
     clang "${CFLAGS[@]}" -arch arm64 -mmacosx-version-min=$MINOS -Wno-deprecated-declarations \
-        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c \
+        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c "$S/aic_msg.c" \
         -framework IOKit -framework CoreFoundation -o "$B/macwifictl"
     codesign --force --sign - "$B/macwifictl"
     file "$B/macwifictl"
