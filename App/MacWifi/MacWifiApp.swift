@@ -118,12 +118,10 @@ final class Model: ObservableObject {
 
     // Signal strength 0...1 for the bars.
     static func strength(_ rssi: Int) -> Double {
-        switch rssi {
-        case -55...: return 1.0
-        case -67 ..< -55: return 0.67
-        case -78 ..< -67: return 0.34
-        default: return 0.1
-        }
+        if rssi >= -55 { return 1.0 }
+        if rssi >= -67 { return 0.67 }
+        if rssi >= -78 { return 0.34 }
+        return 0.1
     }
 
     var iconName: String {
