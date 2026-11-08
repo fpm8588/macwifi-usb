@@ -746,6 +746,7 @@ static int daemon_main(const DaemonHooks *hooks) {
             } else if (!present) {
                 d_set_state(d, DS_NO_ADAPTER);
                 next_try = 0;
+                quick_retries = 4;   // a freshly plugged adapter can need a moment (e.g. its virtual CD isn't mounted yet)
             }
             d_handle(d, a, &manual_off, &next_autojoin);
             if (!a->up) usleep(500000);

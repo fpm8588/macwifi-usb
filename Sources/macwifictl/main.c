@@ -1495,7 +1495,13 @@ static int ssid_is(const WifiBss *b, const uint8_t *ssid, size_t len) {
     return b->ssid_len == len && memcmp(b->ssid, ssid, len) == 0;
 }
 
-// The strongest usable BSS of `ssid` in `sl` (NULL if none); prints each candidate when `verbose`.
+// Band preference: 5 GHz is much faster and usually less crowded, so it wins unless it is clearly weaker (by
+// more than this many dB), much like macOS's own choice between the bands of one network.
+#define BAND_5G_BONUS_DB 15
+static int bss_score(const ScanEntry *e) { return e->rssi + (e->freq >= 5000 ? BAND_5G_BONUS_DB : 0); }
+
+// The best usable BSS of `ssid` in `sl` (signal plus the 5 GHz preference; NULL if none); prints each candidate
+// when `verbose`.
 static const ScanEntry *scan_pick(const ScanList *sl, const uint8_t *ssid, size_t ssid_len, int verbose, int *found) {
     const ScanEntry *best = NULL;
     *found = 0;
@@ -1510,7 +1516,7 @@ static const ScanEntry *scan_pick(const ScanList *sl, const uint8_t *ssid, size_
             printf("  %02x:%02x:%02x:%02x:%02x:%02x  %4d MHz  RSSI %4d  %-10s %s\n", e->bss.bssid[0], e->bss.bssid[1],
                    e->bss.bssid[2], e->bss.bssid[3], e->bss.bssid[4], e->bss.bssid[5], e->freq, e->rssi,
                    wifi_security_name(e->bss.security), why);
-        if (ok && (!best || e->rssi > best->rssi)) best = e;
+        if (ok && (!best || bss_score(e) > bss_score(best))) best = e;
     }
     return best;
 }

@@ -248,3 +248,30 @@ macOS configured feth4100: <private address> (after 6.7 s)
   legacy-mcu1, with `aicwf_usb_rx_aggr = true` for the UGREEN product id). So everything after an odd-length
   packet in a transfer was lost or misread; TCP retransmitted, which cost throughput. Fixed in the next commit
   (`aic_rx_next`), with a test for unaligned packets and a simulation that aggregates RX like the chip.
+
+## 2026-11-07: Phase 5, first runs of the installed service (`macwifid`)
+
+Commits `2303207`..`abd3f43`, installed with `build/MacWifi.pkg`. BSSIDs, addresses and network names are not
+recorded here.
+
+What worked on the adapter:
+- **Sleep/wake, twice.** Idle: `the Mac is going to sleep` → `shutting the adapter down for sleep` → `asleep` →
+  `the Mac is awake` → `no_adapter` → `starting` ("Firmware already running (a69c:8d81)") → bring-up → `idle`.
+  Connected: `Bridged for 350 s ... Disconnected.` → `asleep` → wake → bring-up on the running firmware →
+  `auto-joining a remembered network` → connected on 5 GHz, macOS address after 6.7 s. The adapter kept its
+  firmware through sleep (it stayed `a69c:8d81`), and re-running the bring-up on it works.
+- Auto-join and rejoin after the AP dropped us; the remembered network (PMK) was used without a password.
+- Idle full scan (new logging): `firmware status 0, 12 results; 18 frames, 12 BSSs, 6 names`.
+
+Found:
+- **Disassociated by the AP with reason 34** (`DISASSOC_LOW_ACK`: too many frames not acknowledged) after 31 s of
+  heavy traffic (15,906 frames / 19 MB in, 15,760 of them flagged `need_reord`, i.e. A-MPDU). Likely cause: RX is
+  drained with one synchronous bulk-IN read at a time, so the chip's RX buffers overflow under load; the Linux
+  driver keeps 20 RX URBs in flight (`AICWF_USB_RX_URBS`). Next: several asynchronous reads in flight, then
+  host-side A-MPDU reordering.
+- The strongest-RSSI choice picked 2.4 GHz over a slightly weaker 5 GHz AP of the same network. Now 5 GHz gets a
+  15 dB preference.
+- A first association attempt failed with status 1 (unspecified); the automatic retry succeeded.
+- Reinstalling could leave the service unloaded (bootstrap racing the old copy's teardown); the installer now
+  waits and retries. Replugging during start-up was recovered from by itself, but a freshly plugged adapter whose
+  virtual CD wasn't mounted yet waited 15 s before the next try; now 3 s for the first few tries.

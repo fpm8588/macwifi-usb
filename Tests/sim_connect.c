@@ -644,6 +644,28 @@ static void test_daemon(void) {
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
+    printf("---- band choice\n");
+    {
+        static ScanList bl;
+        memset(&bl, 0, sizeof bl);
+        bl.n = 2;
+        for (int i = 0; i < 2; i++) {
+            memcpy(bl.e[i].bss.ssid, "Home", 4);
+            bl.e[i].bss.ssid_len = 4;
+            bl.e[i].bss.security = WIFI_SEC_WPA2_WPA3;
+            bl.e[i].bss.rsn_akm_psk = bl.e[i].bss.rsn_ccmp = bl.e[i].bss.rsn_group_ccmp = 1;
+            bl.e[i].bss.rsn_ie_len = 26;
+        }
+        bl.e[0].freq = 2437; bl.e[1].freq = 5745;
+        int found = 0;
+        bl.e[0].rssi = -46; bl.e[1].rssi = -52;                       // 5 GHz a bit weaker: still 5 GHz
+        CHECK(scan_pick(&bl, (const uint8_t *)"Home", 4, 0, &found) == &bl.e[1] && found == 2);
+        bl.e[0].rssi = -50; bl.e[1].rssi = -70;                       // 5 GHz 20 dB weaker: 2.4 GHz
+        CHECK(scan_pick(&bl, (const uint8_t *)"Home", 4, 0, &found) == &bl.e[0]);
+        bl.e[1].bss.rsn_pmf_required = 1; bl.e[1].rssi = -30;         // unusable 5 GHz AP never wins
+        CHECK(scan_pick(&bl, (const uint8_t *)"Home", 4, 0, &found) == &bl.e[0]);
+    }
+
     printf("---- happy path\n");
     reset("ExampleNet", "correct horse battery");
     gPass = "correct horse battery";
