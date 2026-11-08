@@ -132,7 +132,7 @@ which phase 2a already does.
 
 ## Phase 3: scan and connect
 
-1. **Scan** (code written; run it on the adapter). `macwifictl scan [SSID]` = `up` + the Linux driver's
+1. **Scan** (PASSED 2026-11-07: both bands, results match the Mac's Wi-Fi menu). `macwifictl scan [SSID]` = `up` + the Linux driver's
    interface-open sequence + one scan, all in `Sources/Shared/aic_fmac.c`:
    `ME_CONFIG` (HT/VHT/HE capabilities) -> `ME_CHAN_CONFIG` (world "00" domain: channels 1-14 and 25 5 GHz
    channels, 20 dBm, none disabled) -> `MM_START` -> `MM_SET_COEX` (CONFIG_COEX) -> `MM_ADD_IF` (station, our MAC)

@@ -124,8 +124,22 @@ Phase 2b hardware check passed.
 - 5 GHz supported; LMAC 6.9.1.0; firmware supports 32 stations and 4 virtual interfaces.
 - No `[firmware]` log packets were sent during the bring-up.
 
-## Phase 3a: scan (waiting for a run)
+## 2026-11-07: Phase 3a passed (scan)
 
-Expected: after the 2b output, "Capabilities and channels set (14 at 2.4 GHz, 25 at 5 GHz...)", "Radio started;
-station interface N", then a table of nearby networks sorted by signal. The firmware's `SCANU_START_CFM` gives a
-result count; every `SCANU_RESULT_IND` carries one beacon or probe response.
+Commit `aa841f9`. Run twice, both times on firmware already running from an earlier command (re-running the
+bring-up on running firmware works). The user confirmed every network listed matches the Mac's Wi-Fi menu.
+Network names and BSSIDs are deliberately not recorded here (this repository is public).
+
+```
+Capabilities and channels set (14 at 2.4 GHz, 25 at 5 GHz, world regulatory domain)
+Radio started; station interface 0
+Scanning 39 channels...
+Scan done in 1.5 s: status 0, firmware counted 11 results; 17 frames, 11 networks
+```
+
+- 11 BSSs on both bands (2.4 GHz channels 4, 6, 10; 5 GHz channels 40, 149, 157); 802.11n/ac/ax networks;
+  WPA2 and WPA2/WPA3 transition networks identified correctly.
+- 1.5 s for 39 channels; RSSI from about -30 dBm (next to the router) to -95 dBm.
+- The firmware sent SCANU_START_CFM_ADDTIONAL (no warning printed).
+- Two BSSs printed a blank SSID: their SSID element is non-empty but all NUL bytes (hidden networks). Now
+  printed as "(hidden)".

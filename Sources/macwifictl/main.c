@@ -1057,7 +1057,9 @@ static int cmd_scan(int argc, char **argv) {
                 const ScanEntry *e = &sl.e[i];
                 int ch = e->bss.channel ? e->bss.channel : mhz_to_channel(e->freq);
                 char name[40];
-                if (e->bss.ssid_len) snprintf(name, sizeof name, "%s", e->bss.ssid);
+                int blank = 1;   // hidden networks send an empty SSID or one made of NUL bytes
+                for (int k = 0; k < e->bss.ssid_len; k++) if (e->bss.ssid[k]) blank = 0;
+                if (!blank) snprintf(name, sizeof name, "%s", e->bss.ssid);
                 else snprintf(name, sizeof name, "(hidden)");
                 printf("  %-32s  %02x:%02x:%02x:%02x:%02x:%02x  %4d  %5s  %4d  %-10s %s%s\n", name, e->bss.bssid[0],
                        e->bss.bssid[1], e->bss.bssid[2], e->bss.bssid[3], e->bss.bssid[4], e->bss.bssid[5], ch,
