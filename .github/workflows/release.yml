@@ -1,0 +1,43 @@
+name: Release
+
+# Push a tag like v0.6.0 to build the installer and publish a GitHub release. The package contains no firmware
+# (AICsemi's files have no open-source license); its installer downloads the firmware from the pinned Linux
+# driver commits and checks the SHA-256 of every file.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Check the tag matches VERSION
+        run: |
+          v=$(tr -d ' \n' < VERSION)
+          [ "v$v" = "${GITHUB_REF_NAME}" ] || { echo "tag ${GITHUB_REF_NAME} != VERSION $v"; exit 1; }
+      - name: Test
+        run: |
+          chmod +x build.sh scripts/*.sh
+          scripts/fetch-firmware.sh && ./build.sh test
+      - name: Build the package (no firmware inside)
+        run: |
+          MW_PKG_NO_FIRMWARE=1 ./build.sh pkg
+          v=$(tr -d ' \n' < VERSION)
+          if pkgutil --payload-files "build/MacWifi-$v.pkg" | grep -q '\.bin$'; then echo "firmware in the package"; exit 1; fi
+          cd build && shasum -a 256 "MacWifi-$v.pkg" > "MacWifi-$v.pkg.sha256"
+      - name: Release notes from CHANGELOG.md
+        run: |
+          v=$(tr -d ' \n' < VERSION)
+          awk -v v="## $v" '$0 ~ "^## " { if (p) exit; if (index($0, v) == 1) { p = 1; next } } p' CHANGELOG.md > build/notes.md
+          test -s build/notes.md
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          v=$(tr -d ' \n' < VERSION)
+          gh release create "${GITHUB_REF_NAME}" "build/MacWifi-$v.pkg" "build/MacWifi-$v.pkg.sha256" \
+            --title "MacWifi $v" --notes-file build/notes.md --prerelease

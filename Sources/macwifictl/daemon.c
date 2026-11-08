@@ -187,6 +187,7 @@ static void reply_status(Daemon *d, JsonOut *j) {
         jo_str(j, "ip", d->ip);
     }
     jo_str(j, "error", d->error);
+    jo_str(j, "version", MW_VERSION);
 }
 
 static void reply_networks(Daemon *d, JsonOut *j) {
@@ -653,6 +654,27 @@ static void d_handle(Daemon *d, Adapter *a, int *manual_off, double *next_autojo
     secure_zero(pass, sizeof pass);
 }
 
+// launchd points stdout/stderr at /Library/Logs/macwifid.log and never reopens it, so the daemon rotates it
+// itself: past 2 MB it keeps three old copies (.1 .. .3) and reopens the file.
+#define MW_LOG "/Library/Logs/macwifid.log"
+static void d_rotate_log(void) {
+    struct stat st;
+    if (stat(MW_LOG, &st) != 0 || st.st_size < 2 * 1024 * 1024) return;
+    fflush(stdout);
+    fflush(stderr);
+    char a[64], b[64];
+    for (int i = 2; i >= 1; i--) {
+        snprintf(a, sizeof a, "%s.%d", MW_LOG, i);
+        snprintf(b, sizeof b, "%s.%d", MW_LOG, i + 1);
+        rename(a, b);
+    }
+    rename(MW_LOG, MW_LOG ".1");
+    if (freopen(MW_LOG, "a", stdout)) setvbuf(stdout, NULL, _IOLBF, 0);
+    if (freopen(MW_LOG, "a", stderr)) setvbuf(stderr, NULL, _IONBF, 0);
+    chmod(MW_LOG, 0644);
+    printf("[macwifid] log rotated, version %s\n", MW_VERSION);
+}
+
 static int daemon_main(const DaemonHooks *hooks) {
     Daemon *d = &gD;
     memset(d, 0, sizeof *d);
@@ -660,7 +682,7 @@ static int daemon_main(const DaemonHooks *hooks) {
     pthread_mutex_init(&d->mu, NULL);
     pthread_cond_init(&d->cv, NULL);
     setvbuf(stdout, NULL, _IOLBF, 0);
-    printf("[macwifid] starting (pid %d)\n", (int)getpid());
+    printf("[macwifid] starting, version %s (pid %d)\n", MW_VERSION, (int)getpid());
     d_load(d);
     if (geteuid() == 0) {
         int n = feth_cleanup();
@@ -676,10 +698,14 @@ static int daemon_main(const DaemonHooks *hooks) {
 
     Adapter *a = &gA;
     memset(a, 0, sizeof *a);
-    double next_try = 0, next_autojoin = 0, autojoin_backoff = 5;
+    double next_try = 0, next_autojoin = 0, autojoin_backoff = 5, next_log_check = 0;
     int manual_off = 0, sleeping = 0, quick_retries = 0;
     d->state = d->power ? DS_NO_ADAPTER : DS_OFF;
     while (!gStop) {
+        if (geteuid() == 0 && now_s() >= next_log_check) {
+            next_log_check = now_s() + 60;
+            d_rotate_log();
+        }
         if (gSleepReq) {
             printf("[macwifid] shutting the adapter down for sleep\n");
             if (a->up) d_release(d, a);
@@ -739,6 +765,12 @@ static int daemon_main(const DaemonHooks *hooks) {
                     next_autojoin = 0;
                     autojoin_backoff = 5;
                     d_set_state(d, DS_IDLE);
+                } else if (access("firmware/aic8800D80-legacy-mcu1/fmacfw_8800d80_u02.bin", R_OK) != 0 &&
+                           access("firmware/aic8800D80/fmacfw_8800d80_u02.bin", R_OK) != 0) {
+                    d_set_error(d, "the adapter firmware isn't installed: run sudo MW_FW_ROOT=\"" MW_DIR "\" \"" MW_DIR
+                                   "/fetch-firmware.sh\"");
+                    d_set_state(d, DS_ERROR);
+                    next_try = now_s() + 30;
                 } else {
                     d_set_error(d, "the adapter didn't start; unplug it and plug it back in");
                     d_set_state(d, DS_ERROR);

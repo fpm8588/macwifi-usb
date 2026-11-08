@@ -54,6 +54,10 @@ extern char **environ;
 typedef IOUSBDeviceInterface320 **Dev;
 typedef IOUSBInterfaceInterface300 **Intf;
 
+#ifndef MW_VERSION
+#define MW_VERSION "dev"
+#endif
+
 static int gDebug = 0;
 static int gNoDump = 0;           // set while key material is on the wire, so MACWIFI_DEBUG=1 never prints keys
 static size_t gDumpLimit = 256;   // bytes shown per transfer with MACWIFI_DEBUG=1 (lowered during uploads)
@@ -2078,6 +2082,7 @@ static void usage(void) {
 int main(int argc, char **argv) {
     gDebug = getenv("MACWIFI_DEBUG") != NULL;
     if (argc < 2 || !strcmp(argv[1], "-h") || !strcmp(argv[1], "--help")) { usage(); return 2; }
+    if (!strcmp(argv[1], "--version") || !strcmp(argv[1], "version")) { printf("macwifictl %s\n", MW_VERSION); return 0; }
     const char *c = argv[1];
     if (!strcmp(c, "daemon")) return cmd_daemon();
     if (!strcmp(c, "status") || !strcmp(c, "networks") || !strcmp(c, "disconnect") || !strcmp(c, "ctl"))

@@ -10,8 +10,9 @@ cd "$(dirname "$0")"
 
 B=build
 MINOS=13.0
+VERSION=$(tr -d ' \n' < VERSION)
 S=Sources/Shared
-CFLAGS=(-std=gnu11 -O2 -g -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration -I "$S")
+CFLAGS=(-std=gnu11 -O2 -g -Wall -Wextra -Wpedantic -Werror=implicit-function-declaration -I "$S" -DMW_VERSION="\"$VERSION\"")
 SHARED=("$S/ieee80211.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/aic_msg.c")
 mkdir -p "$B"
 
@@ -86,36 +87,39 @@ build_app() {
     rm -rf "$app"
     mkdir -p "$app/Contents/MacOS"
     cp App/MacWifi/Info.plist "$app/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$app/Contents/Info.plist"
     swiftc -O -parse-as-library -target "arm64-apple-macos$MINOS" App/MacWifi/MacWifiApp.swift \
         -o "$app/Contents/MacOS/MacWifi"
     codesign --force --sign - "$app"
 }
 
-# An installer package built on this Mac from this Mac's downloaded firmware. The firmware is AICsemi's and has
-# no open-source license: don't redistribute the package.
+# The installer package. By default it includes this Mac's downloaded firmware when present (a package for your
+# own Macs; AICsemi's firmware has no open-source license, so don't share that package). With MW_PKG_NO_FIRMWARE=1
+# (the GitHub release build) it contains none, and the installer downloads and verifies it on the target Mac.
 build_pkg() {
     build_cli
     build_app
-    for d in firmware/aic8800D80 firmware/aic8800D80-legacy-mcu1; do
-        [[ -d "$d" ]] || { echo "Run scripts/fetch-firmware.sh first ($d is missing)."; exit 1; }
-    done
-    echo "== MacWifi.pkg"
-    local root="$B/pkgroot" ver
+    local with_fw=1
+    [[ "${MW_PKG_NO_FIRMWARE:-0}" == 1 || ! -d firmware/aic8800D80-legacy-mcu1 || ! -d firmware/aic8800D80 ]] && with_fw=0
+    echo "== MacWifi.pkg ($VERSION, firmware $([[ $with_fw == 1 ]] && echo included || echo "downloaded at install"))"
+    local root="$B/pkgroot" ver=$VERSION
     local A="$root/Library/Application Support/macwifi"
-    ver=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" App/MacWifi/Info.plist)
     rm -rf "$root"
     mkdir -p "$A/firmware" "$root/Library/LaunchDaemons" "$root/Library/LaunchAgents" "$root/Applications"
     cp "$B/macwifictl" "$A/macwifid"
     cp "$B/macwifictl" "$A/macwifictl"
-    cp -R firmware/aic8800D80 firmware/aic8800D80-legacy-mcu1 "$A/firmware/"
+    [[ $with_fw == 1 ]] && cp -R firmware/aic8800D80 firmware/aic8800D80-legacy-mcu1 "$A/firmware/"
     cp scripts/uninstall.sh "$A/uninstall.sh"
+    cp scripts/fetch-firmware.sh "$A/fetch-firmware.sh"
+    cp scripts/report.sh "$A/report.sh"
     cp packaging/io.github.fpm8588.macwifid.plist "$root/Library/LaunchDaemons/"
     cp packaging/io.github.fpm8588.macwifi.menu.plist "$root/Library/LaunchAgents/"
     cp -R "$B/MacWifi.app" "$root/Applications/"
     pkgbuild --root "$root" --component-plist packaging/components.plist --scripts packaging/scripts \
         --identifier io.github.fpm8588.macwifi --version "$ver" --install-location / --ownership recommended \
-        "$B/MacWifi.pkg"
-    echo "Built $B/MacWifi.pkg. Install: sudo installer -pkg $B/MacWifi.pkg -target /"
+        "$B/MacWifi-$ver.pkg"
+    cp "$B/MacWifi-$ver.pkg" "$B/MacWifi.pkg"
+    echo "Built $B/MacWifi-$ver.pkg. Install: sudo installer -pkg $B/MacWifi.pkg -target /"
 }
 
 case "${1:-all}" in

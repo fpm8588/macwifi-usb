@@ -48,10 +48,17 @@ jobs:
         run: ./build.sh app && codesign --verify --verbose build/MacWifi.app
       - name: Build the installer package (firmware downloaded here; the package is not uploaded)
         run: |
-          chmod +x scripts/fetch-firmware.sh && scripts/fetch-firmware.sh
+          chmod +x scripts/*.sh && scripts/fetch-firmware.sh
+          ./build/macwifictl --version
           ./build.sh pkg
-          pkgutil --payload-files build/MacWifi.pkg | grep -E "macwifid$|MacWifi.app/Contents/MacOS/MacWifi$|LaunchDaemons|LaunchAgents|uninstall.sh"
+          pkgutil --payload-files build/MacWifi.pkg | grep -E "macwifid$|MacWifi.app/Contents/MacOS/MacWifi$|LaunchDaemons|LaunchAgents|uninstall.sh|fetch-firmware.sh|report.sh"
           pkgutil --expand build/MacWifi.pkg build/pkgx && ls build/pkgx/Scripts
+          # the release variant: no firmware inside; the installer's download step works from another folder
+          MW_PKG_NO_FIRMWARE=1 ./build.sh pkg
+          if pkgutil --payload-files build/MacWifi.pkg | grep -q '\.bin$'; then echo "firmware in the release package"; exit 1; fi
+          mkdir -p "$RUNNER_TEMP/fwroot" && MW_FW_ROOT="$RUNNER_TEMP/fwroot" scripts/fetch-firmware.sh >/dev/null
+          test -f "$RUNNER_TEMP/fwroot/firmware/aic8800D80-legacy-mcu1/fmacfw_8800d80_u02.bin"
+          sh scripts/report.sh | head -20
       - uses: actions/upload-artifact@v7
         with:
           name: macwifictl-arm64

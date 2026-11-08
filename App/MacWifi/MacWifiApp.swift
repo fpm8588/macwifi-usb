@@ -30,6 +30,7 @@ struct StatusReply: Decodable {
     let freq: Int?
     let ip: String?
     let error: String?
+    let version: String?
 }
 
 struct NetworksReply: Decodable {
@@ -292,6 +293,12 @@ struct NetworkRow: View {
 struct MenuView: View {
     @EnvironmentObject var model: Model
 
+    var versionLine: String {
+        let app = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let svc = model.status?.version ?? "not running"
+        return "MacWifi \(app) · service \(svc) · Quit keeps Wi-Fi running"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -338,6 +345,9 @@ struct MenuView: View {
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }
             }
+            Text(versionLine)
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
         .padding(12)
         .frame(width: 320)

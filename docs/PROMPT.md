@@ -201,7 +201,11 @@ RX aggregated like the chip). Found on the way: data packets in an aggregated RX
 
 ## Phase 5: product
 
-Built 2026-11-07, simulated end to end in `Tests/sim_connect.c`; waiting for the adapter test.
+Built and run on the adapter 2026-11-07 (install, join, sleep/wake twice with automatic rejoin; see HARDWARE_LOG).
+Release polish for 0.6.0: RX with 16 asynchronous reads (`rx_async.c`, `rxq.c`) after an AP dropped us under load
+(reason 34), A-MPDU receive reordering (`reorder.c`), 5 GHz preference, versioning, firmware download at install,
+log rotation, diagnostics report, release workflow, user documentation (README, docs/ARCHITECTURE,
+TROUBLESHOOTING, PROTOCOL, SECURITY, CONTRIBUTING, CHANGELOG).
 
 - `macwifid` (`Sources/macwifictl/daemon.c`, compiled into the same binary as `macwifictl`; LaunchDaemon
   `io.github.fpm8588.macwifid`, KeepAlive, log `/Library/Logs/macwifid.log`): owns the adapter; polls for it,

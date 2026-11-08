@@ -1,35 +1,134 @@
-# macwifi-usb
+# MacWifi: USB Wi-Fi for Apple Silicon Macs (AIC8800 / UGREEN AX900)
 
-A free, open-source **user-space driver for the UGREEN AX900 (AICsemi AIC8800) USB Wi-Fi adapter** on
-**Apple Silicon Macs running macOS 27 Golden Gate**: no kernel extension, no DriverKit, no SIP changes, no paid
-Apple account.
+[![CI](https://github.com/fpm8588/macwifi-usb/actions/workflows/ci.yml/badge.svg)](https://github.com/fpm8588/macwifi-usb/actions/workflows/ci.yml)
 
-Apple's driver frameworks don't support third-party Wi-Fi hardware, so this runs as a background program that
-drives the adapter over USB and hands traffic to macOS through a virtual Ethernet interface. You pick networks
-in its own menu bar app; it won't appear in the system Wi-Fi menu. Background and design:
-[docs/RESEARCH.md](docs/RESEARCH.md).
+A free, open-source driver that makes **AICsemi AIC8800D80 USB Wi-Fi adapters**, like the **UGREEN AX900
+(CM762)**, work on **Apple Silicon Macs**. No kernel extension, no DriverKit, no changes to System Integrity
+Protection, no paid Apple developer account.
 
-**Adapters:** AICsemi AIC8800 family; developed and tested on a UGREEN AX900 that enumerates as `a69c:5723`
-(driver-CD mode). Other AIC8800D80 adapters (`a69c:57xx` → `a69c:8d80/8d81`) should behave the same.
+macOS has no way for third parties to add Wi-Fi hardware, so MacWifi runs as a small background service that
+drives the adapter over USB and gives macOS an ordinary network connection. You pick networks from its own menu
+bar icon (the adapter doesn't appear in the system Wi-Fi menu); everything else (Safari, apps, DNS, IPv6) just
+uses it like any other connection.
 
-## Status
+> **Status: public beta (0.6).** So far it has been tested on one Mac (macOS 27) with a UGREEN AX900. Bug reports
+> with the diagnostics report (see [Reporting a problem](#reporting-a-problem)) are very welcome.
 
-| Phase | What | State |
+## Contents
+
+- [What works](#what-works) · [Supported adapters](#supported-adapters) · [Install](#install) ·
+  [Using it](#using-it) · [Uninstall](#uninstall) · [Troubleshooting](docs/TROUBLESHOOTING.md) ·
+  [Reporting a problem](#reporting-a-problem) · [How it works](#how-it-works) · [Privacy and security](#privacy-and-security) ·
+  [Building from source](#building-from-source) · [Contributing](CONTRIBUTING.md) · [License](#license)
+
+## What works
+
+- WPA2-Personal (including the WPA2 side of WPA2/WPA3 "transition" networks) and open networks, 2.4 and 5 GHz,
+  802.11n/ac/ax access points
+- A menu bar app: networks with signal strength, lock and band; join; disconnect; forget; Wi-Fi on/off
+- Remembered networks, joined automatically when the adapter is plugged in, after a drop, and after sleep
+- Sleep and wake: the Mac sleeps normally; MacWifi disconnects cleanly first and reconnects after waking
+- macOS sees a normal network service ("UGREEN USB Wi-Fi (macwifi)") and configures it itself (DHCP and DNS;
+  IPv6 is enabled too but hasn't been tested yet); it's placed after your other connections, so wired Ethernet
+  or the built-in Wi-Fi still win when they're connected
+
+Not yet: WPA3-only networks (SAE), networks that require management frame protection (PMF), WPA2/WPA3-Enterprise,
+WEP, hidden networks, 6 GHz, roaming between access points of one network while connected, picking your regulatory
+country (a worldwide channel set is used: channels 1–14 at 2.4 GHz and 36–165 at 5 GHz; access points on DFS
+radar channels 52–144 are scanned but joining them hasn't been tested). See [CHANGELOG.md](CHANGELOG.md).
+
+## Supported adapters
+
+| Adapter | USB IDs | Status |
 |---|---|---|
-| 1 | `macwifictl`: find the adapter, switch it out of driver-CD mode, read the chip revision through the ROM; message framing + WPA2 crypto + 802.11 parsing libraries with tests | **Passed on the adapter** (2026-11-07) |
-| 2a | `macwifictl fwload`: upload the ROM patches and Wi-Fi firmware, start it | **Passed on the adapter** (2026-11-07) |
-| 2b | `macwifictl up`: start the Wi-Fi firmware, calibrate, read the MAC address | **Passed on the adapter** (2026-11-07) |
-| 3a | `macwifictl scan`: start the radio and list nearby networks | **Passed on the adapter** (2026-11-07) |
-| 3b | `macwifictl connect "SSID"`: data path, association, WPA2-PSK handshake, key install, DHCP probe | **Passed on the adapter** (2026-11-07) |
-| 4 | `sudo macwifictl join "SSID"`: macOS networking through a feth (virtual Ethernet) pair | **Passed on the adapter** (2026-11-07: Safari and a speed test over the UGREEN) |
-| 5 | Background service (`macwifid`), menu bar app, installer; sleep/wake | Built and simulated; waiting for the adapter test |
+| UGREEN AX900 (CM762) | `a69c:5723` (driver CD) → `a69c:8d81` | **Tested** |
+| Other AIC8800D80 adapters (e.g. some Tenda models) | `a69c:5721`–`5725`, `a69c:572f` → `a69c:8d80`/`8d81` | Should work (same chip), untested |
+| AIC8800 D40, DC, DW and other variants | `a69c:8800`, `8d40`, … | Detected but not supported yet (different firmware) |
 
-The phase-by-phase plan, written as a Claude Code prompt: [docs/PROMPT.md](docs/PROMPT.md). Results from the
-real adapter: [docs/HARDWARE_LOG.md](docs/HARDWARE_LOG.md).
+Not sure what you have? With the adapter plugged in, run `system_profiler SPUSBDataType | grep -B3 -A6 a69c`, or
+install MacWifi and run `macwifictl list --all`.
 
-## Install (menu bar app + background service)
+**Mac:** Apple Silicon (M1 or later), macOS 13 Ventura or newer. Developed on macOS 27.
 
-Install the free Xcode Command Line Tools once with `xcode-select --install`. Then, in Terminal:
+## Install
+
+1. Download `MacWifi-<version>.pkg` from the [latest release](https://github.com/fpm8588/macwifi-usb/releases).
+2. Install it. The package isn't signed with a paid Apple certificate, so double-clicking may say it "can't be
+   opened". Either right-click it → **Open** → **Open**, or install from Terminal:
+   ```bash
+   sudo installer -pkg ~/Downloads/MacWifi-0.6.0.pkg -target /
+   ```
+   The installer downloads the adapter's firmware (AICsemi's; it isn't redistributed here) from pinned commits
+   of the Linux driver and checks every file's SHA-256, so the Mac needs internet access while installing.
+3. A Wi-Fi icon appears in the menu bar. Plug in the adapter, click the icon, pick your network, type its password.
+
+**Upgrading:** install the newer package the same way; remembered networks are kept.
+Prefer to build it yourself? See [Building from source](#building-from-source).
+
+## Using it
+
+- **Menu bar icon**: lists nearby networks (strongest first) with signal bars, a lock for secured networks and
+  the band. Click one to join; you're asked for the password only the first time. Right-click a remembered
+  network to forget it. The switch at the top turns the adapter's Wi-Fi on and off.
+- **Plug and play**: when you plug the adapter in, MacWifi switches it out of its "driver CD" mode, loads the
+  firmware into it (nothing is written to the adapter itself), and joins the strongest remembered network.
+- **Sleep**: MacWifi never keeps your Mac awake. It leaves the network before sleep and rejoins after wake.
+- **Quit** in the menu closes only the menu; the connection stays up. The menu comes back at the next login.
+- **Terminal**: `macwifictl status` shows what the service is doing, `macwifictl networks` scans. The service's
+  log is `/Library/Logs/macwifid.log`.
+- **Which connection does macOS use?** The adapter's service is last in the service order, so a connected wired
+  Ethernet or the built-in Wi-Fi is preferred. To make the adapter preferred, use System Settings → Network → ⋯ →
+  Set Service Order, or just turn the built-in Wi-Fi off.
+
+## Uninstall
+
+```bash
+sudo "/Library/Application Support/macwifi/uninstall.sh"
+```
+
+This removes the service, the menu bar app, the remembered networks and the logs. Unplug the adapter afterwards;
+it returns to its factory state (the firmware only ever lives in its RAM).
+
+## Reporting a problem
+
+Run this and paste the output into a [new issue](https://github.com/fpm8588/macwifi-usb/issues/new/choose):
+
+```bash
+sh "/Library/Application Support/macwifi/report.sh"
+```
+
+It masks MAC addresses, IP addresses and network names; please look it over anyway, and never paste a password.
+Common problems and fixes are in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md).
+
+## How it works
+
+```
+ Safari, apps ── macOS networking ── feth4100 (virtual Ethernet, a normal network service: DHCP, DNS, IPv6)
+                                         │  frames
+ menu bar app ── control socket ──  macwifid  (root background service, user space)
+                                         │  USB (IOKit), Wi-Fi firmware messages, WPA2 handshake, bridge
+                                    UGREEN AX900 (AIC8800D80, "FullMAC": the chip does the 802.11 work)
+```
+
+The adapter's chip is "FullMAC": its firmware (loaded by MacWifi at plug-in) handles the radio, association and
+encryption. MacWifi talks to it with the same messages as the Linux driver, runs the WPA2 4-way handshake itself,
+installs the keys in the chip, and moves Ethernet frames between the chip and a macOS `feth` virtual Ethernet
+interface. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the control socket API:
+[docs/PROTOCOL.md](docs/PROTOCOL.md); research and design notes: [docs/RESEARCH.md](docs/RESEARCH.md).
+
+## Privacy and security
+
+- Your Wi-Fi password goes from the menu (or the terminal) straight to the service, which derives the WPA2 key
+  (PMK) from it and **never stores or logs the password itself**. Remembered networks are kept as name + PMK in
+  a file only root can read (`/Library/Application Support/macwifi/networks`).
+- The service runs as root (it has to, to create a network interface); the menu talks to it over a socket only
+  administrators can open.
+- Nothing is sent anywhere except your normal network traffic and, at install time, the firmware download.
+- More, and how to report a vulnerability: [SECURITY.md](SECURITY.md).
+
+## Building from source
+
+You need the free Xcode Command Line Tools (`xcode-select --install`); no Xcode, no Homebrew.
 
 ```bash
 git clone https://github.com/fpm8588/macwifi-usb.git && cd macwifi-usb
@@ -38,86 +137,36 @@ scripts/fetch-firmware.sh
 sudo installer -pkg build/MacWifi.pkg -target /
 ```
 
-A Wi-Fi icon appears in the menu bar ("UGREEN Wi-Fi"). Plug in the adapter, pick a network, type its password
-once. From then on:
+`./build.sh test` runs the hardware-free tests, including a full simulation of the adapter, an access point and
+macOS (see [CONTRIBUTING.md](CONTRIBUTING.md)). A package you build yourself includes the firmware you
+downloaded: fine for your own Macs, but please don't share it; the release package downloads the firmware at
+install time instead.
 
-- `macwifid`, a background service (LaunchDaemon), owns the adapter: it switches it out of driver-CD mode, loads
-  the firmware, joins the strongest remembered network, rejoins after drops, and waits quietly when the adapter
-  is unplugged. While connected, macOS sees a network service "UGREEN USB Wi-Fi (macwifi)"; it's last in the
-  service order, so a wired connection or the Mac's own Wi-Fi still wins when they're up.
-- **Sleep:** it never keeps the Mac awake (no power assertions). Before sleep it leaves the network and releases the
-  adapter cleanly, then lets the Mac sleep; after wake it brings the adapter back (whatever state it woke in) and
-  rejoins the remembered network by itself.
-- Remembered networks are stored as WPA2 keys derived from the password (PMKs), never the password itself, in a
-  root-only file in `/Library/Application Support/macwifi/`. "Forget This Network" (right-click in the menu)
-  deletes one.
-- `macwifictl status`, `macwifictl networks` show what the service is doing; its log is
-  `/Library/Logs/macwifid.log`.
-- The package contains AICsemi's firmware, downloaded on your Mac. Don't share the package itself.
+### Developer commands
 
-Uninstall: `sudo "/Library/Application Support/macwifi/uninstall.sh"` (removes the service, the app and the
-remembered networks).
-
-## Try it step by step (developer commands)
-
-These talk to the adapter directly, so uninstall the service first if it's installed (they refuse while it
-runs). Paste this (it has no comments, so it pastes cleanly into zsh):
+With the service uninstalled (these talk to the adapter directly and refuse while the service owns it):
 
 ```bash
-git clone https://github.com/fpm8588/macwifi-usb.git && cd macwifi-usb
-./build.sh test && ./build.sh cli
-scripts/fetch-firmware.sh
-build/macwifictl scan
-build/macwifictl connect "YourNetwork"
-sudo build/macwifictl join "YourNetwork"
+./build.sh cli
+build/macwifictl list --all                  # find the adapter
+build/macwifictl scan                        # bring it up and list networks
+build/macwifictl connect "YourNetwork"       # join, ask DHCP for an offer, count traffic, leave
+sudo build/macwifictl join "YourNetwork"     # join and give macOS a network interface until Ctrl-C
 ```
 
-What each command does:
-
-- `./build.sh test` runs the hardware-free tests; `./build.sh cli` builds `build/macwifictl` (arm64).
-- `scripts/fetch-firmware.sh` downloads AICsemi's firmware into `firmware/` (not part of this repository) from
-  pinned commits of the Linux driver and checks every file's SHA-256. There are two matched sets: newer chips
-  take the SDK V5 set; older "MCU1" chips, like the UGREEN AX900 tested here, need the SDK V3 set
-  (`fwload` picks automatically and prints which).
-- `sudo macwifictl join "SSID" [--seconds N]` connects like `connect`, then gives macOS a network interface,
-  `feth4100`, and passes traffic between it and the adapter until you press Ctrl-C (or for N seconds). While it
-  runs, `feth4100` is a regular network service ("UGREEN USB Wi-Fi (macwifi)", last in the service order), so
-  macOS configures it by DHCP and switches to it when your other connections go away. It needs `sudo` because creating a network interface needs root. It
-  prints a self-test (ping through `feth4100`, which interface macOS prefers, DNS). For the full test, turn the
-  Mac's own Wi-Fi off while `join` runs and use Safari, `ping apple.com` and `networkQuality`; turn Wi-Fi back
-  on before pressing Ctrl-C. On exit the service, `feth4100` and its peer `feth9100` are removed.
-- `macwifictl connect "SSID" [--seconds N]` runs `up`, finds the network, asks for its password on the
-  terminal (typed hidden; it is never printed, logged or saved), joins with WPA2-PSK, then asks the DHCP server
-  for an offer (without taking an address) and counts the traffic it hears for N seconds (default 15) before
-  leaving. It's the current end-to-end test. WPA2/WPA3 transition networks work through their WPA2 side;
-  WPA3-only networks and networks that require PMF aren't supported yet.
-- `macwifictl scan [SSID]` runs `up`, starts the radio and lists nearby networks (SSID, channel, signal,
-  security).
-- `macwifictl up` does everything below in one go: switch modes, load the firmware, then start the Wi-Fi
-  firmware and read the adapter's MAC address. Each step also exists on its own:
-- `macwifictl modeswitch` ejects the adapter's virtual driver CD, which switches it to Wi-Fi mode (`a69c:8d80`).
-  Needed after every plug-in.
-- `macwifictl fwload` uploads the firmware to the adapter's RAM and starts it; the adapter then reconnects as
-  `a69c:8d81`. Nothing is written to the adapter's flash; unplugging it returns it to factory state. If it
-  stops partway, unplug the adapter and plug it back in before trying again.
-- Also: `list` (find the adapter), `info` (USB descriptors), `identify` (chip revision through the ROM).
-
-If anything looks off, rerun with `MACWIFI_DEBUG=1` in front of the command to see every USB transfer.
-
-## Recovery
-
-Unplugging the adapter resets it completely (the firmware only lives in its RAM). If `join` was killed without
-cleaning up, remove its network service ("UGREEN USB Wi-Fi (macwifi)" in System Settings > Network) and its two
-interfaces; `join` also does this by itself the next time it runs:
-
-```bash
-sudo build/macwifictl cleanup
-```
-
-If the package is installed: `sudo "/Library/Application Support/macwifi/uninstall.sh"` removes everything.
+`MACWIFI_DEBUG=1` in front of any command dumps the USB traffic (key material is never printed). The full list:
+`build/macwifictl --help`. The phase-by-phase development plan is in [docs/PROMPT.md](docs/PROMPT.md) and every
+hardware test in [docs/HARDWARE_LOG.md](docs/HARDWARE_LOG.md).
 
 ## License
 
-GPL-2.0-only (later phases port the GPL-2.0 AIC8800 Linux driver). Files written from scratch for this project
-are also available under MIT; see [NOTICE.md](NOTICE.md). Firmware is AICsemi's and is downloaded by
-`scripts/fetch-firmware.sh`, never committed.
+GPL-2.0-only, because parts port the GPL-2.0 AIC8800 Linux driver
+([shenmintao/aic8800d80](https://github.com/shenmintao/aic8800d80), derived from AICsemi's driver). Files written
+from scratch for this project are also available under the MIT license; [NOTICE.md](NOTICE.md) lists which. The
+adapter firmware is AICsemi's, has no open-source license, and is never part of this repository or its release
+packages.
+
+## Acknowledgements
+
+The AIC8800 Linux driver authors and maintainers (the hardware facts come from their code); ZeroTier, whose
+`MacEthernetTapAgent` documented how macOS `feth` interfaces can carry Ethernet frames for a user-space program.

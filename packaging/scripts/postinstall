@@ -5,7 +5,15 @@ D="/Library/Application Support/macwifi"
 L=io.github.fpm8588.macwifid
 P=/Library/LaunchDaemons/$L.plist
 chown -R root:wheel "$D"
-chmod 755 "$D" "$D/macwifid" "$D/macwifictl" "$D/uninstall.sh"
+chmod 755 "$D" "$D/macwifid" "$D/macwifictl" "$D/uninstall.sh" "$D/fetch-firmware.sh" "$D/report.sh"
+# Release packages carry no firmware (AICsemi's, not open source): download it from the pinned Linux driver
+# commits and check every SHA-256, as scripts/fetch-firmware.sh does in the repository.
+if [ ! -f "$D/firmware/aic8800D80-legacy-mcu1/fmacfw_8800d80_u02.bin" ] || [ ! -f "$D/firmware/aic8800D80/fmacfw_8800d80_u02.bin" ]; then
+    echo "Downloading the adapter firmware..."
+    MW_FW_ROOT="$D" /bin/bash "$D/fetch-firmware.sh" >/dev/null 2>&1 ||
+        echo "Couldn't download the firmware (offline?). Later run: sudo MW_FW_ROOT=\"$D\" \"$D/fetch-firmware.sh\"" >&2
+    chown -R root:wheel "$D/firmware" 2>/dev/null
+fi
 touch /Library/Logs/macwifid.log && chmod 644 /Library/Logs/macwifid.log
 mkdir -p /usr/local/bin && ln -sf "$D/macwifictl" /usr/local/bin/macwifictl
 i=0

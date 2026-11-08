@@ -1,0 +1,87 @@
+# Troubleshooting
+
+First steps for almost anything: look at the menu's status line, then the service log:
+
+```bash
+macwifictl status
+tail -50 /Library/Logs/macwifid.log
+```
+
+If you open an issue, include the output of `sh "/Library/Application Support/macwifi/report.sh"` (it masks MAC
+addresses, IPs and network names).
+
+## The menu says "The macwifid service isn't running"
+
+```bash
+sudo launchctl bootstrap system /Library/LaunchDaemons/io.github.fpm8588.macwifid.plist
+sudo launchctl print system/io.github.fpm8588.macwifid | grep -E "state|last exit"
+```
+
+"Bootstrap failed: 5" just means it's already loaded. If it keeps exiting, the end of the log says why.
+
+## "Plug in the UGREEN adapter" although it's plugged in
+
+- Check that macOS sees it: `system_profiler SPUSBDataType | grep -B3 -A6 a69c`. Nothing listed: try another
+  port or cable; avoid unpowered hubs.
+- It shows `a69c:5723` but MacWifi doesn't switch it: macOS may not have mounted its virtual driver CD yet; give it
+  ten seconds. A Finder window showing the CD is harmless (MacWifi ejects it).
+- Your adapter has a different ID: see [Supported adapters](../README.md#supported-adapters).
+
+## "The adapter firmware isn't installed"
+
+The installer couldn't download it (no internet at install time). Run:
+
+```bash
+sudo MW_FW_ROOT="/Library/Application Support/macwifi" "/Library/Application Support/macwifi/fetch-firmware.sh"
+```
+
+## "The adapter didn't start; unplug it and plug it back in"
+
+The chip is in a state the service can't recover from by software (for example after being interrupted halfway
+through a firmware load). Unplugging resets it completely; the service picks it up again when you plug it back in.
+
+## A network I can see in the Mac's own Wi-Fi menu is missing or greyed out
+
+- Greyed out: its security isn't supported yet; hover over it for the reason. WPA3-only, PMF-required and
+  enterprise networks fall in this group.
+- Missing: hidden networks aren't listed, and 6 GHz and 5 GHz channels above 165 aren't scanned.
+- While connected, the list keeps networks seen in the last three minutes; click **Scan Again**.
+
+## "The password seems wrong"
+
+The access point stopped after the second handshake message, which is what happens with a wrong password. Retry
+with the right one (right-click the network → Join with a different password). If you're sure it's right, check
+that the network offers WPA2 (a WPA3-only network is shown greyed out).
+
+## Connected, but no internet
+
+- `macwifictl status` shows `"ip":""` for long: DHCP isn't answering. Check `tail /Library/Logs/macwifid.log`
+  for "macOS configured feth4100".
+- Another connection is preferred: MacWifi's service is last in the service order. Unplug Ethernet or turn the
+  built-in Wi-Fi off, or change System Settings → Network → ⋯ → Set Service Order.
+- A VPN or firewall that only allows known interfaces may block `feth4100`.
+
+## It disconnects now and then
+
+Look for "the network dropped us: reason N" in the log. Reason 34 means the access point thought we weren't
+acknowledging its frames; versions before 0.6 read USB one transfer at a time and could cause this under heavy
+download. Please report other reasons with the diagnostics report.
+
+## It doesn't reconnect after sleep
+
+The log should show `the Mac is going to sleep` … `asleep` … `the Mac is awake` … `auto-joining a remembered
+network`. If it stops at an error, unplug and replug the adapter, and report it with the diagnostics report.
+
+## The developer commands say the service owns the adapter
+
+`macwifictl scan/connect/join/fwload/up` drive the adapter directly and refuse while the service is running.
+Uninstall the service first, or use `macwifictl status` / `macwifictl networks`.
+
+## Remove everything
+
+```bash
+sudo "/Library/Application Support/macwifi/uninstall.sh"
+```
+
+If MacWifi was killed in a way that left its network service or interfaces behind, `sudo macwifictl cleanup` (or
+the next start of the service) removes them.

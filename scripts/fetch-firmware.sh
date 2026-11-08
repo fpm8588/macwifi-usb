@@ -9,7 +9,8 @@
 #
 # `macwifictl fwload` picks the set from the chip's ID register.
 set -euo pipefail
-cd "$(dirname "$0")/.."
+# MW_FW_ROOT: where firmware/ goes (the installer sets it to the install folder); default: the repository.
+cd "${MW_FW_ROOT:-$(dirname "$0")/..}"
 SHA256="shasum -a 256"; command -v shasum >/dev/null || SHA256=sha256sum
 
 fetch_set() {   # fetch_set <commit> <dest>; reads "sha256 name" lines on stdin
