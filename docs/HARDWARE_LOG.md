@@ -143,3 +143,46 @@ Scan done in 1.5 s: status 0, firmware counted 11 results; 17 frames, 11 network
 - The firmware sent SCANU_START_CFM_ADDTIONAL (no warning printed).
 - Two BSSs printed a blank SSID: their SSID element is non-empty but all NUL bytes (hidden networks). Now
   printed as "(hidden)".
+
+## 2026-11-07: Phase 3b passed (connect, WPA2-PSK, traffic)
+
+Commit `607967a`, adapter freshly plugged in (`connect` did the mode switch, firmware load and bring-up itself).
+Target: the user's home network, a WPA2/WPA3 transition network joined through its WPA2-PSK side. The network
+name, BSSIDs and addresses are deliberately not recorded here (this repository is public).
+
+```
+Looking for "<home network>"...
+  <bssid 2.4 GHz>  2432 MHz  RSSI  -44  WPA2/WPA3  usable
+  <bssid 5 GHz>    5745 MHz  RSSI  -35  WPA2/WPA3  usable
+Wi-Fi password for "<home network>" (not shown, not saved):
+Connecting to <bssid 5 GHz> on 5745 MHz...
+Associated in 0.40 s: AP station index 0, AID 0, QoS, 5745 MHz, width code 2
+  EAPOL: message 1 received, message 2 sent
+  EAPOL: message 3 accepted, message 4 sent
+  Pairwise key installed (hardware slot 16)
+  Group key installed (hardware slot 1)
+Connected: WPA2-PSK handshake done in 0.01 s, keys installed, port open.
+Listening for 15 s and asking the DHCP server for an offer...
+  DHCP offer received (arrived encrypted):
+    address    <private address>   (netmask /24, router and server = the gateway, lease 7200 s)
+  (only offered: nothing was requested, so no address was assigned)
+Traffic: 91 frames received (89 broadcast/multicast, 2 unencrypted): IPv4 62, ARP 3, IPv6 23, EAPOL 2, other 1; 4 not convertible; 4 frames sent
+Disconnected.
+```
+
+What the hardware confirmed:
+- `SM_CONNECT_REQ` as built (layout identical to the Linux struct) is accepted; the firmware authenticates and
+  associates on its own (0.40 s, 5 GHz channel 149, 80 MHz: width code 2 = `chnl2bw[2]`).
+- `SM_CONNECT_IND.ap_idx` (offset 10) is the station index the firmware wants for TX and the pairwise key: 0 here.
+  `aid` (offset 820) read 0, so this firmware apparently doesn't fill it; nothing depends on it.
+- TX on bulk OUT 0x01 with the hostdesc layout works: EAPOL messages 2 and 4 reached the AP (it sent message 3 and
+  then let us stay), and the DHCPDISCOVER (broadcast, staid = AP index) got an offer.
+- Our supplicant's PTK/MIC/GTK handling interoperates with a real consumer router. `MM_KEY_ADD_CFM` returns
+  hardware key slot 16 for the pairwise key and
+  slot 1 for the GTK (key index 1).
+- RX `hw_rxhdr.decr_status` is reported: only the two EAPOL frames before the keys arrived unencrypted; all 89
+  frames after the port opened, including the DHCP offer, were decrypted CCMP. The CCMP header is still present
+  (stripped by our 8-byte skip); a trailing MIC, if present, is harmless to the IP parsers.
+- 4 frames were "not convertible" and 1 had another ethertype; to look at in Phase 4 with `MACWIFI_DEBUG=1`
+  (likely 802.11 MPDUs the firmware forwards to the host, `is_80211_mpdu`, or a vendor ethertype from the router).
+- 4 frames sent = EAPOL 2 + EAPOL 4 + two DHCPDISCOVERs (the offer took more than 4 s, so the retry went out).

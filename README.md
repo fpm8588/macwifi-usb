@@ -20,8 +20,8 @@ in its own menu bar app; it won't appear in the system Wi-Fi menu. Background an
 | 2a | `macwifictl fwload`: upload the ROM patches and Wi-Fi firmware, start it | **Passed on the adapter** (2026-11-07) |
 | 2b | `macwifictl up`: start the Wi-Fi firmware, calibrate, read the MAC address | **Passed on the adapter** (2026-11-07) |
 | 3a | `macwifictl scan`: start the radio and list nearby networks | **Passed on the adapter** (2026-11-07) |
-| 3b | `macwifictl connect "SSID"`: data path, association, WPA2-PSK handshake, key install, DHCP probe | Built and simulated; waiting for the adapter test |
-| 4 | macOS networking via a feth (virtual Ethernet) pair | Planned |
+| 3b | `macwifictl connect "SSID"`: data path, association, WPA2-PSK handshake, key install, DHCP probe | **Passed on the adapter** (2026-11-07) |
+| 4 | macOS networking via a feth (virtual Ethernet) pair | Next |
 | 5 | LaunchDaemon, menu bar app, installer | Planned |
 
 The phase-by-phase plan, written as a Claude Code prompt: [docs/PROMPT.md](docs/PROMPT.md). Results from the

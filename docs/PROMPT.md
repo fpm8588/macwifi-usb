@@ -145,6 +145,9 @@ which phase 2a already does.
    The resulting bytes are pinned in `Tests/fmac_golden.h`. SCANU_START / ADD_IF / COEX were compared with the
    driver's own structs filled as `rwnx_send_*` fills them.
    → **Checkpoint: `macwifictl scan` lists your networks with sensible RSSI on 2.4 and 5 GHz.**
+Steps 2-5 PASSED on the adapter 2026-11-07 (WPA2/WPA3 transition home network, 5 GHz 80 MHz: handshake,
+keys, encrypted DHCP offer, 89 broadcast/multicast frames in 15 s; see HARDWARE_LOG.md).
+
 2. **Data path** (built, `Sources/Shared/aic_data.c`): TX on bulk OUT 0x01 = 4-byte header (length, type
    `0x01`) + `struct hostdesc` (28 bytes, ethertype in network order, staid = the AP's station index for all
    station-mode traffic, tid 0 → BE) + the payload without its Ethernet header; EAPOL asks for a TX confirmation
