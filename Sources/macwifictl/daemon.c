@@ -479,6 +479,7 @@ static void d_release(Daemon *d, Adapter *a) {
     if (!a->up) return;
     d_disconnect(d, a);
     pthread_mutex_destroy(&a->c.tx_lock);
+    link_rx_stop(&a->l);
     d->h.release(&a->l);
     a->up = 0;
 }
@@ -724,6 +725,7 @@ static int daemon_main(const DaemonHooks *hooks) {
                 d_set_error(d, "");
                 uint8_t vif = 0;
                 if (d->h.acquire(&a->l, a->mac, &vif) == 0) {
+                    link_rx_start(&a->l);
                     pthread_mutex_lock(&d->mu);
                     d->adapter = 1;
                     pthread_mutex_unlock(&d->mu);

@@ -44,6 +44,8 @@
 #include "feth.h"
 #include "json.h"
 #include "power.h"
+#include "rx_async.h"
+#include "rxq.h"
 #include "knownnet.h"
 
 extern char **environ;
@@ -164,11 +166,34 @@ typedef struct {
     Intf intf;
     UInt8 in_pipe, out_pipe, msg_pipe;   // pipe refs (0 = none)
     UInt8 out_ep;                         // endpoint number behind out_pipe (data must go to bulk OUT 0x01)
+    RxQ *rxq;                             // when set, bulk IN is read asynchronously into this queue
+    RxAsync *rx;
     const AicId *id;
     int dev_open;                         // 0 when macOS's composite-device driver holds the device
 } Link;
 
+// Starts the asynchronous bulk-IN reader (several reads in flight; rx_async.c). Used once the radio is up and
+// everything goes through pump(); before that (firmware load, bring-up) reads are synchronous.
+static void link_rx_start(Link *l) {
+    if (l->rx) return;
+    l->rxq = rxq_new(8192, 64u << 20);
+    l->rx = l->rxq ? rx_async_start(l->intf, l->in_pipe, l->rxq) : NULL;
+    if (!l->rx) { rxq_free(l->rxq); l->rxq = NULL; }
+}
+
+static void link_rx_stop(Link *l) {
+    if (!l->rx) return;
+    rx_async_stop(l->rx);
+    RxQStats s;
+    rxq_stats(l->rxq, &s);
+    printf("RX: %lu transfers, deepest queue %zu, dropped %lu\n", s.pushed, s.max_depth, s.dropped);
+    rxq_free(l->rxq);
+    l->rx = NULL;
+    l->rxq = NULL;
+}
+
 static void link_close(Link *l) {
+    link_rx_stop(l);
     if (l->intf) { (*l->intf)->USBInterfaceClose(l->intf); (*l->intf)->Release(l->intf); }
     if (l->dev) {
         if (l->dev_open) (*l->dev)->USBDeviceClose(l->dev);
@@ -1259,13 +1284,25 @@ static int pump(Conn *c, int timeout_ms, int (*done)(const Conn *)) {
         if (gStop) return -1;
         if ((now_s() - t0) * 1000 >= timeout_ms) return 1;
         UInt32 size = sizeof buf;
-        IOReturn kr = (*c->l->intf)->ReadPipeTO(c->l->intf, c->l->in_pipe, buf, &size, 200, 200);
-        if (kr == kIOUSBTransactionTimeout || kr == kIOReturnTimeout) continue;
-        if (kr != kIOReturnSuccess) {
-            fprintf(stderr, "bulk IN failed: 0x%08x\n", kr);
-            if (kr == kIOUSBPipeStalled) (*c->l->intf)->ClearPipeStallBothEnds(c->l->intf, c->l->in_pipe);
-            c->usb_error = 1;
-            return -1;
+        if (c->l->rxq) {                       // asynchronous reader: take the next completed transfer
+            int err = 0;
+            long got = rxq_pop(c->l->rxq, buf, sizeof buf, 200, &err);
+            if (got == 0) continue;
+            if (got < 0) {
+                fprintf(stderr, "bulk IN failed: 0x%08x\n", (unsigned)err);
+                c->usb_error = 1;
+                return -1;
+            }
+            size = (UInt32)got;
+        } else {
+            IOReturn kr = (*c->l->intf)->ReadPipeTO(c->l->intf, c->l->in_pipe, buf, &size, 200, 200);
+            if (kr == kIOUSBTransactionTimeout || kr == kIOReturnTimeout) continue;
+            if (kr != kIOReturnSuccess) {
+                fprintf(stderr, "bulk IN failed: 0x%08x\n", kr);
+                if (kr == kIOUSBPipeStalled) (*c->l->intf)->ClearPipeStallBothEnds(c->l->intf, c->l->in_pipe);
+                c->usb_error = 1;
+                return -1;
+            }
         }
         hexdump("IN", buf, size);
         size_t off = 0;
@@ -1893,6 +1930,7 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
     memset(&ws, 0, sizeof ws);
     if (secured && ask_pmk((const uint8_t *)ssid, ssid_len, ws.pmk)) return 2;
 
+    link_rx_start(&l);                     // several bulk-IN reads in flight from here on
     static Conn c;
     memset(&c, 0, sizeof c);
     c.l = &l;
@@ -1954,6 +1992,7 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
 
     // 6. Leave cleanly.
     conn_leave(&c);
+    link_rx_stop(&l);
     signal(SIGINT, SIG_DFL);
     signal(SIGTERM, SIG_DFL);
     signal(SIGHUP, SIG_DFL);

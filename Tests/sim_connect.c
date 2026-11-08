@@ -379,6 +379,43 @@ static IOReturn f_read(void *self, UInt8 pipe, void *buf, UInt32 *n, UInt32 a, U
 }
 static IOReturn f_clear(void *self, UInt8 pipe) { (void)self; (void)pipe; return kIOReturnSuccess; }
 
+// ---------------------------------------------------------------- stand-in for the async USB reader
+// Same interface as rx_async.c: a thread keeps reading the simulated device and fills the RxQ.
+struct RxAsync {
+    pthread_t th;
+    atomic_int stop;
+    RxQ *q;
+};
+static IOReturn f_read(void *self, UInt8 pipe, void *buf, UInt32 *n, UInt32 a, UInt32 b);
+static atomic_int gRxStarted;
+static void *feeder(void *arg) {
+    RxAsync *r = (RxAsync *)arg;
+    uint8_t *buf = malloc(32768);
+    while (!r->stop) {
+        UInt32 n = 32768;
+        IOReturn kr = f_read(NULL, 2, buf, &n, 0, 0);
+        if (kr == kIOUSBTransactionTimeout) continue;
+        if (kr != kIOReturnSuccess) { rxq_push_error(r->q, kr); break; }
+        rxq_push(r->q, buf, n);
+    }
+    free(buf);
+    return NULL;
+}
+RxAsync *rx_async_start(void *intf, uint8_t pipe, RxQ *q) {
+    (void)intf; (void)pipe;
+    RxAsync *r = calloc(1, sizeof *r);
+    r->q = q;
+    pthread_create(&r->th, NULL, feeder, r);
+    gRxStarted++;
+    return r;
+}
+void rx_async_stop(RxAsync *r) {
+    r->stop = 1;
+    pthread_join(r->th, NULL);
+    free(r);
+    gRxStarted--;
+}
+
 // ---------------------------------------------------------------- a fake feth pair ("macOS" side of join)
 static struct {
     atomic_int dhcp_set, none_set, offer_to_host, arp_to_host, v6_to_host, echo_to_host, plain_to_host, eapol_to_host, reads;
@@ -735,6 +772,7 @@ int main(void) {
     CHECK(S.discs == 1);
 
     test_daemon();
+    CHECK(gRxStarted == 0);    // every reader that was started was stopped
 
     printf("sim_connect: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
