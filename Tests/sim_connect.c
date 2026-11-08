@@ -96,8 +96,10 @@ static void in_tx_cfm(uint32_t status, uint32_t idx) {
 }
 
 // A From-DS (QoS) data frame carrying `eth` (DA, SA, type, payload), optionally "decrypted CCMP": protected bit,
-// CCMP header and an 8-byte MIC left in place.
-static void in_data(const uint8_t *eth, size_t len, int ccmp) {
+// CCMP header and an 8-byte MIC left in place. `sn` >= 0 also flags it "need reorder" (block-ack session).
+static void in_data_sn(const uint8_t *eth, size_t len, int ccmp, int sn);
+static void in_data(const uint8_t *eth, size_t len, int ccmp) { in_data_sn(eth, len, ccmp, -1); }
+static void in_data_sn(const uint8_t *eth, size_t len, int ccmp, int sn) {
     uint8_t b[4096] = {0};
     uint8_t *f = b + 60;
     size_t n = 0;
@@ -117,6 +119,10 @@ static void in_data(const uint8_t *eth, size_t len, int ccmp) {
     b[36] = (uint8_t)((ccmp ? 3 : 0) << 2);
     b[42] = 0x6c; b[43] = 0x09;                             // 2412 MHz
     b[49] = 0; b[50] = AP_IDX; b[51] = 0xff;
+    if (sn >= 0) {
+        f[22] = (uint8_t)(sn << 4); f[23] = (uint8_t)(sn >> 4);   // sequence control
+        b[48] |= 0x20;                                             // need reorder
+    }
     q_push_data(b, 60 + n);
 }
 
@@ -259,6 +265,12 @@ static void on_msg(uint16_t id, const uint8_t *p, uint16_t plen) {
             memcpy(eth, kMac, 6); memcpy(eth + 6, "\x02\x00\x00\x00\x00\x09", 6);
             eth[12] = 0x08; eth[13] = 0x00; eth[14] = 0x45; eth[15] = 0xAB;
             in_data(eth, 14 + 40, 0);
+            // a block-ack burst arriving out of order (sequence 20, 22, 21): macOS must see 20, 21, 22
+            for (int k = 0; k < 3; k++) {
+                static const int order[3] = {20, 22, 21};
+                eth[15] = (uint8_t)(0xC0 + order[k] - 20);
+                in_data_sn(eth, 14 + 40, 1, order[k]);
+            }
             break;
         }
         case AIC_SM_DISCONNECT_REQ:
@@ -419,6 +431,7 @@ void rx_async_stop(RxAsync *r) {
 // ---------------------------------------------------------------- a fake feth pair ("macOS" side of join)
 static struct {
     atomic_int dhcp_set, none_set, offer_to_host, arp_to_host, v6_to_host, echo_to_host, plain_to_host, eapol_to_host, reads;
+    atomic_int ba_seen;   // order of the block-ack burst as macOS saw it: base-4 digits, first frame most significant
 } H;
 static uint8_t hbuf[8192];
 
@@ -439,6 +452,7 @@ int feth_open(Feth *f, const uint8_t mac[6]) {
     f->blen = sizeof hbuf;
     H.reads = 0;              // each new interface: macOS asks for DHCP again
     H.offer_to_host = 0;
+    H.ba_seen = 0;
     gFethOpen++;
     return 0;
 }
@@ -466,6 +480,7 @@ int feth_write(Feth *f, const uint8_t *eth, size_t len) {
     if (eth[12] == 0x08 && eth[13] == 0x06) H.arp_to_host++;
     if (eth[12] == 0x86 && eth[13] == 0xDD) H.v6_to_host++;
     if (eth[12] == 0x08 && eth[13] == 0x00 && len > 15 && eth[15] == 0xAB) H.plain_to_host++;
+    if (eth[12] == 0x08 && eth[13] == 0x00 && len > 15 && eth[15] >= 0xC0 && eth[15] <= 0xC2) H.ba_seen = H.ba_seen * 4 + (eth[15] - 0xC0 + 1);
     DhcpReply r;
     if (dhcp_parse_reply(eth, len, kMac, 0x51515151, &r) == 0 && r.type == 2) H.offer_to_host++;
     return 0;
@@ -768,6 +783,7 @@ int main(void) {
     CHECK(S.dhcp_seen == 1 && S.dhcp_sta_ok && S.data_bad == 0);   // only macOS's DISCOVER went out
     CHECK(H.offer_to_host == 1 && H.arp_to_host == 1);
     CHECK(H.v6_to_host == 1);   // 2nd packet of an aggregated transfer, starting at an unaligned offset
+    CHECK(H.ba_seen == 1 * 16 + 2 * 4 + 3);   // out-of-order block-ack burst delivered as 20, 21, 22
     CHECK(H.echo_to_host == 0 && H.plain_to_host == 0 && H.eapol_to_host == 0);
     CHECK(S.discs == 1);
 

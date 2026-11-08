@@ -44,6 +44,7 @@
 #include "feth.h"
 #include "json.h"
 #include "power.h"
+#include "reorder.h"
 #include "rx_async.h"
 #include "rxq.h"
 #include "knownnet.h"
@@ -1205,6 +1206,12 @@ typedef struct {
     unsigned long to_host, to_host_bytes, host_write_err, reord, rx_malformed;
     atomic_ulong from_host, from_host_bytes;   // written by the macOS->air thread
     unsigned long drop_to[BRIDGE_DROP_COUNT], drop_from[BRIDGE_DROP_COUNT];
+    // A-MPDU receive reordering (frames the chip flags "need reorder"): one unit per MPDU =
+    // [decryption status][u16 length][Ethernet frame]..., released in sequence order by reorder.c
+    Reorder ro;
+    uint8_t unit[8192];
+    size_t unit_len;
+    int unit_over;
 } Conn;
 
 static void conn_send_eth(Conn *c, const uint8_t *eth, size_t len, int eapol) {
@@ -1275,6 +1282,29 @@ static void on_eth(void *ctx, const uint8_t *eth, size_t len) {
     else c->rx_other++;
 }
 
+static void collect_unit(void *ctx, const uint8_t *eth, size_t len) {
+    Conn *c = (Conn *)ctx;
+    if (c->unit_len + 2 + len > sizeof c->unit) { c->unit_over = 1; return; }
+    c->unit[c->unit_len] = (uint8_t)len;
+    c->unit[c->unit_len + 1] = (uint8_t)(len >> 8);
+    memcpy(c->unit + c->unit_len + 2, eth, len);
+    c->unit_len += 2 + len;
+}
+
+static void deliver_unit(void *ctx, const uint8_t *u, size_t n) {
+    Conn *c = (Conn *)ctx;
+    if (n < 1) return;
+    uint8_t saved = c->cur_decr;
+    c->cur_decr = u[0];
+    for (size_t o = 1; o + 2 <= n;) {
+        size_t l = (size_t)(u[o] | (u[o + 1] << 8));
+        if (o + 2 + l > n) break;
+        on_eth(c, u + o + 2, l);
+        o += 2 + l;
+    }
+    c->cur_decr = saved;
+}
+
 // Reads the bulk IN pipe for up to `timeout_ms`, handling messages, data and TX confirmations, until `done` says
 // so. Returns 0 when done, 1 on timeout, -1 on a USB error or Ctrl-C.
 static int pump(Conn *c, int timeout_ms, int (*done)(const Conn *)) {
@@ -1284,9 +1314,10 @@ static int pump(Conn *c, int timeout_ms, int (*done)(const Conn *)) {
         if (gStop) return -1;
         if ((now_s() - t0) * 1000 >= timeout_ms) return 1;
         UInt32 size = sizeof buf;
+        if (ro_pending(&c->ro)) ro_tick(&c->ro, now_s(), deliver_unit, c);
         if (c->l->rxq) {                       // asynchronous reader: take the next completed transfer
             int err = 0;
-            long got = rxq_pop(c->l->rxq, buf, sizeof buf, 200, &err);
+            long got = rxq_pop(c->l->rxq, buf, sizeof buf, ro_pending(&c->ro) ? 20 : 200, &err);
             if (got == 0) continue;
             if (got < 0) {
                 fprintf(stderr, "bulk IN failed: 0x%08x\n", (unsigned)err);
@@ -1369,7 +1400,22 @@ static int pump(Conn *c, int timeout_ms, int (*done)(const Conn *)) {
             c->cur_decr = ri.decr_status;
             if (ri.need_reord) c->reord++;
             if (ri.rssi) c->last_rssi = ri.rssi;
-            if (aic_data_rx_to_eth(&ri, scratch, sizeof scratch, on_eth, c) < 0) c->rx_not_eth++;
+            // Block-ack session frames: QoS data, TID from the QoS control field, sequence number from the
+            // sequence control field; put back in order before they go anywhere (as CONFIG_RX_REORDER does).
+            const uint8_t *f = ri.frame;
+            if (ri.need_reord && ri.frame_len >= 26 && ((f[0] >> 2) & 3) == 2 && (f[0] & 0x80) && !(f[0] & 0x40)) {
+                uint16_t sn = (uint16_t)((f[22] | (f[23] << 8)) >> 4);
+                uint8_t tid = f[24] & 0x0f;
+                c->unit[0] = ri.decr_status;
+                c->unit_len = 1;
+                c->unit_over = 0;
+                int r = aic_data_rx_to_eth(&ri, scratch, sizeof scratch, collect_unit, c);
+                if (r < 0) c->rx_not_eth++;
+                else if (c->unit_over) aic_data_rx_to_eth(&ri, scratch, sizeof scratch, on_eth, c);   // too big to hold
+                else if (c->unit_len > 1) ro_rx(&c->ro, tid, sn, c->unit, c->unit_len, now_s(), deliver_unit, c);
+            } else if (aic_data_rx_to_eth(&ri, scratch, sizeof scratch, on_eth, c) < 0) {
+                c->rx_not_eth++;
+            }
         }
         if (r < 0 && ++c->rx_malformed <= 5) {
             const uint8_t *h = buf + off;
@@ -1585,6 +1631,8 @@ static void conn_reset_assoc(Conn *c) {
     c->port_open = 0;
     c->last_eapol_cfm = 0;
     c->open_net = 0;
+    ro_reset(&c->ro);
+    c->ro.timeout_s = 0.05;                 // REORDER_UPDATE_TIME: 50 ms
 }
 
 typedef enum { JOIN_OK = 0, JOIN_FW, JOIN_ASSOC, JOIN_PASSWORD, JOIN_TIMEOUT, JOIN_STOPPED } JoinResult;
@@ -1684,6 +1732,7 @@ static void conn_leave(Conn *c) {
     }
     c->associated = 0;
     c->port_open = 0;
+    ro_reset(&c->ro);
 }
 
 // ---------------------------------------------------------------- bridge to macOS (feth pair)
@@ -1809,7 +1858,9 @@ static void bridge_stop(Conn *c) {
         if (c->drop_to[v]) printf("  dropped on the way to macOS (%s): %lu\n", bridge_verdict_name((BridgeVerdict)v), c->drop_to[v]);
         if (c->drop_from[v]) printf("  dropped on the way from macOS (%s): %lu\n", bridge_verdict_name((BridgeVerdict)v), c->drop_from[v]);
     }
-    if (c->reord) printf("  %lu frames were flagged for reordering (Linux reorders them; not done here yet)\n", c->reord);
+    if (c->reord)
+        printf("  reordering: %lu frames flagged; %lu in order, %lu held back, %lu late, %lu duplicates, %lu gaps skipped\n",
+               c->reord, c->ro.in_order, c->ro.buffered, c->ro.late, c->ro.dups, c->ro.timeouts);
 }
 
 // `join`: bridge until Ctrl-C, `seconds`, or a disconnect. 0 if macOS got an address.
