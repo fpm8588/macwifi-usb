@@ -172,13 +172,23 @@ keys, encrypted DHCP offer, 89 broadcast/multicast frames in 15 s; see HARDWARE_
 
 ## Phase 4: macOS networking
 
-1. `feth` pair (root): `fethA` for macOS, `fethB` for raw I/O; `fethA` lladdr = the adapter's MAC; BPF read
-   (immediate, see-sent off, header-complete on) + `AF_NDRV` write, as ZeroTier does.
-2. Bridge loop: Ethernet from macOS → AIC TX descriptor → USB; USB RX → Ethernet → macOS. Drop while not
-   connected; EAPOL goes to the supplicant, not macOS.
-3. `ipconfig set fethA DHCP`; check `scutil --nwi`, `route -n get default`, `scutil --dns`. If DNS is only
-   supplemental, register a proper network service via SystemConfiguration from the daemon; fallback to `utun`
-   + in-daemon DHCP only if both fail.
+Built (`sudo macwifictl join "SSID"`), simulated in `Tests/sim_connect.c` (fake firmware + AP + fake feth), waiting
+for the adapter test.
+
+1. `feth` pair (root, `Sources/macwifictl/feth.c`): `feth4100` for macOS (lladdr = the adapter's MAC, MTU 1500),
+   `feth9100` its peer for raw I/O; BPF on the peer (BIOCSBLEN 128 KiB, immediate, see-sent off, header-complete
+   on, promiscuous, 250 ms read timeout) + `AF_NDRV` bound and connected to the peer, as ZeroTier's tap agent
+   does. A leftover pair from an earlier run is removed; a foreign `feth4100`/`feth9100` is left alone.
+2. Bridge (`Sources/Shared/bridge.c` rules, tested): RX loop → Ethernet → AF_NDRV; a second thread: BPF →
+   AIC TX descriptor → bulk OUT 0x01 (a mutex serialises the data pipe with EAPOL replies). Dropped: EAPOL
+   either way (the supplicant owns it), frames from macOS with another source address or over 1518 bytes,
+   unencrypted frames once keys are installed, unicast for other addresses, and **our own broadcasts reflected by
+   the AP** (otherwise macOS sees its own ARP/ND and reports address conflicts). Group rekeys keep working.
+3. `ipconfig set feth4100 DHCP`, then a self-test bound to `feth4100` (ping router and 1.1.1.1 with `ping -b`,
+   default-route interface, resolvers mentioning feth4100, `scutil --nwi` order); `ipconfig set feth4100 NONE`
+   and interface removal on exit (Ctrl-C, SIGTERM, SIGHUP). The open question stays: does the `ipconfig`
+   (temporary) service get DNS and become primary when the built-in Wi-Fi is off? If not: register a proper
+   network service via SystemConfiguration; fallback `utun` + in-daemon DHCP only if both fail.
    → **Checkpoint: built-in Wi-Fi off, UGREEN connected; Safari loads pages, `ping apple.com` works,
    `networkQuality` numbers logged.**
 

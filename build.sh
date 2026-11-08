@@ -42,11 +42,13 @@ run_tests() {
     "$B/test_data"
     $cc "${CFLAGS[@]}" Tests/test_dhcp.c "$S/dhcp.c" -o "$B/test_dhcp"
     "$B/test_dhcp"
+    $cc "${CFLAGS[@]}" Tests/test_bridge.c "$S/bridge.c" -o "$B/test_bridge"
+    "$B/test_bridge"
     if [[ "$(uname)" != "Darwin" ]]; then
         # connect logic from main.c against a simulated firmware + AP, behind stand-in IOKit headers
         $cc "${CFLAGS[@]}" -Wno-unused-function -no-pie -I Tests/macstubs -I Sources/macwifictl Tests/sim_connect.c \
             Sources/macwifictl/descdump.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" \
-            "$S/aic_data.c" "$S/dhcp.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" $libs \
+            "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" $libs -lpthread \
             -Wl,--unresolved-symbols=ignore-all -o "$B/sim_connect"
         "$B/sim_connect" > "$B/sim_connect.log" || { cat "$B/sim_connect.log"; exit 1; }
         tail -1 "$B/sim_connect.log"
@@ -63,7 +65,7 @@ build_cli() {
     [[ "$(uname)" == "Darwin" ]] || { echo "macwifictl needs macOS (IOKit)"; exit 1; }
     echo "== macwifictl (arm64)"
     clang "${CFLAGS[@]}" -arch arm64 -mmacosx-version-min=$MINOS -Wno-deprecated-declarations \
-        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" "$S/aic_data.c" "$S/dhcp.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" \
+        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c Sources/macwifictl/feth.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" \
         -framework IOKit -framework CoreFoundation -o "$B/macwifictl"
     codesign --force --sign - "$B/macwifictl"
     file "$B/macwifictl"

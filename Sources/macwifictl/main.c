@@ -17,9 +17,11 @@
 #include <IOKit/IOKitLib.h>
 #include <IOKit/usb/IOUSBLib.h>
 
+#include <pthread.h>
 #include <readpassphrase.h>
 #include <signal.h>
 #include <spawn.h>
+#include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -32,11 +34,13 @@
 #include "aic_fwload.h"
 #include "aic_data.h"
 #include "aic_msg.h"
+#include "bridge.h"
 #include "dhcp.h"
 #include "eapol.h"
 #include "ieee80211.h"
 #include "wpa.h"
 #include "descdump.h"
+#include "feth.h"
 
 extern char **environ;
 
@@ -1125,7 +1129,8 @@ typedef struct {
     Link *l;
     uint8_t mac[6], bssid[6], vif;
     // association
-    int connect_cfm, associated, disconnected;
+    int connect_cfm, associated;
+    atomic_int disconnected;          // also read by the macOS->air thread
     uint8_t connect_status;
     uint16_t disc_reason;
     AicConnectInd ind;
@@ -1133,7 +1138,8 @@ typedef struct {
     // handshake
     WpaSupplicant *ws;
     uint8_t snonce[32];
-    int pending, keys_installed, port_open, eapol_rejects;
+    int pending, keys_installed, eapol_rejects;
+    atomic_int port_open;
     uint8_t next_cfm_idx, last_eapol_idx;
     int last_eapol_cfm;
     uint32_t last_eapol_status;
@@ -1149,6 +1155,13 @@ typedef struct {
     uint8_t offer_decr;
     DhcpReply reply;
     unsigned rx, rx_group, rx_ipv4, rx_arp, rx_ipv6, rx_eapol, rx_other, rx_plain, rx_not_eth, tx;
+    // Phase 4 bridge (frames to/from macOS through a feth pair)
+    Feth *feth;
+    atomic_int bridging;
+    pthread_mutex_t tx_lock;          // the data pipe is written by the RX loop (EAPOL) and the macOS->air thread
+    unsigned long to_host, to_host_bytes, host_write_err, reord;
+    atomic_ulong from_host, from_host_bytes;   // written by the macOS->air thread
+    unsigned long drop_to[BRIDGE_DROP_COUNT], drop_from[BRIDGE_DROP_COUNT];
 } Conn;
 
 static void conn_send_eth(Conn *c, const uint8_t *eth, size_t len, int eapol) {
@@ -1160,7 +1173,10 @@ static void conn_send_eth(Conn *c, const uint8_t *eth, size_t len, int eapol) {
         c->last_eapol_cfm = 0;
     }
     size_t n = aic_data_build_tx(out, sizeof out, eth, len, c->vif, c->ind.ap_idx, 0, idx);
-    if (n && link_send_data(c->l, out, n) == 0) c->tx++;
+    if (!n) return;
+    pthread_mutex_lock(&c->tx_lock);
+    if (link_send_data(c->l, out, n) == 0) c->tx++;
+    pthread_mutex_unlock(&c->tx_lock);
 }
 
 static void on_eth(void *ctx, const uint8_t *eth, size_t len) {
@@ -1170,6 +1186,12 @@ static void on_eth(void *ctx, const uint8_t *eth, size_t len) {
     if (eth[0] & 1) c->rx_group++;
     if (!c->cur_decr) c->rx_plain++;
     uint16_t type = (uint16_t)((eth[12] << 8) | eth[13]);
+    if (c->bridging && c->feth && type != 0x888E) {
+        BridgeVerdict v = bridge_to_host(eth, len, c->mac, c->cur_decr != 0, c->keys_installed);
+        if (v != BRIDGE_PASS) c->drop_to[v]++;
+        else if (feth_write(c->feth, eth, len) == 0) { c->to_host++; c->to_host_bytes += len; }
+        else c->host_write_err++;
+    }
     if (type == 0x888E) {
         c->rx_eapol++;
         if (!c->associated || !c->ws || memcmp(eth + 6, c->bssid, 6) != 0) return;
@@ -1285,6 +1307,7 @@ static int pump(Conn *c, int timeout_ms, int (*done)(const Conn *)) {
             AicRxInfo ri;
             if (aic_data_parse_rx(pk.packet, pk.packet_len, &ri) != 0) { c->rx_not_eth++; continue; }
             c->cur_decr = ri.decr_status;
+            if (ri.need_reord) c->reord++;
             if (aic_data_rx_to_eth(&ri, scratch, sizeof scratch, on_eth, c) < 0) c->rx_not_eth++;
         }
         if (r < 0) fprintf(stderr, "malformed IN transfer (%u bytes); set MACWIFI_DEBUG=1 to see it\n", size);
@@ -1322,6 +1345,32 @@ static int install_key(Conn *c, int pairwise, const uint8_t *key, uint8_t len, u
         return -1;
     }
     printf("  %s key installed (hardware slot %u)\n", pairwise ? "Pairwise" : "Group", c->plen > 1 ? c->params[1] : 0);
+    return 0;
+}
+
+// Acts on what the supplicant reported (keys to install, control port to open). Returns 0, or -1 if the firmware
+// refused a step.
+static int handle_wpa_events(Conn *c, WpaSupplicant *ws) {
+    int ev = c->pending;
+    c->pending = 0;
+    if (ev & WPA_EV_INSTALL_PTK) {
+        // Let message 4 leave unencrypted before the pairwise key exists (wpa_supplicant's order).
+        pump(c, 500, w_eapol_cfm);
+        if (!c->last_eapol_cfm) printf("  (no TX confirmation for message 4 within 500 ms; continuing)\n");
+        else if (!(c->last_eapol_status & AIC_TXST_ACKED))
+            printf("  (message 4 TX status 0x%x: not acknowledged by the AP)\n", c->last_eapol_status);
+        if (install_key(c, 1, WPA_TK(ws->ptk), 16, 0)) return -1;
+        c->keys_installed = 1;
+    }
+    if ((ev & WPA_EV_INSTALL_GTK) && ws->gtk_len) {
+        if (install_key(c, 0, ws->gtk, (uint8_t)ws->gtk_len, (uint8_t)ws->gtk_idx)) return -1;
+    }
+    if ((ev & WPA_EV_DONE) && !c->port_open) {
+        uint8_t cp[AIC_SZ_CTRL_PORT_REQ];
+        aic_fmac_ctrl_port_params(cp, c->ind.ap_idx, 1);
+        if (conn_call(c, AIC_ME_SET_CONTROL_PORT_REQ, cp, sizeof cp, AIC_ME_SET_CONTROL_PORT_CFM, 2000)) return -1;
+        c->port_open = 1;
+    }
     return 0;
 }
 
@@ -1399,7 +1448,7 @@ static void print_ip(const char *label, const uint8_t a[4]) {
     if (a[0] | a[1] | a[2] | a[3]) printf("    %-10s %u.%u.%u.%u\n", label, a[0], a[1], a[2], a[3]);
 }
 
-static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *ssid, int listen_s);
+static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *ssid, int listen_s, Feth *feth);
 
 static int cmd_connect(int argc, char **argv) {
     if (argc < 3 || argv[2][0] == '-' || !argv[2][0] || strlen(argv[2]) > 32) {
@@ -1417,13 +1466,142 @@ static int cmd_connect(int argc, char **argv) {
     int rc = up_link(argc, argv, &l, mac);
     if (rc) return rc;
     rc = radio_start(&l, mac, &vif);
-    if (!rc) rc = connect_run(&l, mac, vif, ssid, listen_s);
+    if (!rc) rc = connect_run(&l, mac, vif, ssid, listen_s, NULL);
+    link_close(&l);
+    return rc;
+}
+
+// ---------------------------------------------------------------- Phase 4: join (bridge to macOS via feth)
+
+static void *host_to_air(void *arg) {
+    Conn *c = (Conn *)arg;
+    while (c->bridging && !gStop) {
+        long n = feth_read(c->feth);
+        if (n < 0) { perror("BPF read"); break; }
+        size_t off = 0, cl = 0;
+        const uint8_t *pk = NULL;
+        while (bridge_bpf_next(c->feth->rbuf, (size_t)n, &off, &pk, &cl) == 1) {
+            BridgeVerdict v = bridge_from_host(pk, cl, c->mac);
+            if (v != BRIDGE_PASS) { c->drop_from[v]++; continue; }
+            if (!c->port_open || c->disconnected) continue;
+            conn_send_eth(c, pk, cl, 0);
+            c->from_host++;
+            c->from_host_bytes += cl;
+        }
+    }
+    return NULL;
+}
+
+// Checks run once macOS has an address; output goes straight to the terminal. Bound to the feth interface with
+// ping -b so they test this path even while the Mac's own Wi-Fi is on.
+static const char kSelfTest[] =
+    "N=" FETH_NAME "; sleep 3\n"
+    "R=$(ipconfig getoption $N router); D=$(ipconfig getoption $N domain_name_server)\n"
+    "echo \"  [self-test] router ${R:-none}, DNS server from DHCP ${D:-none}\"\n"
+    "[ -n \"$R\" ] && echo \"  [self-test] ping router:  $(ping -b $N -c 3 -t 6 -q $R | grep transmitted)\"\n"
+    "echo \"  [self-test] ping 1.1.1.1: $(ping -b $N -c 3 -t 6 -q 1.1.1.1 | grep transmitted)\"\n"
+    "echo \"  [self-test] default route now uses: $(route -n get default 2>/dev/null | awk '/interface:/{print $2}')\"\n"
+    "echo \"  [self-test] resolvers mentioning $N: $(scutil --dns | grep -c \"($N)\")\"\n"
+    "echo \"  [self-test] macOS interface order (scutil --nwi):\"\n"
+    "scutil --nwi | sed -n '/IPv4 network interface information/,/REACH/p' | sed 's/^/      /'\n";
+
+static int bridge_run(Conn *c, WpaSupplicant *ws, int seconds) {
+    c->bridging = 1;
+    pthread_t th;
+    if (pthread_create(&th, NULL, host_to_air, c) != 0) {
+        c->bridging = 0;
+        fprintf(stderr, "couldn't start the macOS->air thread\n");
+        return 1;
+    }
+    const char *dhcp[] = {"/usr/sbin/ipconfig", "set", FETH_NAME, "DHCP", NULL};
+    if (feth_run(dhcp) != 0) fprintf(stderr, "ipconfig set %s DHCP failed\n", FETH_NAME);
+    printf("Bridging: %s is up and macOS is asking for an address by DHCP. Press Ctrl-C to stop.\n", FETH_NAME);
+    fflush(stdout);
+
+    double t0 = now_s(), last_status = t0, last_ip_check = 0;
+    char ip[64] = "";
+    pid_t test_pid = 0;
+    int rc = 0;
+    while (!gStop && !c->disconnected && (seconds <= 0 || now_s() - t0 < seconds)) {
+        pump(c, 500, w_pending);
+        if (c->pending && handle_wpa_events(c, ws)) { rc = 1; break; }
+        double t = now_s();
+        if (!ip[0] && t - last_ip_check >= 1) {
+            last_ip_check = t;
+            feth_ipv4(c->feth, ip, sizeof ip);
+            if (ip[0]) {
+                printf("macOS configured %s: %s (after %.1f s)\n", FETH_NAME, ip, t - t0);
+                fflush(stdout);
+                test_pid = (pid_t)feth_spawn_sh(kSelfTest);
+            }
+        }
+        if (test_pid && waitpid(test_pid, NULL, WNOHANG) == test_pid) {
+            test_pid = 0;
+            printf("  [self-test] done. Now try it with the Mac's own Wi-Fi turned off (see README).\n");
+            fflush(stdout);
+        }
+        if (t - last_status >= 30) {
+            last_status = t;
+            printf("  [%4.0f s] air->Mac %lu frames (%.1f MB), Mac->air %lu frames (%.1f MB)\n", t - t0, c->to_host,
+                   c->to_host_bytes / 1e6, c->from_host, c->from_host_bytes / 1e6);
+            fflush(stdout);
+        }
+    }
+    if (c->disconnected) {
+        printf("The access point disconnected us: reason %u (%s).\n", c->disc_reason, reason_text(c->disc_reason));
+        rc = 1;
+    }
+    if (!ip[0] && rc == 0) rc = 1;
+    c->bridging = 0;
+    pthread_join(th, NULL);
+    if (test_pid) { kill(test_pid, SIGTERM); waitpid(test_pid, NULL, 0); }
+    const char *none[] = {"/usr/sbin/ipconfig", "set", FETH_NAME, "NONE", NULL};
+    feth_run(none);
+    double el = now_s() - t0;
+    printf("Bridged for %.0f s: air->Mac %lu frames (%.1f MB), Mac->air %lu frames (%.1f MB)%s\n", el, c->to_host,
+           c->to_host_bytes / 1e6, c->from_host, c->from_host_bytes / 1e6, c->host_write_err ? " (some writes failed)" : "");
+    for (int v = 1; v < BRIDGE_DROP_COUNT; v++) {
+        if (c->drop_to[v]) printf("  dropped on the way to macOS (%s): %lu\n", bridge_verdict_name((BridgeVerdict)v), c->drop_to[v]);
+        if (c->drop_from[v]) printf("  dropped on the way from macOS (%s): %lu\n", bridge_verdict_name((BridgeVerdict)v), c->drop_from[v]);
+    }
+    if (c->reord) printf("  %lu frames were flagged for reordering (Linux reorders them; not done here yet)\n", c->reord);
+    return rc;
+}
+
+static int cmd_join(int argc, char **argv) {
+    if (argc < 3 || argv[2][0] == '-' || !argv[2][0] || strlen(argv[2]) > 32) {
+        fprintf(stderr, "usage: sudo macwifictl join \"SSID\" [--seconds N] [--profile v5|legacy] [--fw DIR]\n");
+        return 2;
+    }
+    if (geteuid() != 0) {
+        fprintf(stderr, "join creates a network interface for macOS, which needs root: run it with sudo.\n");
+        return 2;
+    }
+    const char *secs_opt = opt(argc, argv, "--seconds");
+    int seconds = secs_opt ? atoi(secs_opt) : 0;
+    Link l;
+    uint8_t mac[6], vif = 0;
+    int rc = up_link(argc, argv, &l, mac);
+    if (rc) return rc;
+    rc = radio_start(&l, mac, &vif);
+    if (!rc) {
+        static Feth f;
+        if (feth_open(&f, mac)) {
+            rc = 1;
+        } else {
+            printf("Created %s for macOS (MAC %02x:%02x:%02x:%02x:%02x:%02x; peer %s for raw I/O)\n", f.name, mac[0],
+                   mac[1], mac[2], mac[3], mac[4], mac[5], f.peer);
+            rc = connect_run(&l, mac, vif, argv[2], seconds, &f);
+            feth_close(&f);
+            printf("Removed %s and %s.\n", FETH_NAME, FETH_PEER);
+        }
+    }
     link_close(&l);
     return rc;
 }
 
 // Everything after the radio is up: scan, password, associate, handshake, probe, disconnect. Leaves `l` open.
-static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *ssid, int listen_s) {
+static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *ssid, int listen_s, Feth *feth) {
     Link l = *lp;
     size_t ssid_len = strlen(ssid);
 
@@ -1490,8 +1668,12 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
     memcpy(c.bssid, best->bss.bssid, 6);
     c.vif = vif;
     c.ws = &ws;
+    c.feth = feth;
+    pthread_mutex_init(&c.tx_lock, NULL);
     arc4random_buf(c.snonce, sizeof c.snonce);
     signal(SIGINT, on_sigint);
+    signal(SIGTERM, on_sigint);
+    signal(SIGHUP, on_sigint);
 
     // 3. Associate.
     printf("Connecting to %02x:%02x:%02x:%02x:%02x:%02x on %d MHz...\n", c.bssid[0], c.bssid[1], c.bssid[2],
@@ -1521,26 +1703,7 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
         double th = now_s();
         while (!c.port_open && !c.disconnected && !gStop && now_s() - th < 15) {
             pump(&c, 1000, w_pending);
-            int ev = c.pending;
-            c.pending = 0;
-            if (ev & WPA_EV_INSTALL_PTK) {
-                // Let message 4 leave unencrypted before the pairwise key exists (wpa_supplicant's order).
-                pump(&c, 500, w_eapol_cfm);
-                if (!c.last_eapol_cfm) printf("  (no TX confirmation for message 4 within 500 ms; continuing)\n");
-                else if (!(c.last_eapol_status & AIC_TXST_ACKED))
-                    printf("  (message 4 TX status 0x%x: not acknowledged by the AP)\n", c.last_eapol_status);
-                if (install_key(&c, 1, WPA_TK(ws.ptk), 16, 0)) break;
-                c.keys_installed = 1;
-            }
-            if ((ev & WPA_EV_INSTALL_GTK) && ws.gtk_len) {
-                if (install_key(&c, 0, ws.gtk, (uint8_t)ws.gtk_len, (uint8_t)ws.gtk_idx)) break;
-            }
-            if ((ev & WPA_EV_DONE) && !c.port_open) {
-                uint8_t cp[AIC_SZ_CTRL_PORT_REQ];
-                aic_fmac_ctrl_port_params(cp, c.ind.ap_idx, 1);
-                if (conn_call(&c, AIC_ME_SET_CONTROL_PORT_REQ, cp, sizeof cp, AIC_ME_SET_CONTROL_PORT_CFM, 2000)) break;
-                c.port_open = 1;
-            }
+            if (handle_wpa_events(&c, &ws)) break;
         }
         if (!c.port_open) {
             if (c.disconnected)
@@ -1553,7 +1716,9 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
         } else {
             stage = 2;
             printf("Connected: WPA2-PSK handshake done in %.2f s, keys installed, port open.\n", now_s() - th);
-
+          if (feth) {
+            if (bridge_run(&c, &ws, listen_s) == 0) stage = 3;
+          } else {
             // 5. DHCP probe: DISCOVER only (no address is taken), and count what arrives.
             printf("Listening for %d s and asking the DHCP server for an offer...\n", listen_s);
             fflush(stdout);
@@ -1583,6 +1748,7 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
             }
             if (c.rx > base) stage = 3;
             if (c.disconnected) printf("  Disconnected: reason %u (%s).\n", c.disc_reason, reason_text(c.disc_reason));
+          }
         }
     }
 
@@ -1598,8 +1764,17 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
         if (conn_call(&c, AIC_SM_DISCONNECT_REQ, d, sizeof d, AIC_SM_DISCONNECT_CFM, 3000) == 0) printf("Disconnected.\n");
     }
     signal(SIGINT, SIG_DFL);
+    signal(SIGTERM, SIG_DFL);
+    signal(SIGHUP, SIG_DFL);
+    pthread_mutex_destroy(&c.tx_lock);
     secure_zero(&ws, sizeof ws);
     secure_zero(c.snonce, sizeof c.snonce);
+    if (feth) {
+        printf("\n%s\n", stage == 3 ? "Phase 4: the bridge ran and macOS got an address. Report the self-test lines "
+                                       "and the Wi-Fi-off checks."
+                         : "join stopped. Unplug and replug the adapter before the next try.");
+        return stage == 3 ? 0 : 1;
+    }
     printf("\n%s\n", stage == 3 ? "Phase 3b hardware check passed: connected and traffic flowed."
                      : stage == 2 ? "Connected, but no traffic arrived. Unplug and replug the adapter, then try "
                                     "again with MACWIFI_DEBUG=1."
@@ -1611,7 +1786,8 @@ static void usage(void) {
     fprintf(stderr, "usage: macwifictl list [--all] | modeswitch | info | identify | memr <addr> | memw <addr> <val>\n"
                     "       fwload [--profile v5|legacy] [--fw DIR] | up [--profile v5|legacy] [--fw DIR] |\n"
                     "       scan [SSID] [--profile v5|legacy] [--fw DIR] |\n"
-                    "       connect SSID [--seconds N] [--profile v5|legacy] [--fw DIR]\n"
+                    "       connect SSID [--seconds N] [--profile v5|legacy] [--fw DIR] |\n"
+                    "       join SSID [--seconds N] [--profile v5|legacy] [--fw DIR]   (with sudo)\n"
                     "Supported: AICsemi AIC8800 family, e.g. UGREEN AX900 (CM762). MACWIFI_DEBUG=1 dumps USB traffic.\n");
 }
 
@@ -1627,6 +1803,7 @@ int main(int argc, char **argv) {
     if (!strcmp(c, "up")) return cmd_up(argc, argv);
     if (!strcmp(c, "scan")) return cmd_scan(argc, argv);
     if (!strcmp(c, "connect")) return cmd_connect(argc, argv);
+    if (!strcmp(c, "join")) return cmd_join(argc, argv);
     if ((!strcmp(c, "memr") && argc > 2) || (!strcmp(c, "memw") && argc > 3)) {
         Link l;
         int rc = link_open(&l);

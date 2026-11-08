@@ -21,7 +21,7 @@ in its own menu bar app; it won't appear in the system Wi-Fi menu. Background an
 | 2b | `macwifictl up`: start the Wi-Fi firmware, calibrate, read the MAC address | **Passed on the adapter** (2026-11-07) |
 | 3a | `macwifictl scan`: start the radio and list nearby networks | **Passed on the adapter** (2026-11-07) |
 | 3b | `macwifictl connect "SSID"`: data path, association, WPA2-PSK handshake, key install, DHCP probe | **Passed on the adapter** (2026-11-07) |
-| 4 | macOS networking via a feth (virtual Ethernet) pair | Next |
+| 4 | `sudo macwifictl join "SSID"`: macOS networking through a feth (virtual Ethernet) pair | Built and simulated; waiting for the adapter test |
 | 5 | LaunchDaemon, menu bar app, installer | Planned |
 
 The phase-by-phase plan, written as a Claude Code prompt: [docs/PROMPT.md](docs/PROMPT.md). Results from the
@@ -38,6 +38,7 @@ git clone https://github.com/fpm8588/macwifi-usb.git && cd macwifi-usb
 scripts/fetch-firmware.sh
 build/macwifictl scan
 build/macwifictl connect "YourNetwork"
+sudo build/macwifictl join "YourNetwork"
 ```
 
 What each command does:
@@ -47,6 +48,12 @@ What each command does:
   pinned commits of the Linux driver and checks every file's SHA-256. There are two matched sets: newer chips
   take the SDK V5 set; older "MCU1" chips, like the UGREEN AX900 tested here, need the SDK V3 set
   (`fwload` picks automatically and prints which).
+- `sudo macwifictl join "SSID" [--seconds N]` connects like `connect`, then gives macOS a network interface,
+  `feth4100`, and passes traffic between it and the adapter until you press Ctrl-C (or for N seconds). macOS
+  configures `feth4100` itself by DHCP. It needs `sudo` because creating a network interface needs root. It
+  prints a self-test (ping through `feth4100`, which interface macOS prefers, DNS). For the full test, turn the
+  Mac's own Wi-Fi off while `join` runs and use Safari, `ping apple.com` and `networkQuality`; turn Wi-Fi back
+  on before pressing Ctrl-C. On exit `feth4100` and its peer `feth9100` are removed.
 - `macwifictl connect "SSID" [--seconds N]` runs `up`, finds the network, asks for its password on the
   terminal (typed hidden; it is never printed, logged or saved), joins with WPA2-PSK, then asks the DHCP server
   for an offer (without taking an address) and counts the traffic it hears for N seconds (default 15) before
@@ -67,12 +74,14 @@ If anything looks off, rerun with `MACWIFI_DEBUG=1` in front of the command to s
 
 ## Recovery
 
-Later phases install a background daemon. To remove everything it sets up:
+Unplugging the adapter resets it completely (the firmware only lives in its RAM). If `join` was killed without
+cleaning up, remove its two interfaces (they are also removed automatically the next time `join` runs):
 
 ```bash
-sudo launchctl bootout system/io.github.fpm8588.macwifid 2>/dev/null
-for i in $(ifconfig -l | tr ' ' '\n' | grep '^feth'); do sudo ifconfig $i destroy; done
+sudo ifconfig feth9100 destroy; sudo ifconfig feth4100 destroy
 ```
+
+Phase 5 will add a background daemon; its removal command will be listed here.
 
 ## License
 

@@ -39,6 +39,7 @@ jobs:
           ./build/macwifictl scan;       [ $? -eq 3 ] || exit 1
           ./build/macwifictl connect;    [ $? -eq 2 ] || exit 1   # 2 = usage (no SSID)
           ./build/macwifictl connect TestNet < /dev/null; [ $? -eq 3 ] || exit 1   # no adapter: never prompts
+          ./build/macwifictl join TestNet;  [ $? -eq 2 ] || exit 1   # 2 = needs sudo (checked before anything else)
           ./build/macwifictl list;       [ $? -eq 3 ] || exit 1   # no adapter on the runner
           ./build/macwifictl list --all; echo "list --all exit $?"
           lipo -archs build/macwifictl | grep -q arm64 || exit 1

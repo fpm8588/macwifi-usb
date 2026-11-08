@@ -43,12 +43,19 @@ static Sim S;
 static uint8_t qbuf[64][4096];
 static UInt32 qlen[64];
 static int qh, qt;
+static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;   // join writes from two threads, like the real device
 
 static void q_push(const uint8_t *p, size_t n) {
-    if (qt - qh >= 64 || n > sizeof qbuf[0]) { fprintf(stderr, "sim queue overflow\n"); failures++; return; }
-    memcpy(qbuf[qt % 64], p, n);
-    qlen[qt % 64] = (UInt32)n;
-    qt++;
+    pthread_mutex_lock(&qlock);
+    if (qt - qh >= 64 || n > sizeof qbuf[0]) {
+        fprintf(stderr, "sim queue overflow\n");
+        failures++;
+    } else {
+        memcpy(qbuf[qt % 64], p, n);
+        qlen[qt % 64] = (UInt32)n;
+        qt++;
+    }
+    pthread_mutex_unlock(&qlock);
 }
 
 static void in_msg(uint16_t id, const uint8_t *params, uint16_t plen) {
@@ -210,6 +217,14 @@ static void on_msg(uint16_t id, const uint8_t *p, uint16_t plen) {
             memcpy(eth, "\x33\x33\x00\x00\x00\x01", 6);
             eth[12] = 0x86; eth[13] = 0xDD;
             in_data(eth, 14 + 40, 1);
+            // our own broadcast reflected by the AP (must not reach macOS), and a plaintext frame after the
+            // keys are in place (must not reach macOS either)
+            memset(eth, 0xff, 6); memcpy(eth + 6, kMac, 6);
+            eth[12] = 0x08; eth[13] = 0x06;
+            in_data(eth, 14 + 28, 1);
+            memcpy(eth, kMac, 6); memcpy(eth + 6, "\x02\x00\x00\x00\x00\x09", 6);
+            eth[12] = 0x08; eth[13] = 0x00; eth[14] = 0x45; eth[15] = 0xAB;
+            in_data(eth, 14 + 40, 0);
             break;
         }
         case AIC_SM_DISCONNECT_REQ:
@@ -285,7 +300,15 @@ static void on_data(const uint8_t *b, size_t n) {
     }
 }
 
+static pthread_mutex_t wlock = PTHREAD_MUTEX_INITIALIZER;   // the simulated device handles one transfer at a time
+static IOReturn f_write_locked(void *self, UInt8 pipe, void *buf, UInt32 n, UInt32 a, UInt32 b);
 static IOReturn f_write(void *self, UInt8 pipe, void *buf, UInt32 n, UInt32 a, UInt32 b) {
+    pthread_mutex_lock(&wlock);
+    IOReturn r = f_write_locked(self, pipe, buf, n, a, b);
+    pthread_mutex_unlock(&wlock);
+    return r;
+}
+static IOReturn f_write_locked(void *self, UInt8 pipe, void *buf, UInt32 n, UInt32 a, UInt32 b) {
     (void)self; (void)a; (void)b;
     const uint8_t *p = (const uint8_t *)buf;
     if (pipe == 3) {
@@ -303,21 +326,79 @@ static IOReturn f_write(void *self, UInt8 pipe, void *buf, UInt32 n, UInt32 a, U
 
 static IOReturn f_read(void *self, UInt8 pipe, void *buf, UInt32 *n, UInt32 a, UInt32 b) {
     (void)self; (void)pipe; (void)a; (void)b;
-    if (qh == qt) { usleep(2000); return kIOUSBTransactionTimeout; }
+    pthread_mutex_lock(&qlock);
+    if (qh == qt) {
+        pthread_mutex_unlock(&qlock);
+        usleep(2000);
+        return kIOUSBTransactionTimeout;
+    }
     UInt32 len = qlen[qh % 64];
     if (len > *n) len = *n;
     memcpy(buf, qbuf[qh % 64], len);
     *n = len;
     qh++;
+    pthread_mutex_unlock(&qlock);
     return kIOReturnSuccess;
 }
 static IOReturn f_clear(void *self, UInt8 pipe) { (void)self; (void)pipe; return kIOReturnSuccess; }
+
+// ---------------------------------------------------------------- a fake feth pair ("macOS" side of join)
+static struct {
+    int dhcp_set, none_set, offer_to_host, arp_to_host, echo_to_host, plain_to_host, eapol_to_host, reads;
+} H;
+static uint8_t hbuf[8192];
+
+static size_t bpf_rec(uint8_t *b, size_t off, const uint8_t *pkt, size_t n) {
+    memset(b + off, 0, 18);
+    b[off + 8] = (uint8_t)n; b[off + 9] = (uint8_t)(n >> 8);
+    b[off + 12] = b[off + 8]; b[off + 13] = b[off + 9];
+    b[off + 16] = 18;
+    memcpy(b + off + 18, pkt, n);
+    return off + ((18 + n + 3) & ~(size_t)3);
+}
+
+int feth_open(Feth *f, const uint8_t mac[6]) { (void)mac; memset(f, 0, sizeof *f); f->rbuf = hbuf; f->blen = sizeof hbuf; return 0; }
+long feth_read(Feth *f) {
+    f->rbuf = hbuf;
+    if (H.reads++ == 0) {   // what macOS sends right after the interface comes up
+        uint8_t fr[600];
+        size_t len = 0, n = dhcp_build_discover(fr, sizeof fr, kMac, 0x51515151);
+        len = bpf_rec(hbuf, len, fr, n);
+        memcpy(fr + 6, "\x02\x66\x66\x66\x66\x66", 6);          // foreign source: must be dropped
+        len = bpf_rec(hbuf, len, fr, n);
+        uint8_t ea[60] = {0};
+        memcpy(ea, kBssid, 6); memcpy(ea + 6, kMac, 6); ea[12] = 0x88; ea[13] = 0x8E;   // EAPOL from macOS: dropped
+        len = bpf_rec(hbuf, len, ea, sizeof ea);
+        return (long)len;
+    }
+    usleep(20000);
+    return 0;
+}
+int feth_write(Feth *f, const uint8_t *eth, size_t len) {
+    (void)f;
+    if (len < 14) return -1;
+    if (!memcmp(eth + 6, kMac, 6)) H.echo_to_host++;
+    if (eth[12] == 0x88 && eth[13] == 0x8E) H.eapol_to_host++;
+    if (eth[12] == 0x08 && eth[13] == 0x06) H.arp_to_host++;
+    if (eth[12] == 0x08 && eth[13] == 0x00 && len > 15 && eth[15] == 0xAB) H.plain_to_host++;
+    DhcpReply r;
+    if (dhcp_parse_reply(eth, len, kMac, 0x51515151, &r) == 0 && r.type == 2) H.offer_to_host++;
+    return 0;
+}
+void feth_close(Feth *f) { (void)f; }
+void feth_ipv4(const Feth *f, char *out, size_t cap) { (void)f; snprintf(out, cap, "%s", H.offer_to_host ? "192.0.2.77" : ""); }
+int feth_run(const char *const argv[]) {
+    if (argv[3] && !strcmp(argv[3], "DHCP")) H.dhcp_set++;
+    if (argv[3] && !strcmp(argv[3], "NONE")) H.none_set++;
+    return 0;
+}
+int feth_spawn_sh(const char *script) { (void)script; return 0; }
 
 static IOUSBInterfaceInterface300 gVt;
 static IOUSBInterfaceInterface300 *gVtp = &gVt;
 static const AicId gId = {0xa69c, 0x8d81, AIC_MODE_WIFI, "sim", 1};
 
-static int sim_run(const char *ssid_wanted, int listen_s) {
+static int sim_run_feth(const char *ssid_wanted, int listen_s, Feth *feth) {
     qh = qt = 0;
     gStop = 0;
     gVt.WritePipeTO = f_write;
@@ -328,8 +409,9 @@ static int sim_run(const char *ssid_wanted, int listen_s) {
     l.intf = &gVtp;
     l.in_pipe = 2; l.out_pipe = 1; l.msg_pipe = 3; l.out_ep = 1;
     l.id = &gId;
-    return connect_run(&l, kMac, 0, ssid_wanted, listen_s);
+    return connect_run(&l, kMac, 0, ssid_wanted, listen_s, feth);
 }
+static int sim_run(const char *ssid_wanted, int listen_s) { return sim_run_feth(ssid_wanted, listen_s, NULL); }
 
 static void reset(const char *ssid, const char *ap_pass) {
     memset(&S, 0, sizeof S);
@@ -383,6 +465,21 @@ int main(void) {
     gPass = "short";
     rc = sim_run("ExampleNet", 1);
     CHECK(rc == 2 && S.connects == 0);
+
+    printf("---- join: bridge to a (fake) macOS interface\n");
+    reset("ExampleNet", "correct horse battery");
+    gPass = "correct horse battery";
+    memset(&H, 0, sizeof H);
+    Feth fe;
+    feth_open(&fe, kMac);
+    rc = sim_run_feth("ExampleNet", 2, &fe);
+    CHECK(rc == 0);
+    CHECK(S.ptk_ok && S.gtk_ok && S.port_open && !S.ptk_before_msg4);
+    CHECK(H.dhcp_set == 1 && H.none_set == 1);
+    CHECK(S.dhcp_seen == 1 && S.dhcp_sta_ok && S.data_bad == 0);   // only macOS's DISCOVER went out
+    CHECK(H.offer_to_host == 1 && H.arp_to_host == 1);
+    CHECK(H.echo_to_host == 0 && H.plain_to_host == 0 && H.eapol_to_host == 0);
+    CHECK(S.discs == 1);
 
     printf("sim_connect: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
