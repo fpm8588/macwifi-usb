@@ -220,3 +220,31 @@ macOS configured feth4100: <private address> (after 6.5 s)
 - Cause: `ipconfig set` creates a temporary service that, per ipconfig(8), lasts only until the next network
   configuration change. Fix in the next commit: a persistent network service for feth4100 in the network
   preferences, removed on exit.
+
+## 2026-11-07: Phase 4 passed (`join` with a persistent network service): internet over the adapter
+
+Commit `189d8d4`. The Mac's wired connection (a USB Ethernet adapter on the same network) was taken away by
+unplugging its cable while `join` ran; the user then browsed and ran a speed test with all traffic going over
+the UGREEN. Addresses, MACs and the network name are deliberately not recorded here.
+
+```
+Created feth4100 for macOS (MAC <adapter>; peer feth9100 for raw I/O)
+Added the network service "UGREEN USB Wi-Fi (macwifi)" for feth4100 (System Settings > Network shows it while this runs).
+Bridging: feth4100 is up and macOS is asking for an address by DHCP. Press Ctrl-C to stop.
+macOS configured feth4100: <private address> (after 6.7 s)
+  [self-test] ping router:  3 packets transmitted, 3 packets received, 0.0% packet loss
+  [self-test] ping 1.1.1.1: 3 packets transmitted, 3 packets received, 0.0% packet loss
+  [  30 s] feth4100 <address>; air->Mac 352 frames (0.1 MB), Mac->air 322 frames (0.1 MB)
+  [  60 s] feth4100 <address>; air->Mac 41449 frames (51.9 MB), Mac->air 47834 frames (26.3 MB)
+  [  90 s] feth4100 <address>; air->Mac 104831 frames (115.5 MB), Mac->air 134354 frames (120.4 MB)
+```
+
+- The persistent network service fixed attempt 1: macOS kept the address through the network change (no
+  "removed the address" line) and switched to feth4100 when the wired connection went away. Speed test and Safari
+  worked over the adapter (5 GHz, 80 MHz). Between 30 s and 90 s about 115 MB came in and 120 MB went out.
+- Found under load: ~8,800 "malformed IN transfer" messages. Cause: the RX parser padded every **data** packet
+  to 4 bytes. The firmware aggregates several packets per bulk-IN transfer and Linux walks them with
+  `read += pkt_len + RX_HWHRD_LEN` (no padding; only config packets are rounded up, `aicwf_process_rxframes`,
+  legacy-mcu1, with `aicwf_usb_rx_aggr = true` for the UGREEN product id). So everything after an odd-length
+  packet in a transfer was lost or misread; TCP retransmitted, which cost throughput. Fixed in the next commit
+  (`aic_rx_next`), with a test for unaligned packets and a simulation that aggregates RX like the chip.

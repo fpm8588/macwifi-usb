@@ -108,7 +108,8 @@ enum {
 #define AIC_USB_TYPE_CFG_DATA_CFM 0x12
 
 #define AIC_RX_HW_HDR_LEN         60     // [TX] RX_HWHRD_LEN, added to data packets' length field
-#define AIC_RX_ALIGNMENT          4      // [TX]
+#define AIC_RX_ALIGNMENT          4      // [TX] config packets only; data packets are not padded
+                                         // (aicwf_txrxif.c aicwf_process_rxframes: read += pkt_len + 60)
 #define AIC_USB_MAX_PKT           2048   // [UH]
 
 // ---------------------------------------------------------------- Firmware (Phase 2)  [D8], fw/aic8800D80/

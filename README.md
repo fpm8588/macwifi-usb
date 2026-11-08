@@ -21,8 +21,8 @@ in its own menu bar app; it won't appear in the system Wi-Fi menu. Background an
 | 2b | `macwifictl up`: start the Wi-Fi firmware, calibrate, read the MAC address | **Passed on the adapter** (2026-11-07) |
 | 3a | `macwifictl scan`: start the radio and list nearby networks | **Passed on the adapter** (2026-11-07) |
 | 3b | `macwifictl connect "SSID"`: data path, association, WPA2-PSK handshake, key install, DHCP probe | **Passed on the adapter** (2026-11-07) |
-| 4 | `sudo macwifictl join "SSID"`: macOS networking through a feth (virtual Ethernet) pair | Built and simulated; waiting for the adapter test |
-| 5 | LaunchDaemon, menu bar app, installer | Planned |
+| 4 | `sudo macwifictl join "SSID"`: macOS networking through a feth (virtual Ethernet) pair | **Passed on the adapter** (2026-11-07: Safari and a speed test over the UGREEN) |
+| 5 | LaunchDaemon, menu bar app, installer | Next |
 
 The phase-by-phase plan, written as a Claude Code prompt: [docs/PROMPT.md](docs/PROMPT.md). Results from the
 real adapter: [docs/HARDWARE_LOG.md](docs/HARDWARE_LOG.md).

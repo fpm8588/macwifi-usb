@@ -1159,7 +1159,7 @@ typedef struct {
     Feth *feth;
     atomic_int bridging;
     pthread_mutex_t tx_lock;          // the data pipe is written by the RX loop (EAPOL) and the macOS->air thread
-    unsigned long to_host, to_host_bytes, host_write_err, reord;
+    unsigned long to_host, to_host_bytes, host_write_err, reord, rx_malformed;
     atomic_ulong from_host, from_host_bytes;   // written by the macOS->air thread
     unsigned long drop_to[BRIDGE_DROP_COUNT], drop_from[BRIDGE_DROP_COUNT];
 } Conn;
@@ -1310,7 +1310,12 @@ static int pump(Conn *c, int timeout_ms, int (*done)(const Conn *)) {
             if (ri.need_reord) c->reord++;
             if (aic_data_rx_to_eth(&ri, scratch, sizeof scratch, on_eth, c) < 0) c->rx_not_eth++;
         }
-        if (r < 0) fprintf(stderr, "malformed IN transfer (%u bytes); set MACWIFI_DEBUG=1 to see it\n", size);
+        if (r < 0 && ++c->rx_malformed <= 5) {
+            const uint8_t *h = buf + off;
+            fprintf(stderr, "malformed IN transfer: %u bytes, stopped at offset %zu (header %02x %02x %02x %02x)%s\n",
+                    size, off, off < size ? h[0] : 0, off + 1 < size ? h[1] : 0, off + 2 < size ? h[2] : 0,
+                    off + 3 < size ? h[3] : 0, c->rx_malformed == 5 ? "; not reporting further ones" : "");
+        }
     }
     return 0;
 }
@@ -1786,6 +1791,7 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
     printf("Traffic: %u frames received (%u broadcast/multicast, %u unencrypted): IPv4 %u, ARP %u, IPv6 %u, EAPOL %u, "
            "other %u; %u not convertible; %u frames sent\n", c.rx, c.rx_group, c.rx_plain, c.rx_ipv4, c.rx_arp,
            c.rx_ipv6, c.rx_eapol, c.rx_other, c.rx_not_eth, c.tx);
+    if (c.rx_malformed) printf("  %lu IN transfers couldn't be fully parsed (please report)\n", c.rx_malformed);
 
     // 6. Leave cleanly.
     if (c.associated && !c.disconnected) {

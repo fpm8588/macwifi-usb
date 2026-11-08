@@ -154,16 +154,22 @@ static void test_rx(void) {
     pl = rx_packet(pkt, f, n, 3, 0x40);
     CHECK(aic_data_parse_rx(pkt, pl - 1, &ri) == -1 && aic_data_parse_rx(pkt, 59, &ri) == -1);
 
-    // The packet iterator steps over data packets by roundup(len + 60, 4).
-    uint8_t two[1200];
+    // Aggregated transfers: data packets follow each other with no padding (len + 60 exactly), as
+    // aicwf_process_rxframes walks them; found on the adapter, where rounding to 4 broke ~9k transfers under load.
+    uint8_t two[1600];
     size_t a = rx_packet(two, f, n, 3, 0x40);
-    size_t a_occ = (a + 3) & ~(size_t)3;
-    memset(two + a, 0, a_occ - a);
-    size_t b = rx_packet(two + a_occ, g, 30, 0, 0x40);
-    size_t off = 0;
+    size_t b = rx_packet(two + a, g, 31, 0, 0x40);          // odd frame length
+    size_t c = rx_packet(two + a + b, f, n, 3, 0x40);
+    CHECK(((a + b) & 3) != 0);                              // the third packet starts unaligned
+    size_t total = a + b + c, off = 0;
     AicRxPacket pk;
-    CHECK(aic_rx_next(two, a_occ + b, &off, &pk) == 1 && !pk.is_msg && pk.packet == two && off == a_occ);
-    CHECK(aic_rx_next(two, a_occ + b, &off, &pk) == 1 && pk.packet == two + a_occ);
+    AicRxInfo r2;
+    CHECK(aic_rx_next(two, total, &off, &pk) == 1 && !pk.is_msg && pk.packet == two && off == a);
+    CHECK(aic_rx_next(two, total, &off, &pk) == 1 && pk.packet == two + a && pk.packet_len == b);
+    CHECK(aic_data_parse_rx(pk.packet, pk.packet_len, &r2) == 0 && r2.frame_len == 31);
+    CHECK(aic_rx_next(two, total, &off, &pk) == 1 && pk.packet == two + a + b && off == total);
+    CHECK(aic_data_parse_rx(pk.packet, pk.packet_len, &r2) == 0 && r2.frame_len == n);
+    CHECK(aic_rx_next(two, total, &off, &pk) == 0);
 }
 
 static void test_tx_cfm(void) {

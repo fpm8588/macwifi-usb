@@ -12,7 +12,8 @@
 //   [0..1] len (LE)   [2] type
 //   type & 0x10 (config): message at +4: u16 id, u16 dest, u16 src, u16 param_len, u32 pattern, params...;
 //                         packet occupies roundup(len, 4) + 4 bytes
-//   otherwise (data):     packet occupies roundup(len + 60, 4) bytes (60-byte RX hardware header)
+//   otherwise (data):     packet occupies exactly len + 60 bytes (60-byte RX hardware header), no padding; the
+//                         next packet starts right after it (aicwf_process_rxframes, USB RX aggregation)
 
 #ifndef AIC_MSG_H
 #define AIC_MSG_H

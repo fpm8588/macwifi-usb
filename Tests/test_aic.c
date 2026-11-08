@@ -68,11 +68,11 @@ static void test_rx(void) {
     memset(buf, 0, sizeof buf);
     uint8_t p1[8] = {0x00, 0x00, 0x50, 0x40, 0x34, 0x12, 0x03, 0x00};  // addr 0x40500000, data 0x00031234
     size_t n = make_msg(buf, AIC_DBG_MEM_READ_CFM, p1, 8);
-    // A data packet after it: len 10 + 60-byte RX header -> 72 bytes aligned.
+    // A data packet after it: len 10 + 60-byte RX header = 70 bytes, not padded (the next packet starts at +70).
     uint8_t *d = buf + n;
     d[0] = 10; d[1] = 0; d[2] = 0x00;
-    size_t total = n + 72;
-    // And a second message with an odd parameter length (forces alignment padding).
+    size_t total = n + 70;
+    // And a second message with an odd parameter length (forces alignment padding), starting unaligned.
     uint8_t p2[5] = {1, 2, 3, 4, 5};
     total += make_msg(buf + total, AIC_DBG_ERROR_IND, p2, 5);
 
@@ -84,7 +84,7 @@ static void test_rx(void) {
     CHECK(aic_parse_mem_read_cfm(&pk, &a, &v) == 0 && a == 0x40500000u && v == 0x00031234u);
     CHECK(((v >> 16) & 0xff) == AIC_CHIP_REV_U02);
     CHECK(aic_rx_next(buf, total, &off, &pk) == 1);
-    CHECK(!pk.is_msg && pk.type == 0x00 && pk.packet_len == 72);
+    CHECK(!pk.is_msg && pk.type == 0x00 && pk.packet_len == 70 && off == n + 70);
     CHECK(aic_parse_mem_read_cfm(&pk, &a, &v) == -1);
     CHECK(aic_rx_next(buf, total, &off, &pk) == 1);
     CHECK(pk.is_msg && pk.id == AIC_DBG_ERROR_IND && pk.param_len == 5 && pk.params[4] == 5);

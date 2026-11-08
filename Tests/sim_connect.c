@@ -58,6 +58,22 @@ static void q_push(const uint8_t *p, size_t n) {
     pthread_mutex_unlock(&qlock);
 }
 
+// Data packets queued back to back go into one transfer (up to 4 KB), as the chip aggregates RX on USB.
+static int qlast_is_data;
+static void q_push_data(const uint8_t *p, size_t n) {
+    pthread_mutex_lock(&qlock);
+    int last = (qt - 1) % 64;
+    if (qt > qh && qlast_is_data && qlen[last] + n <= sizeof qbuf[0]) {
+        memcpy(qbuf[last] + qlen[last], p, n);
+        qlen[last] += (UInt32)n;
+        pthread_mutex_unlock(&qlock);
+        return;
+    }
+    pthread_mutex_unlock(&qlock);
+    q_push(p, n);
+    qlast_is_data = 1;
+}
+
 static void in_msg(uint16_t id, const uint8_t *params, uint16_t plen) {
     uint8_t b[2048] = {0};
     uint16_t len = (uint16_t)(12 + plen);
@@ -66,12 +82,14 @@ static void in_msg(uint16_t id, const uint8_t *params, uint16_t plen) {
     b[10] = (uint8_t)plen; b[11] = (uint8_t)(plen >> 8);
     if (plen) memcpy(b + 16, params, plen);
     q_push(b, 4 + (((size_t)len + 3) & ~(size_t)3));
+    qlast_is_data = 0;
 }
 
 static void in_tx_cfm(uint32_t status, uint32_t idx) {
     uint8_t b[12] = {8, 0, 0x12, 0};
     for (int i = 0; i < 4; i++) { b[4 + i] = (uint8_t)(status >> (8 * i)); b[8 + i] = (uint8_t)(idx >> (8 * i)); }
     q_push(b, sizeof b);
+    qlast_is_data = 0;
 }
 
 // A From-DS (QoS) data frame carrying `eth` (DA, SA, type, payload), optionally "decrypted CCMP": protected bit,
@@ -96,7 +114,7 @@ static void in_data(const uint8_t *eth, size_t len, int ccmp) {
     b[36] = (uint8_t)((ccmp ? 3 : 0) << 2);
     b[42] = 0x6c; b[43] = 0x09;                             // 2412 MHz
     b[49] = 0; b[50] = AP_IDX; b[51] = 0xff;
-    q_push(b, (60 + n + 3) & ~(size_t)3);
+    q_push_data(b, 60 + n);
 }
 
 static void put_be16(uint8_t *p, unsigned v) { p[0] = (uint8_t)(v >> 8); p[1] = (uint8_t)v; }
@@ -344,7 +362,7 @@ static IOReturn f_clear(void *self, UInt8 pipe) { (void)self; (void)pipe; return
 
 // ---------------------------------------------------------------- a fake feth pair ("macOS" side of join)
 static struct {
-    int dhcp_set, none_set, offer_to_host, arp_to_host, echo_to_host, plain_to_host, eapol_to_host, reads;
+    int dhcp_set, none_set, offer_to_host, arp_to_host, v6_to_host, echo_to_host, plain_to_host, eapol_to_host, reads;
 } H;
 static uint8_t hbuf[8192];
 
@@ -380,6 +398,7 @@ int feth_write(Feth *f, const uint8_t *eth, size_t len) {
     if (!memcmp(eth + 6, kMac, 6)) H.echo_to_host++;
     if (eth[12] == 0x88 && eth[13] == 0x8E) H.eapol_to_host++;
     if (eth[12] == 0x08 && eth[13] == 0x06) H.arp_to_host++;
+    if (eth[12] == 0x86 && eth[13] == 0xDD) H.v6_to_host++;
     if (eth[12] == 0x08 && eth[13] == 0x00 && len > 15 && eth[15] == 0xAB) H.plain_to_host++;
     DhcpReply r;
     if (dhcp_parse_reply(eth, len, kMac, 0x51515151, &r) == 0 && r.type == 2) H.offer_to_host++;
@@ -404,6 +423,7 @@ static const AicId gId = {0xa69c, 0x8d81, AIC_MODE_WIFI, "sim", 1};
 
 static int sim_run_feth(const char *ssid_wanted, int listen_s, Feth *feth) {
     qh = qt = 0;
+    qlast_is_data = 0;
     gStop = 0;
     gVt.WritePipeTO = f_write;
     gVt.ReadPipeTO = f_read;
@@ -483,6 +503,7 @@ int main(void) {
     CHECK(H.dhcp_set == 0 && H.none_set == 0);
     CHECK(S.dhcp_seen == 1 && S.dhcp_sta_ok && S.data_bad == 0);   // only macOS's DISCOVER went out
     CHECK(H.offer_to_host == 1 && H.arp_to_host == 1);
+    CHECK(H.v6_to_host == 1);   // 2nd packet of an aggregated transfer, starting at an unaligned offset
     CHECK(H.echo_to_host == 0 && H.plain_to_host == 0 && H.eapol_to_host == 0);
     CHECK(S.discs == 1);
 

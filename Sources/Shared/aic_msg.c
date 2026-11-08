@@ -93,11 +93,12 @@ int aic_rx_next(const uint8_t *buf, size_t len, size_t *offset, AicRxPacket *pkt
         }
         *offset = off + (occupied < len - off ? occupied : len - off);
     } else {
+        // Data packets follow each other with no padding: aicwf_process_rxframes advances by
+        // pkt_len + RX_HWHRD_LEN exactly (only config packets are rounded up to RX_ALIGNMENT).
         size_t aggr = (size_t)plen + AIC_RX_HW_HDR_LEN;
-        size_t adj = (aggr + (AIC_RX_ALIGNMENT - 1)) & ~(size_t)(AIC_RX_ALIGNMENT - 1);
         if (off + aggr > len) return -1;
-        pkt->packet_len = adj;
-        *offset = off + (adj < len - off ? adj : len - off);
+        pkt->packet_len = aggr;
+        *offset = off + aggr;
     }
     return 1;
 }

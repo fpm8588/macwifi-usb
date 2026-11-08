@@ -172,8 +172,9 @@ keys, encrypted DHCP offer, 89 broadcast/multicast frames in 15 s; see HARDWARE_
 
 ## Phase 4: macOS networking
 
-Built (`sudo macwifictl join "SSID"`), simulated in `Tests/sim_connect.c` (fake firmware + AP + fake feth), waiting
-for the adapter test.
+PASSED 2026-11-07 (`sudo macwifictl join "SSID"`): with the Mac's wired connection unplugged, Safari and a speed
+test ran over the UGREEN through feth4100. Also simulated in `Tests/sim_connect.c` (fake firmware + AP + fake feth,
+RX aggregated like the chip). Found on the way: data packets in an aggregated RX transfer are not padded.
 
 1. `feth` pair (root, `Sources/macwifictl/feth.c`): `feth4100` for macOS (lladdr = the adapter's MAC, MTU 1500),
    `feth9100` its peer for raw I/O; BPF on the peer (BIOCSBLEN 128 KiB, immediate, see-sent off, header-complete
