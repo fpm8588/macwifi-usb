@@ -32,6 +32,7 @@ typedef struct {
     const char *ap_pass;
     uint16_t assoc_status;      // SM_CONNECT_IND status
     int pmf_required;
+    int open;                   // no RSN, no privacy: open network
     // what happened
     int scans, connects, msg2_ok, msg2_bad, msg4_ok, ptk_ok, gtk_ok, ptk_before_msg4, port_open, dhcp_seen;
     int discs, data_bad, eapol_sta_ok, eapol_cfm_req, dhcp_sta_ok, key_dumped, connect_req_ok;
@@ -44,6 +45,7 @@ static uint8_t qbuf[64][4096];
 static UInt32 qlen[64];
 static int qh, qt;
 static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;   // join writes from two threads, like the real device
+static pthread_mutex_t wlock = PTHREAD_MUTEX_INITIALIZER;   // the simulated device handles one transfer at a time
 
 static void q_push(const uint8_t *p, size_t n) {
     pthread_mutex_lock(&qlock);
@@ -166,14 +168,16 @@ static void beacon_result(void) {
     f[0] = 0x50;                                            // probe response
     memcpy(f + 4, kMac, 6); memcpy(f + 10, kBssid, 6); memcpy(f + 16, kBssid, 6);
     n = 24;
-    f[n + 8] = 100; f[n + 10] = 0x11; f[n + 11] = 0x04;     // interval, capability: ESS + privacy
+    f[n + 8] = 100; f[n + 10] = S.open ? 0x01 : 0x11; f[n + 11] = 0x04;   // interval, capability: ESS (+ privacy)
     n += 12;
     size_t sl = strlen(S.ssid);
     f[n++] = 0; f[n++] = (uint8_t)sl; memcpy(f + n, S.ssid, sl); n += sl;
     f[n++] = 3; f[n++] = 1; f[n++] = 1;                     // channel 1
-    memcpy(f + n, kApRsn, sizeof kApRsn);
-    if (S.pmf_required) f[n + sizeof kApRsn - 2] = 0xC0;
-    n += sizeof kApRsn;
+    if (!S.open) {
+        memcpy(f + n, kApRsn, sizeof kApRsn);
+        if (S.pmf_required) f[n + sizeof kApRsn - 2] = 0xC0;
+        n += sizeof kApRsn;
+    }
     uint8_t p[300] = {0};
     p[0] = (uint8_t)n; p[1] = (uint8_t)(n >> 8);
     p[2] = 0x50; p[4] = 0x6c; p[5] = 0x09;                  // 2412 MHz
@@ -198,14 +202,16 @@ static void on_msg(uint16_t id, const uint8_t *p, uint16_t plen) {
             wpa_build_rsn_ie(rsn, sizeof rsn);
             S.connect_req_ok = plen == 320 && p[0] == strlen(S.ssid) && !memcmp(p + 1, S.ssid, p[0]) &&
                                !memcmp(p + 34, kBssid, 6) && p[40] == 0x6c && p[41] == 0x09 && p[42] == 0 &&
-                               p[48] == 9 && p[52] == 0x88 && p[53] == 0x8E && p[54] == 22 && p[60] == 1 &&
-                               p[61] == 0 && !memcmp(p + 64, rsn, 22);
+                               p[52] == 0x88 && p[53] == 0x8E && p[60] == 1 && p[61] == 0 &&
+                               (S.open ? p[48] == 0 && p[54] == 0 && p[64] == 0
+                                       : p[48] == 9 && p[54] == 22 && !memcmp(p + 64, rsn, 22));
             in_msg(AIC_SM_CONNECT_CFM, r, 4);
             r[0] = (uint8_t)S.assoc_status; r[1] = (uint8_t)(S.assoc_status >> 8);
             memcpy(r + 2, kBssid, 6);
             r[10] = AP_IDX; r[12] = 1; r[820] = 1; r[824] = 0x6c; r[825] = 0x09;
             in_msg(AIC_SM_CONNECT_IND, r, 852);
             if (S.assoc_status) break;
+            if (S.open) { S.port_open = 1; break; }        // no handshake, no control port
             for (int i = 0; i < 32; i++) S.anonce[i] = (uint8_t)(0x80 + i);
             uint8_t e[200];
             size_t n = ap_eapol(e, 0x008A, NULL, 0, 0, 0);   // message 1
@@ -313,12 +319,11 @@ static void on_data(const uint8_t *b, size_t n) {
         uint8_t *o = bo + 236 + 4;
         o[2] = 2;                                          // DHCPOFFER
         o[3] = 54; o[4] = 4; o[5] = 192; o[6] = 0; o[7] = 2; o[8] = 1; o[9] = 255;
-        in_data(eth, dl, 1);
+        in_data(eth, dl, !S.open);
         return;
     }
 }
 
-static pthread_mutex_t wlock = PTHREAD_MUTEX_INITIALIZER;   // the simulated device handles one transfer at a time
 static IOReturn f_write_locked(void *self, UInt8 pipe, void *buf, UInt32 n, UInt32 a, UInt32 b);
 static IOReturn f_write(void *self, UInt8 pipe, void *buf, UInt32 n, UInt32 a, UInt32 b) {
     pthread_mutex_lock(&wlock);
@@ -342,8 +347,10 @@ static IOReturn f_write_locked(void *self, UInt8 pipe, void *buf, UInt32 n, UInt
     return kIOReturnSuccess;
 }
 
+static atomic_int gUnplugged;
 static IOReturn f_read(void *self, UInt8 pipe, void *buf, UInt32 *n, UInt32 a, UInt32 b) {
     (void)self; (void)pipe; (void)a; (void)b;
+    if (gUnplugged) { usleep(2000); return kIOReturnNoDevice; }
     pthread_mutex_lock(&qlock);
     if (qh == qt) {
         pthread_mutex_unlock(&qlock);
@@ -362,7 +369,7 @@ static IOReturn f_clear(void *self, UInt8 pipe) { (void)self; (void)pipe; return
 
 // ---------------------------------------------------------------- a fake feth pair ("macOS" side of join)
 static struct {
-    int dhcp_set, none_set, offer_to_host, arp_to_host, v6_to_host, echo_to_host, plain_to_host, eapol_to_host, reads;
+    atomic_int dhcp_set, none_set, offer_to_host, arp_to_host, v6_to_host, echo_to_host, plain_to_host, eapol_to_host, reads;
 } H;
 static uint8_t hbuf[8192];
 
@@ -375,7 +382,17 @@ static size_t bpf_rec(uint8_t *b, size_t off, const uint8_t *pkt, size_t n) {
     return off + ((18 + n + 3) & ~(size_t)3);
 }
 
-int feth_open(Feth *f, const uint8_t mac[6]) { (void)mac; memset(f, 0, sizeof *f); f->rbuf = hbuf; f->blen = sizeof hbuf; return 0; }
+static atomic_int gFethOpen;
+int feth_open(Feth *f, const uint8_t mac[6]) {
+    (void)mac;
+    memset(f, 0, sizeof *f);
+    f->rbuf = hbuf;
+    f->blen = sizeof hbuf;
+    H.reads = 0;              // each new interface: macOS asks for DHCP again
+    H.offer_to_host = 0;
+    gFethOpen++;
+    return 0;
+}
 long feth_read(Feth *f) {
     f->rbuf = hbuf;
     if (H.reads++ == 0) {   // what macOS sends right after the interface comes up
@@ -404,7 +421,7 @@ int feth_write(Feth *f, const uint8_t *eth, size_t len) {
     if (dhcp_parse_reply(eth, len, kMac, 0x51515151, &r) == 0 && r.type == 2) H.offer_to_host++;
     return 0;
 }
-void feth_close(Feth *f) { (void)f; }
+void feth_close(Feth *f) { (void)f; gFethOpen--; }
 void feth_ipv4(const Feth *f, char *out, size_t cap) { (void)f; snprintf(out, cap, "%s", H.offer_to_host ? "192.0.2.77" : ""); }
 int feth_run(const char *const argv[]) {
     if (argv[3] && !strcmp(argv[3], "DHCP")) H.dhcp_set++;
@@ -412,10 +429,17 @@ int feth_run(const char *const argv[]) {
     return 0;
 }
 int feth_spawn_sh(const char *script) { (void)script; return 0; }
-static int gSvcAdded, gSvcRemoved;
+static atomic_int gSvcAdded, gSvcRemoved;
 int feth_service_add(const char *ifname) { (void)ifname; gSvcAdded++; return 0; }
 int feth_service_remove(void) { gSvcRemoved++; return 0; }
 int feth_cleanup(void) { return 0; }
+
+static int S_get(const int *field) {
+    pthread_mutex_lock(&wlock);
+    int v = *field;
+    pthread_mutex_unlock(&wlock);
+    return v;
+}
 
 static IOUSBInterfaceInterface300 gVt;
 static IOUSBInterfaceInterface300 *gVtp = &gVt;
@@ -441,6 +465,144 @@ static void reset(const char *ssid, const char *ap_pass) {
     memset(&S, 0, sizeof S);
     S.ssid = ssid;
     S.ap_pass = ap_pass;
+}
+
+// ---------------------------------------------------------------- macwifid against the simulated adapter
+
+static atomic_int gAdapterPresent, gAcquired, gReleased;
+static int sim_present(void) { return gAdapterPresent; }
+static int sim_acquire(Link *l, uint8_t mac[6], uint8_t *vif) {
+    qh = qt = 0;
+    qlast_is_data = 0;
+    gVt.WritePipeTO = f_write;
+    gVt.ReadPipeTO = f_read;
+    gVt.ClearPipeStallBothEnds = f_clear;
+    memset(l, 0, sizeof *l);
+    l->intf = &gVtp;
+    l->in_pipe = 2; l->out_pipe = 1; l->msg_pipe = 3; l->out_ep = 1;
+    l->id = &gId;
+    memcpy(mac, kMac, 6);
+    *vif = 0;
+    gAcquired++;
+    return 0;
+}
+static void sim_release(Link *l) { (void)l; gReleased++; }
+
+static char gSock[64], gDir[64];
+static void *daemon_thread(void *arg) {
+    (void)arg;
+    DaemonHooks h = {sim_present, sim_acquire, sim_release, gDir, gSock};
+    daemon_main(&h);
+    return NULL;
+}
+
+static int ask(const char *req, char *reply, size_t cap) { return ctl_request(gSock, req, reply, cap); }
+
+// Polls status until `want` appears in the reply (or `secs` pass).
+static int wait_for(const char *want, double secs) {
+    char r[4096];
+    double t0 = now_s();
+    while (now_s() - t0 < secs) {
+        if (ask("{\"cmd\":\"status\"}", r, sizeof r) == 0 && strstr(r, want)) return 1;
+        usleep(50000);
+    }
+    fprintf(stderr, "waited for %s; last status: %s", want, r);
+    return 0;
+}
+
+static void test_daemon(void) {
+    printf("---- macwifid\n");
+    reset("ExampleNet", "correct horse battery");
+    snprintf(gDir, sizeof gDir, "/tmp/mw-sim-%d", (int)getpid());
+    snprintf(gSock, sizeof gSock, "/tmp/mw-sim-%d.sock", (int)getpid());
+    mkdir(gDir, 0700);
+    gStop = 0;
+    gAdapterPresent = 1;
+    pthread_t th;
+    pthread_create(&th, NULL, daemon_thread, NULL);
+    char r[8192];
+    CHECK(wait_for("\"state\":\"idle\"", 5));
+    CHECK(gAcquired == 1);
+
+    // the menu's scan
+    CHECK(ask("{\"cmd\":\"scan\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":true") && strstr(r, "\"ssid\":\"ExampleNet\"") &&
+          strstr(r, "\"usable\":true") && strstr(r, "\"known\":false"));
+    // bad requests
+    CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\",\"password\":\"short\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":false"));
+    CHECK(ask("not json", r, sizeof r) == 0 && strstr(r, "bad request"));
+    CHECK(ask("{\"cmd\":\"teleport\"}", r, sizeof r) == 0 && strstr(r, "unknown cmd"));
+    CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\"}", r, sizeof r) == 0 && strstr(r, "password is needed"));
+
+    // wrong password: refused, nothing remembered
+    CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\",\"password\":\"incorrect horse battery\"}", r, sizeof r) == 0 &&
+          strstr(r, "\"ok\":false") && strstr(r, "password seems wrong"));
+    CHECK(ask("{\"cmd\":\"known\"}", r, sizeof r) == 0 && strstr(r, "\"known\":[]"));
+
+    // right password: connected, macOS gets an address, the network is remembered (as a PMK, root-only file)
+    CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\",\"password\":\"correct horse battery\"}", r, sizeof r) == 0 &&
+          strstr(r, "\"ok\":true"));
+    CHECK(wait_for("\"ip\":\"192.0.2.77\"", 5));
+    CHECK(wait_for("\"state\":\"connected\",\"adapter\":true,\"power\":true,\"ssid\":\"ExampleNet\"", 1));
+    CHECK(gSvcAdded >= 1 && gFethOpen == 1);
+    CHECK(ask("{\"cmd\":\"known\"}", r, sizeof r) == 0 && strstr(r, "{\"ssid\":\"ExampleNet\",\"secured\":true}"));
+    char path[128];
+    snprintf(path, sizeof path, "%s/networks", gDir);
+    struct stat st;
+    CHECK(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600);
+    size_t fl = 0;
+    char *ft = read_small(path, &fl);
+    CHECK(ft && !strstr(ft, "horse") && strstr(ft, "4578616d706c654e6574 ") && fl == 20 + 1 + 64 + 3);
+    free(ft);
+    CHECK(ask("{\"cmd\":\"networks\"}", r, sizeof r) == 0 && strstr(r, "\"known\":true"));
+
+    // the AP drops us: macwifid rejoins the remembered network by itself
+    int before = S_get(&S.connects);
+    uint8_t dr[6] = {4, 0, 0, 0, 0, 0};
+    in_msg(AIC_SM_DISCONNECT_IND, dr, 6);
+    double t0 = now_s();
+    while (S_get(&S.connects) == before && now_s() - t0 < 10) usleep(50000);
+    CHECK(S_get(&S.connects) == before + 1);
+    CHECK(wait_for("\"state\":\"connected\"", 10));
+    CHECK(gFethOpen == 1);                                     // old interface closed, new one open
+
+    // user disconnect: stays off (no auto-join)
+    CHECK(ask("{\"cmd\":\"disconnect\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":true"));
+    CHECK(wait_for("\"state\":\"idle\"", 3));
+    int after = S_get(&S.connects);
+    usleep(1500000);
+    CHECK(S_get(&S.connects) == after && gFethOpen == 0);
+    // join a remembered network without a password
+    CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":true"));
+    CHECK(wait_for("\"state\":\"connected\"", 3));
+    // forget: disconnects and drops the key
+    CHECK(ask("{\"cmd\":\"forget\",\"ssid\":\"ExampleNet\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":true"));
+    CHECK(wait_for("\"state\":\"idle\"", 3));
+    CHECK(ask("{\"cmd\":\"known\"}", r, sizeof r) == 0 && strstr(r, "\"known\":[]"));
+    ft = read_small(path, &fl);
+    CHECK(ft && fl == 0);
+    free(ft);
+
+    // power off / on
+    CHECK(ask("{\"cmd\":\"power\",\"on\":false}", r, sizeof r) == 0 && strstr(r, "\"ok\":true"));
+    CHECK(wait_for("\"state\":\"off\"", 3) && gReleased >= 1);
+    CHECK(ask("{\"cmd\":\"scan\"}", r, sizeof r) == 0 && strstr(r, "Wi-Fi is off"));
+    CHECK(ask("{\"cmd\":\"power\",\"on\":true}", r, sizeof r) == 0);
+    CHECK(wait_for("\"state\":\"idle\"", 5) && gAcquired == 2);
+
+    // unplugged: back to waiting for the adapter
+    gAdapterPresent = 0;
+    gUnplugged = 1;
+    CHECK(wait_for("\"state\":\"no_adapter\",\"adapter\":false", 5));
+    gUnplugged = 0;
+
+    gStop = 1;
+    pthread_join(th, NULL);
+    CHECK(access(gSock, F_OK) != 0);                          // socket removed on exit
+    unlink(path);
+    snprintf(path, sizeof path, "%s/power", gDir);
+    unlink(path);
+    rmdir(gDir);
+    gStop = 0;
 }
 
 int main(void) {
@@ -490,6 +652,12 @@ int main(void) {
     rc = sim_run("ExampleNet", 1);
     CHECK(rc == 2 && S.connects == 0);
 
+    printf("---- open network\n");
+    reset("GuestNet", "");
+    S.open = 1;
+    rc = sim_run("GuestNet", 1);
+    CHECK(rc == 0 && S.connect_req_ok && S.msg2_ok == 0 && !S.ptk_ok && S.dhcp_seen >= 1 && S.discs == 1);
+
     printf("---- join: bridge to a (fake) macOS interface\n");
     reset("ExampleNet", "correct horse battery");
     gPass = "correct horse battery";
@@ -497,6 +665,7 @@ int main(void) {
     Feth fe;
     feth_open(&fe, kMac);
     rc = sim_run_feth("ExampleNet", 2, &fe);
+    feth_close(&fe);
     CHECK(rc == 0);
     CHECK(S.ptk_ok && S.gtk_ok && S.port_open && !S.ptk_before_msg4);
     CHECK(gSvcAdded == 1 && gSvcRemoved == 1);              // the network service, not `ipconfig set`
@@ -506,6 +675,8 @@ int main(void) {
     CHECK(H.v6_to_host == 1);   // 2nd packet of an aggregated transfer, starting at an unaligned offset
     CHECK(H.echo_to_host == 0 && H.plain_to_host == 0 && H.eapol_to_host == 0);
     CHECK(S.discs == 1);
+
+    test_daemon();
 
     printf("sim_connect: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
