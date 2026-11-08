@@ -167,6 +167,24 @@ enum { AIC_PT_INF = 0, AIC_PT_TRAP = 1, AIC_PT_B4 = 2, AIC_PT_BTMODE = 3, AIC_PT
 #define AIC_BT_LPM_ENABLE             0u
 #define AIC_BT_TXPWR_LVL_D80          0x00006F2Fu
 
+// ---------------------------------------------------------------- Loader profiles
+// Chips with chip_mcu_id = 1 (bit 25 of [0x40500000] clear), like your adapter, cannot take the SDK V5 FMAC:
+// its block upload stops being confirmed at 0x170000 (your Mac, docs/HARDWARE_LOG.md; Linux issue #58 reports
+// 0x170400 because it notices the timeout one chunk late). The Linux maintainers' fix is the `legacy-mcu1`
+// branch [LM] = github.com/shenmintao/aic8800d80 @ bbf6cb4015c8da4e7e113a6a6282f191213e0854,
+// drivers/aic8800/aic_load_fw/aic_compat_8800d80.c and tests/issue58-mcu1-legacy-fw/README.md: the matched
+// Radxa SDK V3 firmware set (327,037-byte FMAC, ends at 0x16FD7D), its patch table and fixed patch-buffer
+// layout, plus the same cache write. Product 0x8820 also needs two system-config writes (issues #118/#119).
+#define AIC_D80_PRODUCT_MASK          0xFFFFu       // product id = low 16 bits of [0x40500000]  [LM]
+#define AIC_D80_PRODUCT_8820          0x8820u       // your adapter: [0x40500000] = 0xf9078820
+#define AIC_D80_8820_REG_A            0x40500010u   //   write 0x2                                   [LM]
+#define AIC_D80_8820_VAL_A            0x00000002u
+#define AIC_D80_8820_REG_B            0x40506024u   //   masked write: mask 0xff, value 0xdf         [LM]
+#define AIC_D80_8820_MASK_B           0x000000FFu
+#define AIC_D80_8820_VAL_B            0x000000DFu
+#define AIC_D80_FW_DIR_V5             "firmware/aic8800D80"
+#define AIC_D80_FW_DIR_LEGACY         "firmware/aic8800D80-legacy-mcu1"
+
 // After START_APP the D80 re-enumerates; the Linux Wi-Fi driver (aic8800_fdrv/aicwf_usb.c id table) binds
 // a69c:8d81 (vendor-specific interface 0xff/0xff/0xff), and aic_load_fw ignores 8d81 once firmware is loaded.
 #define AIC_PID_D80_ROM               0x8d80

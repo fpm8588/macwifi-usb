@@ -42,12 +42,15 @@ build/macwifictl fwload
 What each command does:
 
 - `./build.sh test` runs the hardware-free tests; `./build.sh cli` builds `build/macwifictl` (arm64).
-- `scripts/fetch-firmware.sh` downloads AICsemi's firmware into `firmware/` (not part of this repository) from a
-  pinned commit of the Linux driver and checks every file's SHA-256.
+- `scripts/fetch-firmware.sh` downloads AICsemi's firmware into `firmware/` (not part of this repository) from
+  pinned commits of the Linux driver and checks every file's SHA-256. There are two matched sets: newer chips
+  take the SDK V5 set; older "MCU1" chips, like the UGREEN AX900 tested here, need the SDK V3 set
+  (`fwload` picks automatically and prints which).
 - `macwifictl modeswitch` ejects the adapter's virtual driver CD, which switches it to Wi-Fi mode (`a69c:8d80`).
   Needed after every plug-in.
 - `macwifictl fwload` uploads the firmware to the adapter's RAM and starts it; the adapter then reconnects as
-  `a69c:8d81`. Nothing is written to the adapter's flash; unplugging it returns it to factory state.
+  `a69c:8d81`. Nothing is written to the adapter's flash; unplugging it returns it to factory state. If it
+  stops partway, unplug the adapter and plug it back in before trying again.
 - Also: `list` (find the adapter), `info` (USB descriptors), `identify` (chip revision through the ROM).
 
 If anything looks off, rerun with `MACWIFI_DEBUG=1` in front of the command to see every USB transfer.

@@ -22,7 +22,8 @@ later phases keep their original copyright lines and are listed here:
 - `Sources/Shared/aic_fwload.h`, `Sources/Shared/aic_fwload.c`: from `aic_load_fw/aicbluetooth.c`
   (`aicbt_patch_table_alloc`, `aicbt_patch_info_unpack`, `aicbt_patch_table_load`,
   `rwnx_plat_bin_fw_upload_android`) and `aic_load_fw/aic_compat_8800d80.c` (`aicwf_patch_config_8800d80`,
-  `patch_tbl_d80`). Copyright (C) AICSemi 2018-2020. GPL-2.0-only.
+  `patch_tbl_d80`, `system_config_8800d80`), on branches `main` and `legacy-mcu1` (the MCU1 / product
+  0x8820 profile). Copyright (C) AICSemi 2018-2020. GPL-2.0-only.
 - The `fwload` command in `Sources/macwifictl/main.c` follows `aicfw_download_fw_8800d80` and
   `system_config_8800d80`; that part of the file is GPL-2.0-only.
 
@@ -30,7 +31,8 @@ later phases keep their original copyright lines and are listed here:
 
 The AIC8800D80 firmware (`fw_patch_*`, `fw_adid_*`, `fmacfw_*`) is AICsemi's. It has no stated open-source
 license, so it is **not** part of this repository; `scripts/fetch-firmware.sh` downloads it onto the user's
-Mac from the driver repository at a pinned commit and verifies SHA-256 hashes.
+Mac from the driver repository at pinned commits (SDK V5 set from `main`, SDK V3 set from `legacy-mcu1`, which
+that branch imported from radxa-pkg/aic8800 commit 254d47e) and verifies SHA-256 hashes.
 
 ## Prior art consulted (facts only)
 

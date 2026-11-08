@@ -97,6 +97,7 @@ int aic_pt_writes(const AicPatchTable *pt, AicMemOp *ops, size_t cap) {
             ops[n].addr = aic_le32(r->pairs + 8 * k);
             ops[n].value = (r->type == AIC_PT_BTMODE && k < 9) ? bt_values[k] : aic_le32(r->pairs + 8 * k + 4);
             ops[n].delay_ms_after = 0;
+            ops[n].mask = 0;
             n++;
         }
         // The original sleeps after a power-on record; a record without pairs has nothing to attach it to.
@@ -105,28 +106,53 @@ int aic_pt_writes(const AicPatchTable *pt, AicMemOp *ops, size_t cap) {
     return (int)n;
 }
 
-int aic_d80_patch_config_writes(uint32_t config_base, uint32_t patch_str_base, uint32_t fw_version,
+const char *aic_d80_profile_name(AicD80Profile p) {
+    return p == AIC_D80_PROFILE_LEGACY_MCU1 ? "legacy-mcu1 (SDK V3 firmware)" : "v5 (SDK V5 firmware)";
+}
+
+#define OP(a, v, m) do { if (n >= cap) return -1; ops[n].addr = (a); ops[n].value = (v); ops[n].mask = (m); \
+                         ops[n].delay_ms_after = 0; n++; } while (0)
+
+int aic_d80_syscfg_writes(AicD80Profile p, uint32_t chip_word, AicMemOp *ops, size_t cap) {
+    size_t n = 0;
+    // legacy-mcu1 system_config_8800d80: product 0x8820 needs these for MM_START to complete (#118/#119).
+    if (p == AIC_D80_PROFILE_LEGACY_MCU1 && (chip_word & AIC_D80_PRODUCT_MASK) == AIC_D80_PRODUCT_8820) {
+        OP(AIC_D80_8820_REG_A, AIC_D80_8820_VAL_A, 0);
+        OP(AIC_D80_8820_REG_B, AIC_D80_8820_VAL_B, AIC_D80_8820_MASK_B);
+    }
+    return (int)n;
+}
+
+int aic_d80_patch_config_writes(AicD80Profile p, uint32_t config_base, uint32_t patch_str_base, uint32_t fw_version,
                                 uint32_t patch_buff_base, AicMemOp *ops, size_t cap) {
     // patch_tbl_d80 as aic_load_fw builds it (no USE_5G, CONFIG_PLATFORM_HI, CONFIG_POWER_LIMIT,
     // CONFIG_PRBREQ_REPORT, CONFIG_RADAR_OR_IR_DETECT or CONFIG_WOWLAN in its Makefile). Offsets from config_base.
-    static const uint32_t tbl[][2] = {
+    static const uint32_t tbl_v5[][2] = {
         {0x00b4, 0xf3010000},
         {0x0170, 0x0001000A},   // rx aggregation counter
         {0x0188, 0x00000001},   // user_ext_flags = USER_PWROFST_COVER_CALIB_FLAG
     };
-    const uint32_t cnt = sizeof tbl / sizeof tbl[0];
-    uint32_t start = aic_d80_needs_patch_buff(fw_version) ? patch_buff_base : AIC_D80_PATCH_PAIRS_DEFAULT;
+    // legacy-mcu1: "Newer loader patches use different RX aggregation settings and a user_ext_flags field that
+    // is not part of this firmware generation."
+    static const uint32_t tbl_legacy[][2] = {
+        {0x00b4, 0xf3010000},
+        {0x0170, 0x00000002},   // rx aggregation counter
+    };
+    const int legacy = p == AIC_D80_PROFILE_LEGACY_MCU1;
+    const uint32_t (*tbl)[2] = legacy ? tbl_legacy : tbl_v5;
+    const uint32_t cnt = legacy ? (uint32_t)(sizeof tbl_legacy / sizeof tbl_legacy[0])
+                                : (uint32_t)(sizeof tbl_v5 / sizeof tbl_v5[0]);
+    uint32_t start = aic_d80_needs_patch_buff(p, fw_version) ? patch_buff_base : AIC_D80_PATCH_PAIRS_DEFAULT;
     size_t n = 0;
-#define OP(a, v) do { if (n >= cap) return -1; ops[n].addr = (a); ops[n].value = (v); ops[n].delay_ms_after = 0; n++; } while (0)
-    OP(patch_str_base + AIC_PATCH_OFS_MAGIC, AIC_PATCH_MAGIC);
-    OP(patch_str_base + AIC_PATCH_OFS_MAGIC_2, AIC_PATCH_MAGIC_2);
-    OP(patch_str_base + AIC_PATCH_OFS_PAIR_START, start);
-    OP(patch_str_base + AIC_PATCH_OFS_PAIR_COUNT, cnt);
+    OP(patch_str_base + AIC_PATCH_OFS_MAGIC, AIC_PATCH_MAGIC, 0);
+    OP(patch_str_base + AIC_PATCH_OFS_MAGIC_2, AIC_PATCH_MAGIC_2, 0);
+    OP(patch_str_base + AIC_PATCH_OFS_PAIR_START, start, 0);
+    OP(patch_str_base + AIC_PATCH_OFS_PAIR_COUNT, cnt, 0);
     for (uint32_t i = 0; i < cnt; i++) {
-        OP(start + 8 * i, tbl[i][0] + config_base);
-        OP(start + 8 * i + 4, tbl[i][1]);
+        OP(start + 8 * i, tbl[i][0] + config_base, 0);
+        OP(start + 8 * i + 4, tbl[i][1], 0);
     }
-    for (uint32_t b = 0; b < 4; b++) OP(patch_str_base + AIC_PATCH_OFS_BLOCK_SIZE + 4 * b, 0);
-#undef OP
+    for (uint32_t b = 0; b < 4; b++) OP(patch_str_base + AIC_PATCH_OFS_BLOCK_SIZE + 4 * b, 0, 0);
     return (int)n;
 }
+#undef OP

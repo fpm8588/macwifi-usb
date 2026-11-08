@@ -29,11 +29,12 @@ run_tests() {
     "$B/test_descdump" > /dev/null && echo "descdump: OK"
     $cc "${CFLAGS[@]}" Tests/test_fwload.c "$S/aic_fwload.c" "$S/aic_msg.c" -o "$B/test_fwload"
     # With the firmware downloaded (scripts/fetch-firmware.sh), also check the loader against the real files.
-    if [[ -f firmware/aic8800D80/fw_patch_table_8800d80_u02.bin ]]; then
-        "$B/test_fwload" firmware/aic8800D80
-    else
-        "$B/test_fwload"
-    fi
+    local real=""
+    [[ -f firmware/aic8800D80/fw_patch_table_8800d80_u02.bin ]] && real="$real --v5 firmware/aic8800D80"
+    [[ -f firmware/aic8800D80-legacy-mcu1/fw_patch_table_8800d80_u02.bin ]] &&
+        real="$real --legacy firmware/aic8800D80-legacy-mcu1"
+    # shellcheck disable=SC2086
+    "$B/test_fwload" $real
 }
 
 build_cli() {

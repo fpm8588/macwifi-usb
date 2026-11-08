@@ -1,7 +1,8 @@
 // Hardware-free tests for the firmware-loader logic (Sources/Shared/aic_fwload.c).
 //
-//   test_fwload            synthetic patch tables (always runs)
-//   test_fwload <fw dir>   also checks the real, SHA-256-pinned firmware from scripts/fetch-firmware.sh
+//   test_fwload                                     synthetic patch tables (always runs)
+//   test_fwload [--v5 DIR] [--legacy DIR]           also checks the real, SHA-256-pinned firmware sets that
+//                                                   scripts/fetch-firmware.sh downloads
 #include "aic8800.h"
 #include "aic_fwload.h"
 #include "aic_msg.h"
@@ -135,7 +136,7 @@ static void test_parse_rejects(void) {
 static void test_patch_config(void) {
     AicMemOp ops[32];
     // Values read from fmacfw_8800d80_u02.bin at the pinned commit (version 0x06090101 > 0x06090100).
-    int n = aic_d80_patch_config_writes(0x00177158, 0x00177c00, 0x06090101, 0x0017d318, ops, 32);
+    int n = aic_d80_patch_config_writes(AIC_D80_PROFILE_V5, 0x00177158, 0x00177c00, 0x06090101, 0x0017d318, ops, 32);
     CHECK(n == 14);
     static const uint32_t want[14][2] = {
         {0x177c00, 0x48435450}, {0x177c08, 0x50544348}, {0x177c04, 0x17d318}, {0x177c0c, 3},
@@ -148,10 +149,40 @@ static void test_patch_config(void) {
     for (int i = 0; ok && i < 14; i++) ok = ops[i].addr == want[i][0] && ops[i].value == want[i][1];
     CHECK(ok);
     // Older firmware: fixed pair buffer, patch_buff_base ignored.
-    n = aic_d80_patch_config_writes(0x1000, 0x2000, 0x06090100, 0x9999, ops, 32);
+    n = aic_d80_patch_config_writes(AIC_D80_PROFILE_V5, 0x1000, 0x2000, 0x06090100, 0x9999, ops, 32);
     CHECK(n == 14 && ops[2].value == 0x001D7000 && ops[4].addr == 0x001D7000 && ops[4].value == 0x10b4);
-    CHECK(aic_d80_patch_config_writes(0, 0, 0, 0, ops, 13) == -1);
-    CHECK(aic_d80_needs_patch_buff(0x06090101) && !aic_d80_needs_patch_buff(0x06090100));
+    CHECK(aic_d80_patch_config_writes(AIC_D80_PROFILE_V5, 0, 0, 0, 0, ops, 13) == -1);
+    CHECK(aic_d80_needs_patch_buff(AIC_D80_PROFILE_V5, 0x06090101));
+    CHECK(!aic_d80_needs_patch_buff(AIC_D80_PROFILE_V5, 0x06090100));
+    CHECK(!aic_d80_needs_patch_buff(AIC_D80_PROFILE_LEGACY_MCU1, 0x06090101));
+
+    // legacy-mcu1, values read from the V3 fmacfw_8800d80_u02.bin (config base 0x183214, patch struct 0x170000,
+    // version word 0): fixed pair buffer at 0x1D7000 and the two-entry table.
+    n = aic_d80_patch_config_writes(AIC_D80_PROFILE_LEGACY_MCU1, 0x00183214, 0x00170000, 0, 0x12345678, ops, 32);
+    static const uint32_t want_legacy[12][2] = {
+        {0x170000, 0x48435450}, {0x170008, 0x50544348}, {0x170004, 0x1D7000}, {0x17000c, 2},
+        {0x1D7000, 0x1832c8}, {0x1D7004, 0xf3010000},
+        {0x1D7008, 0x183384}, {0x1D700c, 0x00000002},
+        {0x170030, 0}, {0x170034, 0}, {0x170038, 0}, {0x17003c, 0},
+    };
+    ok = (n == 12);
+    for (int i = 0; ok && i < 12; i++)
+        ok = ops[i].addr == want_legacy[i][0] && ops[i].value == want_legacy[i][1] && ops[i].mask == 0;
+    CHECK(ok);
+}
+
+static void test_profiles(void) {
+    const uint32_t user = 0xf9078820;   // the user's adapter (docs/HARDWARE_LOG.md)
+    CHECK(aic_d80_is_mcu1(user) && aic_d80_choose_profile(user) == AIC_D80_PROFILE_LEGACY_MCU1);
+    CHECK(aic_d80_choose_profile(user | (1u << 25)) == AIC_D80_PROFILE_V5);
+    AicMemOp ops[8];
+    int n = aic_d80_syscfg_writes(AIC_D80_PROFILE_LEGACY_MCU1, user, ops, 8);
+    CHECK(n == 2);
+    CHECK(ops[0].addr == 0x40500010 && ops[0].value == 2 && ops[0].mask == 0);
+    CHECK(ops[1].addr == 0x40506024 && ops[1].value == 0xdf && ops[1].mask == 0xff);
+    CHECK(aic_d80_syscfg_writes(AIC_D80_PROFILE_LEGACY_MCU1, 0xf9078800, ops, 8) == 0);   // other product
+    CHECK(aic_d80_syscfg_writes(AIC_D80_PROFILE_V5, user, ops, 8) == 0);                  // main has no 0x8820 writes
+    CHECK(aic_d80_syscfg_writes(AIC_D80_PROFILE_LEGACY_MCU1, user, ops, 1) == -1);
 }
 
 static void test_chunks(void) {
@@ -193,7 +224,7 @@ static uint8_t *slurp(const char *dir, const char *name, size_t *len) {
     return b;
 }
 
-static void test_real(const char *dir) {
+static void test_real_v5(const char *dir) {
     size_t len = 0;
     uint8_t *t = slurp(dir, AIC_D80_FW_PATCH_TABLE, &len);
     CHECK(t != NULL);
@@ -229,13 +260,48 @@ static void test_real(const char *dir) {
     }
 }
 
+static void test_real_legacy(const char *dir) {
+    size_t len = 0;
+    uint8_t *t = slurp(dir, AIC_D80_FW_PATCH_TABLE, &len);
+    CHECK(t != NULL);
+    if (!t) return;
+    AicPatchTable pt;
+    CHECK(len == 984 && aic_pt_parse(t, len, AIC_D80_RAM_ADID_ADDR, AIC_D80_RAM_PATCH_ADDR, &pt) == 0);
+    CHECK(pt.n == 7 && pt.info_len == 4 && pt.ext_patch_nb == 0);
+    CHECK(pt.addr_adid == 0x201940 && pt.addr_patch == 0x1e0000);
+    AicMemOp ops[256];
+    int n = aic_pt_writes(&pt, ops, 256);
+    CHECK(n == 4 + 19 + 42 + 9 + 3 + 15);
+    printf("legacy patch table: %d writes, version \"%s\"\n", n, pt.version);
+    free(t);
+    uint8_t *fw = slurp(dir, AIC_D80_FMACFW, &len);
+    CHECK(fw != NULL && len == 327037);
+    CHECK(AIC_D80_RAM_FMAC_FW_ADDR + len <= 0x170000);   // stays below the region MCU1 chips can't take
+    if (fw && len > 0x1A8) {
+        CHECK(aic_le32(fw + AIC_D80_FW_OFS_CONFIG_BASE) == 0x00183214);
+        CHECK(aic_le32(fw + AIC_D80_FW_OFS_PATCH_STR) == 0x00170000);
+    }
+    free(fw);
+    uint8_t *b = slurp(dir, AIC_D80_FW_ADID, &len);
+    CHECK(b != NULL && len == 1708);
+    free(b);
+    b = slurp(dir, AIC_D80_FW_PATCH, &len);
+    CHECK(b != NULL && len == 25300);
+    free(b);
+}
+
 int main(int argc, char **argv) {
     test_parse();
     test_parse_rejects();
     test_patch_config();
     test_chunks();
     test_chip_rev();
-    if (argc > 1) test_real(argv[1]);
-    printf("fwload: %d checks, %d failures%s\n", checks, failures, argc > 1 ? " (with real firmware)" : "");
+    test_profiles();
+    int real = 0;
+    for (int i = 1; i + 1 < argc; i += 2) {
+        if (!strcmp(argv[i], "--v5")) { test_real_v5(argv[i + 1]); real++; }
+        else if (!strcmp(argv[i], "--legacy")) { test_real_legacy(argv[i + 1]); real++; }
+    }
+    printf("fwload: %d checks, %d failures (%d real firmware set%s)\n", checks, failures, real, real == 1 ? "" : "s");
     return failures ? 1 : 0;
 }

@@ -70,7 +70,14 @@ endpoint layout than Linux expects, record it before changing code.
 
 ## Phase 2: load the firmware
 
-### 2a: upload and start (code written; run it on the adapter)
+### 2a: upload and start (attempt 1 stopped at 0x170000; legacy-mcu1 profile written, run it on the adapter)
+
+**Two loader profiles** (`AicD80Profile`), chosen from `[0x40500000]` bit 25 like Linux's `chip_mcu_id`:
+`v5` (branch `main`, SDK V5 firmware) for MCU0 chips, `legacy-mcu1` (branch `legacy-mcu1` @ `bbf6cb4`, SDK V3
+firmware) for MCU1 chips such as the user's. Legacy differences: V3 firmware set (no ext patch, no H image,
+FMAC ends below 0x170000), product-0x8820 syscfg writes (`0x40500010 = 2`, mask-write `0x40506024` mask 0xff =
+0xdf), patch config always at 0x1D7000 with `{0xb4, 0xf3010000}, {0x170, 0x2}`. See HARDWARE_LOG.md and Linux
+issues #58, #118, #119. For phase 2b, port the fdrv from the same branch as the firmware.
 
 Ported from `aicfw_download_fw_8800d80` (`aic_load_fw/aic_compat_8800d80.c`) and what it calls. Pure logic in
 `Sources/Shared/aic_fwload.[ch]` (patch-table parser, its register writes with the D80 BT-mode values,
@@ -88,7 +95,7 @@ real pinned firmware in CI. I/O in `macwifictl fwload`:
 
 | Step | Command | Expected |
 |---|---|---|
-| 1 | `scripts/fetch-firmware.sh` | "OK: firmware in firmware/aic8800D80" |
+| 1 | `scripts/fetch-firmware.sh` | "OK: firmware in firmware/aic8800D80 and firmware/aic8800D80-legacy-mcu1" |
 | 2 | `build/macwifictl modeswitch` | `a69c:8d80` |
 | 3 | `build/macwifictl fwload` | each upload "ok"; "read-back matches the file"; "came back as a69c:8d81"; descriptors of the new device. **Record the 8d81 interfaces and endpoints** (Linux uses a second bulk OUT for messages on 8d81, and may expose a BT interface). |
 

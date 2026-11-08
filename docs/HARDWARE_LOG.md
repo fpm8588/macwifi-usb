@@ -41,9 +41,35 @@ Notes:
   comment-free.
 - The driver CD comes back after every plug-in, so `modeswitch` is needed each time.
 
-## Phase 2a: firmware upload (waiting for a run)
+## 2026-11-07: Phase 2a, attempt 1 (SDK V5 firmware): stopped at 0x170000
 
-Expected from the Linux driver and the pinned firmware (also checked by `Tests/test_fwload.c` in CI):
-patch table version "- Aug 01 2025 11:05:26 - git a26f071"; ADID (1,708 B) → 0x201940; patch (32,700 B) →
-0x1e0000; ext0 (16,136 B) → 0x20b43c; 140 patch-table writes; fmacfw (358,072 B, 350 chunks) → 0x120000;
-firmware version 0x06090101; 14 patch-config writes; START_APP → re-enumerates as `a69c:8d81`.
+Commit `d4aad06`. `fetch-firmware.sh` OK. Output:
+
+```
+Chip: [0x40500000] = 0xf9078820 -> revision 0x07 (U03), MCU id
+System config: [0x40100020] 0x00000002 -> 0x00000003
+Patch table: 7 records, ADID -> 0x00201940, patch -> 0x001e0000, 1 ext patch(es), version "- Aug 01 2025 11:05:26 - git a26f071"
+  fw_adid_8800d80_u02.bin             1708 bytes -> 0x00201940  ok (2 chunks, 0.0 s)
+  fw_patch_8800d80_u02.bin           32700 bytes -> 0x001e0000 . ok (32 chunks, 0.0 s)
+  fw_patch_8800d80_u02_ext0.bin      16136 bytes -> 0x0020b43c  ok (16 chunks, 0.0 s)
+  patch table: 140 register writes ok
+  fmacfw_8800d80_u02.bin            358072 bytes -> 0x00120000 ..........no reply (message 0x040c) within 2000 ms
+Upload of fmacfw_8800d80_u02.bin failed at offset 327680 (address 0x00170000).
+```
+
+Diagnosis: the chip is an **MCU1** part (bit 25 of `[0x40500000]` clear) and **product 0x8820** (low 16 bits).
+Linux users hit the same wall: shenmintao/aic8800d80 issue #58, "[A69C:8D80][chip_mcu_id=1] Firmware upload
+times out at 0x170400" (Linux notices the missing confirmation one chunk late, so its address is one chunk past
+ours). The SDK V5 FMAC (358,072 B) runs past 0x170000; the older SDK V3 FMAC (327,037 B) ends at 0x16FD7D. The
+maintainers' validated fix is the `legacy-mcu1` branch: the complete V3 firmware set with its patch table and
+fixed patch-buffer layout, plus the MCU1 cache write. Issue #118 (UGREEN `a69c:5723`, chip_id 7, MCU1, product
+0x8820) and PR #119 add two system-config writes for product 0x8820 that MM_START needs later. Both are now the
+`legacy-mcu1` loader profile, chosen automatically for MCU1 chips.
+
+## Phase 2a, attempt 2: legacy-mcu1 profile (waiting for a run)
+
+Expected (checked against the real files in CI): profile legacy-mcu1; cache 0x2 -> 0x3; two product-0x8820
+writes; patch table version "- Dec 05 2023 15:53:41 - git 487f432", ADID (1,708 B) -> 0x201940, patch
+(25,300 B) -> 0x1e0000, no ext patch, 92 patch-table writes; fmacfw (327,037 B, 320 chunks) -> 0x120000; no
+version word; 12 patch-config writes (patch struct at 0x170000, pairs at 0x1D7000); START_APP; re-enumeration
+as `a69c:8d81` (Linux sees interfaces 0-1 Bluetooth, interface 2 Wi-Fi).

@@ -312,6 +312,13 @@ static int mem_write(Link *l, uint32_t addr, uint32_t val) {
     return link_wait_msg(l, AIC_DBG_MEM_WRITE_CFM, NULL, 0, NULL, 2000);
 }
 
+static int mem_mask_write(Link *l, uint32_t addr, uint32_t mask, uint32_t val) {
+    uint8_t cmd[64];
+    size_t n = aic_build_mem_mask_write(cmd, sizeof cmd, addr, mask, val);
+    if (!n || link_send(l, cmd, n)) return -1;
+    return link_wait_msg(l, AIC_DBG_MEM_MASK_WRITE_CFM, NULL, 0, NULL, 2000);
+}
+
 // ---------------------------------------------------------------- commands
 
 static int cmd_list(int all) {
@@ -467,6 +474,12 @@ static int upload(Link *l, const char *dir, const char *name, uint32_t addr) {
         size_t n = aic_build_block_write(cmd, sizeof cmd, addr + off, data + off, c);
         if (!n || link_send(l, cmd, n) || link_wait_msg(l, AIC_DBG_MEM_BLOCK_WRITE_CFM, NULL, 0, NULL, 2000)) {
             fprintf(stderr, "\nUpload of %s failed at offset %u (address 0x%08x).\n", name, off, addr + off);
+            uint32_t v = 0;
+            if (mem_read(l, AIC_ADDR_CHIP_ID, &v) == 0)
+                fprintf(stderr, "The ROM still answers ([0x%08x] = 0x%08x), so it refused or lost that chunk.\n",
+                        AIC_ADDR_CHIP_ID, v);
+            else
+                fprintf(stderr, "The ROM no longer answers at all.\n");
             rc = -1;
             break;
         }
@@ -480,8 +493,10 @@ static int upload(Link *l, const char *dir, const char *name, uint32_t addr) {
 
 static int write_ops(Link *l, const AicMemOp *ops, int n) {
     for (int i = 0; i < n; i++) {
-        if (mem_write(l, ops[i].addr, ops[i].value)) {
-            fprintf(stderr, "Write [0x%08x] <- 0x%08x failed.\n", ops[i].addr, ops[i].value);
+        int bad = ops[i].mask ? mem_mask_write(l, ops[i].addr, ops[i].mask, ops[i].value)
+                              : mem_write(l, ops[i].addr, ops[i].value);
+        if (bad) {
+            fprintf(stderr, "Write [0x%08x] <- 0x%08x (mask 0x%08x) failed.\n", ops[i].addr, ops[i].value, ops[i].mask);
             return -1;
         }
         if (ops[i].delay_ms_after) usleep(ops[i].delay_ms_after * 1000);
@@ -500,31 +515,59 @@ static int read_check(Link *l, const uint8_t *img, size_t img_len, uint32_t ofs,
     return 0;
 }
 
-static const char *fw_dir(int argc, char **argv) {
+static const char *opt(int argc, char **argv, const char *name) {
     for (int i = 2; i + 1 < argc; i++)
-        if (!strcmp(argv[i], "--fw")) return argv[i + 1];
-    const char *e = getenv("MACWIFI_FW");
-    return (e && *e) ? e : "firmware/aic8800D80";
+        if (!strcmp(argv[i], name)) return argv[i + 1];
+    return NULL;
 }
 
-static int fwload_steps(Link *l, const char *dir) {
-    // 1. Chip revision and system config (system_config_8800d80).
+static int have_fw(const char *dir) {
+    char p[1024];
+    snprintf(p, sizeof p, "%s/%s", dir, AIC_D80_FW_PATCH_TABLE);
+    return access(p, R_OK) == 0;
+}
+
+typedef struct {
+    const char *dir;        // --fw DIR or MACWIFI_FW; NULL = pick by profile
+    int profile;            // --profile v5|legacy; -1 = pick from the chip
+} FwOpts;
+
+static int fwload_steps(Link *l, const FwOpts *o) {
+    // 1. Chip revision, loader profile and system config (system_config_8800d80).
     uint32_t chip = 0;
     if (mem_read(l, AIC_ADDR_CHIP_ID, &chip)) return 1;
     uint8_t rev = (uint8_t)(chip >> 16);
     int h = (rev & AIC_D80_CHIP_ID_H_MASK) == AIC_D80_CHIP_ID_H_MASK;
-    int mcu = ((chip >> AIC_D80_MCU_BIT) & 1u) == 0;
-    printf("Chip: [0x%08x] = 0x%08x -> revision 0x%02x (%s)%s%s\n", AIC_ADDR_CHIP_ID, chip, rev, aic_chip_rev_name(rev),
-           h ? ", H variant" : "", mcu ? ", MCU id" : "");
+    int mcu = aic_d80_is_mcu1(chip);
+    printf("Chip: [0x%08x] = 0x%08x -> revision 0x%02x (%s), product 0x%04x, chip_mcu_id %d%s\n", AIC_ADDR_CHIP_ID,
+           chip, rev, aic_chip_rev_name(rev), chip & AIC_D80_PRODUCT_MASK, mcu, h ? ", H variant" : "");
     if (rev != AIC_CHIP_REV_U02 && rev != AIC_CHIP_REV_U03) {
         fprintf(stderr, "Only U02/U03 AIC8800D80 chips are supported so far (the _u02 firmware set). Record this in\n"
                         "docs/HARDWARE_LOG.md.\n");
         return 1;
     }
+    AicD80Profile prof = o->profile >= 0 ? (AicD80Profile)o->profile : aic_d80_choose_profile(chip);
+    const char *dir = o->dir ? o->dir : (prof == AIC_D80_PROFILE_LEGACY_MCU1 ? AIC_D80_FW_DIR_LEGACY : AIC_D80_FW_DIR_V5);
+    printf("Loader profile: %s%s, firmware from %s\n", aic_d80_profile_name(prof), o->profile >= 0 ? " (forced)" : "",
+           dir);
+    if (!have_fw(dir)) {
+        fprintf(stderr, "Firmware not found in %s. Run scripts/fetch-firmware.sh (it downloads both sets).\n", dir);
+        return 4;
+    }
+    if (h && prof == AIC_D80_PROFILE_LEGACY_MCU1) {
+        fprintf(stderr, "The legacy-mcu1 firmware set has no H-variant image. Record this in docs/HARDWARE_LOG.md.\n");
+        return 1;
+    }
     if (mcu) {
         uint32_t v = 0;
         if (mem_read(l, AIC_D80_CACHE_CTRL_ADDR, &v) || mem_write(l, AIC_D80_CACHE_CTRL_ADDR, v | 1u)) return 1;
-        printf("System config: [0x%08x] 0x%08x -> 0x%08x\n", AIC_D80_CACHE_CTRL_ADDR, v, v | 1u);
+        printf("System config: [0x%08x] 0x%08x -> 0x%08x (MCU1 cache fix)\n", AIC_D80_CACHE_CTRL_ADDR, v, v | 1u);
+    }
+    {
+        AicMemOp sc[8];
+        int nsc = aic_d80_syscfg_writes(prof, chip, sc, 8);
+        if (nsc < 0 || write_ops(l, sc, nsc)) return 1;
+        if (nsc) printf("System config: %d product-0x%04x writes\n", nsc, chip & AIC_D80_PRODUCT_MASK);
     }
 
     // 2. Patch table.
@@ -573,13 +616,17 @@ static int fwload_steps(Link *l, const char *dir) {
         int bad = read_check(l, img, ilen, AIC_D80_FW_OFS_VERSION, &version) ||
                   read_check(l, img, ilen, AIC_D80_FW_OFS_CONFIG_BASE, &config_base) ||
                   read_check(l, img, ilen, AIC_D80_FW_OFS_PATCH_STR, &patch_str) ||
-                  (aic_d80_needs_patch_buff(version) &&
+                  (aic_d80_needs_patch_buff(prof, version) &&
                    read_check(l, img, ilen, AIC_D80_FW_OFS_PATCH_BUFF, &patch_buff));
         free(img);
         if (bad) goto out;
-        printf("Firmware version 0x%08x (%u.%u.%u.%u); read-back matches the file.\n", version, version >> 24,
-               (version >> 16) & 0xff, (version >> 8) & 0xff, version & 0xff);
-        nops = aic_d80_patch_config_writes(config_base, patch_str, version, patch_buff, ops, sizeof ops / sizeof ops[0]);
+        if (version)
+            printf("Firmware version 0x%08x (%u.%u.%u.%u); read-back matches the file.\n", version, version >> 24,
+                   (version >> 16) & 0xff, (version >> 8) & 0xff, version & 0xff);
+        else
+            printf("Firmware read-back matches the file (this image has no version word).\n");
+        nops = aic_d80_patch_config_writes(prof, config_base, patch_str, version, patch_buff, ops,
+                                           sizeof ops / sizeof ops[0]);
         if (nops < 0 || write_ops(l, ops, nops)) goto out;
         printf("Patch config: %d writes (config base 0x%08x, patch struct 0x%08x, pairs at 0x%08x)\n", nops,
                config_base, patch_str, ops[2].value);
@@ -602,11 +649,20 @@ out:
 }
 
 static int cmd_fwload(int argc, char **argv) {
-    const char *dir = fw_dir(argc, argv);
-    char probe[1024];
-    snprintf(probe, sizeof probe, "%s/%s", dir, AIC_D80_FW_PATCH_TABLE);
-    if (access(probe, R_OK) != 0) {
-        fprintf(stderr, "Firmware not found in %s. Run scripts/fetch-firmware.sh first (or pass --fw DIR).\n", dir);
+    FwOpts o = {opt(argc, argv, "--fw"), -1};
+    if (!o.dir) {
+        const char *e = getenv("MACWIFI_FW");
+        if (e && *e) o.dir = e;
+    }
+    const char *pf = opt(argc, argv, "--profile");
+    if (pf) {
+        if (!strcmp(pf, "v5")) o.profile = AIC_D80_PROFILE_V5;
+        else if (!strcmp(pf, "legacy")) o.profile = AIC_D80_PROFILE_LEGACY_MCU1;
+        else { fprintf(stderr, "--profile must be v5 or legacy\n"); return 2; }
+    }
+    if (o.dir ? !have_fw(o.dir) : (!have_fw(AIC_D80_FW_DIR_V5) && !have_fw(AIC_D80_FW_DIR_LEGACY))) {
+        fprintf(stderr, "Firmware not found in %s. Run scripts/fetch-firmware.sh first.\n",
+                o.dir ? o.dir : "firmware/");
         return 4;
     }
     const AicId *id = NULL;
@@ -627,7 +683,7 @@ static int cmd_fwload(int argc, char **argv) {
     int rc = link_open(&l);
     if (rc) return rc;
     double t0 = now_s();
-    rc = fwload_steps(&l, dir);
+    rc = fwload_steps(&l, &o);
     link_close(&l);
     if (rc) {
         fprintf(stderr, "Firmware load stopped. Unplug and replug the adapter to reset it (then `modeswitch`).\n");
@@ -660,8 +716,8 @@ static int cmd_fwload(int argc, char **argv) {
 }
 
 static void usage(void) {
-    fprintf(stderr, "usage: macwifictl list [--all] | modeswitch | info | identify | fwload [--fw DIR] | memr <addr> |\n"
-                    "       memw <addr> <val>\n"
+    fprintf(stderr, "usage: macwifictl list [--all] | modeswitch | info | identify | fwload [--profile v5|legacy]\n"
+                    "       [--fw DIR] | memr <addr> | memw <addr> <val>\n"
                     "Supported: AICsemi AIC8800 family, e.g. UGREEN AX900 (CM762). MACWIFI_DEBUG=1 dumps USB traffic.\n");
 }
 
