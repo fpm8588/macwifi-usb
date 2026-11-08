@@ -9,7 +9,7 @@ Files written from scratch for this project are **additionally** available under
 (Copyright (c) 2026 fpm8588), so they can be reused elsewhere:
 `Sources/Shared/aic8800.h`, `Sources/Shared/aic_msg.[ch]`, `Sources/Shared/ieee80211.[ch]`,
 `Sources/Shared/wpa.[ch]`, `Sources/Shared/crypto_backend.c`, `Sources/macwifictl/descdump.[ch]`,
-`Sources/macwifictl/main.c` (except `fwload`), `Tests/*`, `build.sh`,
+`Sources/macwifictl/main.c` (except `fwload` and `up`), `Tests/*`, `build.sh`,
 `scripts/*`.
 
 ## AIC8800 Linux driver (GPL-2.0-only)
@@ -24,7 +24,10 @@ later phases keep their original copyright lines and are listed here:
   `rwnx_plat_bin_fw_upload_android`) and `aic_load_fw/aic_compat_8800d80.c` (`aicwf_patch_config_8800d80`,
   `patch_tbl_d80`, `system_config_8800d80`), on branches `main` and `legacy-mcu1` (the MCU1 / product
   0x8820 profile). Copyright (C) AICSemi 2018-2020. GPL-2.0-only.
-- The `fwload` command in `Sources/macwifictl/main.c` follows `aicfw_download_fw_8800d80` and
+- `Sources/Shared/aic_fmac.h`, `Sources/Shared/aic_fmac.c`: from `aic8800_fdrv/lmac_msg.h` (message ids, layouts),
+  `rwnx_msg_tx.c` (request builders), `rwnx_platform.c` (user-config defaults, parser and key table) and
+  `aicwf_compat_8800d80.c`, branch `legacy-mcu1`. Copyright (C) AICSemi 2018-2020. GPL-2.0-only.
+- The `fwload` and `up` commands in `Sources/macwifictl/main.c` follow `aicfw_download_fw_8800d80` and
   `system_config_8800d80`; that part of the file is GPL-2.0-only.
 
 ## Firmware

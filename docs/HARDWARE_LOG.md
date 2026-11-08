@@ -66,10 +66,42 @@ fixed patch-buffer layout, plus the MCU1 cache write. Issue #118 (UGREEN `a69c:5
 0x8820) and PR #119 add two system-config writes for product 0x8820 that MM_START needs later. Both are now the
 `legacy-mcu1` loader profile, chosen automatically for MCU1 chips.
 
-## Phase 2a, attempt 2: legacy-mcu1 profile (waiting for a run)
+## 2026-11-07: Phase 2a passed (legacy-mcu1 profile)
 
-Expected (checked against the real files in CI): profile legacy-mcu1; cache 0x2 -> 0x3; two product-0x8820
-writes; patch table version "- Dec 05 2023 15:53:41 - git 487f432", ADID (1,708 B) -> 0x201940, patch
-(25,300 B) -> 0x1e0000, no ext patch, 92 patch-table writes; fmacfw (327,037 B, 320 chunks) -> 0x120000; no
-version word; 12 patch-config writes (patch struct at 0x170000, pairs at 0x1D7000); START_APP; re-enumeration
-as `a69c:8d81` (Linux sees interfaces 0-1 Bluetooth, interface 2 Wi-Fi).
+Commit `f88e71f`. (A first try right after the failed attempt returned "no reply (message 0x0401)": the chip was
+still wedged; it was not unplugged in between. Unplug/replug always resets it.) After replug + `modeswitch`:
+
+```
+Chip: [0x40500000] = 0xf9078820 -> revision 0x07 (U03), product 0x8820, chip_mcu_id 1
+Loader profile: legacy-mcu1 (SDK V3 firmware), firmware from firmware/aic8800D80-legacy-mcu1
+System config: [0x40100020] 0x00000002 -> 0x00000003 (MCU1 cache fix)
+System config: 2 product-0x8820 writes
+Patch table: 7 records, ADID -> 0x00201940, patch -> 0x001e0000, 0 ext patch(es), version "- Dec 05 2023 15:53:41 - git 487f432"
+  fw_adid_8800d80_u02.bin             1708 bytes -> 0x00201940  ok (2 chunks, 0.0 s)
+  fw_patch_8800d80_u02.bin           25300 bytes -> 0x001e0000  ok (25 chunks, 0.1 s)
+  patch table: 92 register writes ok
+  fmacfw_8800d80_u02.bin            327037 bytes -> 0x00120000 .......... ok (320 chunks, 1.7 s)
+Firmware read-back matches the file (this image has no version word).
+Patch config: 12 writes (config base 0x00183214, patch struct 0x00170000, pairs at 0x001d7000)
+START_APP sent (boot 0x00120000).
+The adapter came back as a69c:8d81 (AIC8800D80/D81 running firmware) 4.8 s after the upload started.
+```
+
+`a69c:8d81`, bcdDevice 0x0100, 480 Mb/s, wTotalLength 215, 3 interfaces, 500 mA:
+
+| Interface | Class | Endpoints | Use |
+|---|---|---|---|
+| 0 (IAD first=0 count=2, class 0xe0) | 0xe0/0x01/0x01 Bluetooth | 0x83 IN interrupt 64 B; 0x84 IN bulk; 0x04 OUT bulk | HCI events / ACL |
+| 1, alt 0-5 | 0xe0/0x01/0x01 Bluetooth | 0x85 IN / 0x05 OUT isochronous, 0/9/17/25/33/49 B | SCO audio |
+| 2 | 0xff/0xff/0xff vendor | **0x01 OUT bulk (data), 0x81 IN bulk, 0x02 OUT bulk (messages)** | Wi-Fi (Linux `aic8800_fdrv`) |
+
+Matches Linux #58 (interfaces 0-1 to `btusb`, interface 2 to `aic8800_fdrv`) and `kAicIds` (8d81 sends
+messages on the second bulk OUT). Bluetooth is out of scope: macOS does not use third-party USB Bluetooth
+controllers.
+
+## Phase 2b: bring-up (waiting for a run)
+
+Expected from the Linux driver: `macwifictl up` loads the firmware as in 2a, opens interface 2 of `a69c:8d81`
+(pipes: in 0x81, out 0x01, msg 0x02), reads `[0x40500000] = 0xf9078820` through the firmware, applies 96
+user-config settings, then STACK_START (5 GHz support expected), FW_VERSION, TXPWR_IDX_LVL, RF_CALIB,
+GET_MAC_ADDR (should match the adapter's label), RESET, VERSION.

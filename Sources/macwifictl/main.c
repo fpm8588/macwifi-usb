@@ -26,6 +26,7 @@
 #include <unistd.h>
 
 #include "aic8800.h"
+#include "aic_fmac.h"
 #include "aic_fwload.h"
 #include "aic_msg.h"
 #include "descdump.h"
@@ -143,11 +144,15 @@ typedef struct {
     Intf intf;
     UInt8 in_pipe, out_pipe, msg_pipe;   // pipe refs (0 = none)
     const AicId *id;
+    int dev_open;                         // 0 when macOS's composite-device driver holds the device
 } Link;
 
 static void link_close(Link *l) {
     if (l->intf) { (*l->intf)->USBInterfaceClose(l->intf); (*l->intf)->Release(l->intf); }
-    if (l->dev) { (*l->dev)->USBDeviceClose(l->dev); (*l->dev)->Release(l->dev); }
+    if (l->dev) {
+        if (l->dev_open) (*l->dev)->USBDeviceClose(l->dev);
+        (*l->dev)->Release(l->dev);
+    }
     memset(l, 0, sizeof *l);
 }
 
@@ -170,16 +175,21 @@ static int link_open(Link *l) {
     if (!l->dev) return 1;
 
     IOReturn kr = (*l->dev)->USBDeviceOpen(l->dev);
-    if (kr != kIOReturnSuccess) {
-        fprintf(stderr, "USBDeviceOpen failed: 0x%08x%s\n", kr,
-                kr == kIOReturnExclusiveAccess ? " (another program or driver owns the adapter)" : "");
+    if (kr == kIOReturnSuccess) {
+        l->dev_open = 1;
+    } else if (kr == kIOReturnExclusiveAccess) {
+        // Multi-interface devices (a69c:8d81 has Bluetooth + Wi-Fi) are held by macOS's composite driver, which
+        // has already configured them; the Wi-Fi interface can still be opened on its own.
+        if (gDebug) fprintf(stderr, "USBDeviceOpen: exclusive access (composite device); opening the interface only\n");
+    } else {
+        fprintf(stderr, "USBDeviceOpen failed: 0x%08x\n", kr);
         (*l->dev)->Release(l->dev);
         l->dev = NULL;
         return 1;
     }
     UInt8 cfg = 0;
     (*l->dev)->GetConfiguration(l->dev, &cfg);
-    if (cfg == 0) {
+    if (cfg == 0 && l->dev_open) {
         IOUSBConfigurationDescriptorPtr d = NULL;
         if ((*l->dev)->GetConfigurationDescriptorPtr(l->dev, 0, &d) == kIOReturnSuccess && d) {
             kr = (*l->dev)->SetConfiguration(l->dev, d->bConfigurationValue);
@@ -277,6 +287,13 @@ static int link_wait_msg(Link *l, uint16_t want, uint8_t *params, size_t cap, ui
         AicRxPacket pk;
         int r;
         while ((r = aic_rx_next(buf, size, &off, &pk)) == 1) {
+            if ((pk.type & 0x7f) == AIC_USB_TYPE_CFG_PRINT) {   // firmware log line
+                size_t tl = pk.packet[0] | (pk.packet[1] << 8);
+                const char *t = (const char *)pk.packet + 4;
+                while (tl && (t[tl - 1] == '\n' || t[tl - 1] == '\r' || t[tl - 1] == 0)) tl--;
+                fprintf(stderr, "  [firmware] %.*s\n", (int)tl, t);
+                continue;
+            }
             if (!pk.is_msg) continue;
             if (pk.id == AIC_DBG_ERROR_IND) fprintf(stderr, "firmware reported DBG_ERROR_IND\n");
             if (pk.id != want) {
@@ -648,7 +665,7 @@ out:
     return rc;
 }
 
-static int cmd_fwload(int argc, char **argv) {
+static int fwload_impl(int argc, char **argv, int show_info) {
     FwOpts o = {opt(argc, argv, "--fw"), -1};
     if (!o.dir) {
         const char *e = getenv("MACWIFI_FW");
@@ -703,9 +720,12 @@ static int cmd_fwload(int argc, char **argv) {
         if (s && now->pid != AIC_PID_D80_ROM) {
             printf("\nThe adapter came back as %04x:%04x (%s) %.1f s after the upload started.\n", now->vid, now->pid,
                    now->name, now_s() - t0);
-            printf("\n");
-            cmd_info();
-            printf("\nPhase 2a hardware check %s.\n", now->pid == AIC_PID_D80_FW ? "passed" : "finished (unexpected ID: record it)");
+            if (show_info) {
+                printf("\n");
+                cmd_info();
+                printf("\nPhase 2a hardware check %s.\n",
+                       now->pid == AIC_PID_D80_FW ? "passed" : "finished (unexpected ID: record it)");
+            }
             return now->pid == AIC_PID_D80_FW ? 0 : 1;
         }
         if (i % 4 == 3) { putchar('.'); fflush(stdout); }
@@ -715,9 +735,158 @@ static int cmd_fwload(int argc, char **argv) {
     return 1;
 }
 
+static int cmd_fwload(int argc, char **argv) { return fwload_impl(argc, argv, 1); }
+
+// ---------------------------------------------------------------- Phase 2b: FullMAC bring-up
+
+// Sends one firmware message and waits for its confirmation. `out` receives up to `cap` parameter bytes.
+static int fmac_call(Link *l, uint16_t id, const void *params, uint16_t plen, uint16_t cfm, uint8_t *out, size_t cap,
+                     uint16_t *olen, int timeout_ms) {
+    uint8_t cmd[16 + 256];
+    size_t n = aic_build_cmd(cmd, sizeof cmd, id, (uint16_t)(id >> 10), params, plen);
+    if (!n || link_send(l, cmd, n)) return -1;
+    return link_wait_msg(l, cfm, out, cap, olen, timeout_ms);
+}
+
+static int fmac_step(const char *what, int rc) {
+    if (rc) fprintf(stderr, "%s: no confirmation from the firmware.\n", what);
+    return rc;
+}
+
+static int read_text(const char *dir, const char *name, char **buf, size_t *len) {
+    *buf = (char *)read_file(dir, name, len);
+    return *buf ? 0 : -1;
+}
+
+static int bringup(Link *l, const FwOpts *o) {
+    uint8_t p[128], r[128];
+    uint16_t rl = 0;
+
+    // system_config_8800d80 (fdrv): the running firmware still answers debug reads.
+    uint32_t chip = 0;
+    if (mem_read(l, AIC_ADDR_CHIP_ID, &chip)) {
+        fprintf(stderr, "The firmware does not answer. Unplug and replug the adapter, then run `macwifictl up` again.\n");
+        return 1;
+    }
+    AicD80Profile prof = o->profile >= 0 ? (AicD80Profile)o->profile : aic_d80_choose_profile(chip);
+    const char *dir = o->dir ? o->dir : (prof == AIC_D80_PROFILE_LEGACY_MCU1 ? AIC_D80_FW_DIR_LEGACY : AIC_D80_FW_DIR_V5);
+    printf("Firmware answers: [0x%08x] = 0x%08x (profile %s)\n", AIC_ADDR_CHIP_ID, chip, aic_d80_profile_name(prof));
+
+    // rwnx_plat_userconfig_load_8800d80: transmit-power tables and crystal trim from the user-config file.
+    AicUserConfig uc;
+    aic_userconfig_defaults(&uc);
+    char *txt = NULL;
+    size_t tlen = 0;
+    if (read_text(dir, "aic_userconfig_8800d80.txt", &txt, &tlen) == 0) {
+        int nkeys = aic_userconfig_parse(&uc, txt, tlen);
+        printf("User config: %d settings from %s/aic_userconfig_8800d80.txt\n", nkeys, dir);
+        free(txt);
+    } else {
+        printf("User config: file not found, using the driver defaults\n");
+    }
+
+    // MM_SET_STACK_START(on, efuse_valid 0, set_vendor_info BIT(5), fw trace off).
+    AicStackStartCfm ss = {0, 0};
+    aic_fmac_stack_start_params(p, 1, 0, AIC_D80_STACK_SET_VENDOR_INFO, 0);
+    if (fmac_step("MM_SET_STACK_START",
+                  fmac_call(l, AIC_MM_SET_STACK_START_REQ, p, AIC_SZ_STACK_START_REQ, AIC_MM_SET_STACK_START_CFM, r,
+                            sizeof r, &rl, 5000)) ||
+        aic_fmac_parse_stack_start_cfm(r, rl, &ss))
+        return 1;
+    printf("Stack started: 5 GHz %s, vendor info 0x%02x\n", ss.is_5g_support ? "supported" : "NOT supported",
+           ss.vendor_info);
+
+    char ver[64] = "";
+    memset(p, 0, AIC_SZ_GET_FW_VER_REQ);
+    if (fmac_step("MM_GET_FW_VERSION", fmac_call(l, AIC_MM_GET_FW_VERSION_REQ, p, AIC_SZ_GET_FW_VER_REQ,
+                                                 AIC_MM_GET_FW_VERSION_CFM, r, sizeof r, &rl, 2000)))
+        return 1;
+    aic_fmac_parse_fw_version_cfm(r, rl, ver, sizeof ver);
+    printf("Firmware version: %s\n", ver[0] ? ver : "(empty)");
+
+    // aicwf_set_rf_config_8800d80: each power message is sent only if the user config enables it.
+    size_t n = aic_fmac_txpwr_lvl_v3_params(&uc, p);
+    if (n && fmac_step("MM_SET_TXPWR_IDX_LVL", fmac_call(l, AIC_MM_SET_TXPWR_IDX_LVL_REQ, p, (uint16_t)n,
+                                                         AIC_MM_SET_TXPWR_IDX_LVL_CFM, NULL, 0, NULL, 2000)))
+        return 1;
+    printf("TX power levels: %s\n", n ? "sent" : "disabled in the user config");
+    n = aic_fmac_txpwr_lvl_adj_params(&uc, p);
+    if (n && fmac_step("MM_SET_TXPWR_LVL_ADJ", fmac_call(l, AIC_MM_SET_TXPWR_LVL_ADJ_REQ, p, (uint16_t)n,
+                                                         AIC_MM_SET_TXPWR_LVL_ADJ_CFM, NULL, 0, NULL, 2000)))
+        return 1;
+    if (n) printf("TX power adjust: sent\n");
+    n = aic_fmac_txpwr_ofst2x_params(&uc, p);
+    if (n && fmac_step("MM_SET_TXPWR_OFST", fmac_call(l, AIC_MM_SET_TXPWR_OFST_REQ, p, (uint16_t)n,
+                                                      AIC_MM_SET_TXPWR_OFST_CFM, NULL, 0, NULL, 2000)))
+        return 1;
+    if (n) printf("TX power offsets: sent\n");
+    AicRfCalibCfm cal;
+    n = aic_fmac_rf_calib_params(&uc, p);
+    if (fmac_step("MM_SET_RF_CALIB", fmac_call(l, AIC_MM_SET_RF_CALIB_REQ, p, (uint16_t)n, AIC_MM_SET_RF_CALIB_CFM, r,
+                                               sizeof r, &rl, 5000)) ||
+        aic_fmac_parse_rf_calib_cfm(r, rl, &cal))
+        return 1;
+    printf("RF calibration done (rx gain tables 0x%08x / 0x%08x, tx 0x%08x / 0x%08x)\n", cal.rxgain_24g_addr,
+           cal.rxgain_5g_addr, cal.txgain_24g_addr, cal.txgain_5g_addr);
+
+    uint8_t mac[6];
+    aic_fmac_get_mac_params(p);
+    if (fmac_step("MM_GET_MAC_ADDR", fmac_call(l, AIC_MM_GET_MAC_ADDR_REQ, p, AIC_SZ_GET_MAC_ADDR_REQ,
+                                               AIC_MM_GET_MAC_ADDR_CFM, r, sizeof r, &rl, 2000)) ||
+        aic_fmac_parse_mac_cfm(r, rl, mac))
+        return 1;
+    printf("MAC address: %02x:%02x:%02x:%02x:%02x:%02x%s\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
+           aic_fmac_mac_valid(mac) ? "" : "  (none in efuse; Linux would use a random one)");
+
+    if (fmac_step("MM_RESET", fmac_call(l, AIC_MM_RESET_REQ, NULL, 0, AIC_MM_RESET_CFM, NULL, 0, NULL, 2000))) return 1;
+    AicVersionCfm vc;
+    if (fmac_step("MM_VERSION", fmac_call(l, AIC_MM_VERSION_REQ, NULL, 0, AIC_MM_VERSION_CFM, r, sizeof r, &rl, 2000)) ||
+        aic_fmac_parse_version_cfm(r, rl, &vc))
+        return 1;
+    printf("MAC reset; LMAC 0x%08x, MAC HW 0x%08x/0x%08x, PHY 0x%08x/0x%08x, features 0x%08x, %u stations, %u "
+           "interfaces\n", vc.version_lmac, vc.version_machw_1, vc.version_machw_2, vc.version_phy_1,
+           vc.version_phy_2, vc.features, vc.max_sta_nb, vc.max_vif_nb);
+    return 0;
+}
+
+static int cmd_up(int argc, char **argv) {
+    const AicId *id = NULL;
+    io_service_t svc = find_adapter(AIC_MODE_NONE, &id);
+    if (!svc) { fprintf(stderr, "No AIC8800 adapter found.\n"); return 3; }
+    IOObjectRelease(svc);
+    if (id->mode == AIC_MODE_DRIVER_CD) {
+        int rc = cmd_modeswitch();
+        if (rc) return rc;
+        io_service_t s2 = find_adapter(AIC_MODE_WIFI, &id);
+        if (s2) IOObjectRelease(s2);
+    }
+    if (id && id->pid != AIC_PID_D80_FW) {
+        int rc = fwload_impl(argc, argv, 0);
+        if (rc) return rc;
+        usleep(300 * 1000);   // let IOKit finish publishing the new device's interfaces
+    } else {
+        printf("Firmware already running (a69c:8d81).\n");
+    }
+    FwOpts o = {opt(argc, argv, "--fw"), -1};
+    const char *pf = opt(argc, argv, "--profile");
+    if (pf) o.profile = !strcmp(pf, "legacy") ? AIC_D80_PROFILE_LEGACY_MCU1 : AIC_D80_PROFILE_V5;
+    Link l;
+    int rc = 1;
+    for (int i = 0; i < 10 && rc; i++) {   // the interface can take a moment to appear after re-enumeration
+        rc = link_open(&l);
+        if (rc) usleep(300 * 1000);
+    }
+    if (rc) return rc;
+    printf("Wi-Fi interface: pipes in %u, out %u, msg %u\n", l.in_pipe, l.out_pipe, l.msg_pipe);
+    rc = bringup(&l, &o);
+    link_close(&l);
+    printf("%s\n", rc ? "Bring-up stopped. Unplug and replug the adapter to reset it." : "Phase 2b hardware check passed.");
+    return rc;
+}
+
 static void usage(void) {
-    fprintf(stderr, "usage: macwifictl list [--all] | modeswitch | info | identify | fwload [--profile v5|legacy]\n"
-                    "       [--fw DIR] | memr <addr> | memw <addr> <val>\n"
+    fprintf(stderr, "usage: macwifictl list [--all] | modeswitch | info | identify | memr <addr> | memw <addr> <val>\n"
+                    "       fwload [--profile v5|legacy] [--fw DIR] | up [--profile v5|legacy] [--fw DIR]\n"
                     "Supported: AICsemi AIC8800 family, e.g. UGREEN AX900 (CM762). MACWIFI_DEBUG=1 dumps USB traffic.\n");
 }
 
@@ -730,6 +899,7 @@ int main(int argc, char **argv) {
     if (!strcmp(c, "modeswitch")) return cmd_modeswitch();
     if (!strcmp(c, "identify")) return cmd_identify();
     if (!strcmp(c, "fwload")) return cmd_fwload(argc, argv);
+    if (!strcmp(c, "up")) return cmd_up(argc, argv);
     if ((!strcmp(c, "memr") && argc > 2) || (!strcmp(c, "memw") && argc > 3)) {
         Link l;
         int rc = link_open(&l);

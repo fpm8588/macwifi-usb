@@ -70,7 +70,7 @@ endpoint layout than Linux expects, record it before changing code.
 
 ## Phase 2: load the firmware
 
-### 2a: upload and start (attempt 1 stopped at 0x170000; legacy-mcu1 profile written, run it on the adapter)
+### 2a: upload and start (PASSED with the legacy-mcu1 profile, 2026-11-07)
 
 **Two loader profiles** (`AicD80Profile`), chosen from `[0x40500000]` bit 25 like Linux's `chip_mcu_id`:
 `v5` (branch `main`, SDK V5 firmware) for MCU0 chips, `legacy-mcu1` (branch `legacy-mcu1` @ `bbf6cb4`, SDK V3
@@ -102,14 +102,33 @@ real pinned firmware in CI. I/O in `macwifictl fwload`:
 If it fails, rerun with `MACWIFI_DEBUG=1` and record the last transfers. If the adapter comes back with another
 ID, add it to `kAicIds` with a hardware-log citation.
 
-### 2b: FullMAC bring-up (next)
+### 2b: FullMAC bring-up (code written; run it on the adapter)
 
-1. Open `a69c:8d81` (pick the vendor interface the Linux fdrv binds; messages on the second bulk OUT if present).
-2. FullMAC bring-up, from `aic8800_fdrv/rwnx_main.c` (`rwnx_platform_on` area, ~lines 9000-9430):
-   D80 RF config (`aicwf_set_rf_config_8800d80`: txpwr lvl v3, lvl adj, ofst2x, `rf_calib`), userconfig file
-   (`aic_userconfig_8800d80.txt` → `rwnx_cfgfile.c`), `MM_GET_MAC_ADDR` (eFuse MAC), `MM_RESET`, `ME_CONFIG`,
-   `ME_CHAN_CONFIG` (country code; default "00"/world-safe), `MM_START`, `MM_ADD_IF` (station).
-   → **Checkpoint: `macwifictl up` (fwload + bring-up) prints the MAC address printed on your adapter.**
+`macwifictl up` = `modeswitch` (if in driver-CD mode) + `fwload` (if not already `8d81`) + bring-up on the
+running firmware. Ported from the Linux Wi-Fi driver on the same branch as the firmware (`legacy-mcu1`,
+`aic8800_fdrv`), pure logic in `Sources/Shared/aic_fmac.[ch]` with `Tests/test_fmac.c`. Message ids and struct
+sizes were checked by compiling the driver's `lmac_msg.h` with its build flags; the user-config parser was
+checked byte for byte against the driver's own parser (defaults, both real files, 100,000 mutated files).
+
+Sequence (Linux `rwnx_cfg80211_init` for PRODUCT_ID_AIC8800D81, testmode 0, USE_5G):
+
+1. Open `a69c:8d81` interface 2 (0xff/0xff/0xff); messages on the second bulk OUT (0x02), replies on 0x81.
+   If USBDeviceOpen is refused because macOS's composite driver holds the device, open the interface alone.
+2. `DBG_MEM_READ [0x40500000]` through the firmware (fdrv `system_config_8800d80`); choose the profile.
+3. Parse `aic_userconfig_8800d80.txt` (defaults from `userconfig_info`).
+4. `MM_SET_STACK_START(1, 0, BIT(5), 0)` -> 5 GHz support, vendor info.
+5. `MM_GET_FW_VERSION` -> version string.
+6. `MM_SET_TXPWR_IDX_LVL` (v3 table, 95-byte union; with the legacy file: sent), `MM_SET_TXPWR_LVL_ADJ` and
+   `MM_SET_TXPWR_OFST` (2x) only if enabled (legacy file: neither), `MM_SET_RF_CALIB` (0x0f8f / 0x0f0f /
+   0x0c34c008 / 0 / 0x264203, crystal trim off).
+7. `MM_GET_MAC_ADDR` -> **checkpoint: the MAC printed on the adapter's label**.
+8. `MM_RESET`, `MM_VERSION`.
+
+Firmware log packets (type 0x13) are printed as `[firmware] ...`.
+
+Next (phase 3 start): `ME_CONFIG` (HT/VHT/HE capabilities), `ME_CHAN_CONFIG` (channel list, country "00"),
+`MM_START`, `MM_ADD_IF` (station), then scanning. Issue #118 notes `MM_START` needs the product-0x8820 writes,
+which phase 2a already does.
 
 ## Phase 3: scan and connect
 
