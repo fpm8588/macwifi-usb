@@ -99,9 +99,27 @@ Matches Linux #58 (interfaces 0-1 to `btusb`, interface 2 to `aic8800_fdrv`) and
 messages on the second bulk OUT). Bluetooth is out of scope: macOS does not use third-party USB Bluetooth
 controllers.
 
-## Phase 2b: bring-up (waiting for a run)
+## 2026-11-07: Phase 2b passed
 
-Expected from the Linux driver: `macwifictl up` loads the firmware as in 2a, opens interface 2 of `a69c:8d81`
-(pipes: in 0x81, out 0x01, msg 0x02), reads `[0x40500000] = 0xf9078820` through the firmware, applies 96
-user-config settings, then STACK_START (5 GHz support expected), FW_VERSION, TXPWR_IDX_LVL, RF_CALIB,
-GET_MAC_ADDR (should match the adapter's label), RESET, VERSION.
+Commit `806f69e`. The adapter was still running the firmware from the 2a run (not replugged), so `up` skipped
+straight to the bring-up:
+
+```
+Firmware already running (a69c:8d81).
+Wi-Fi interface: pipes in 2, out 1, msg 3
+Firmware answers: [0x40500000] = 0xf9078820 (profile legacy-mcu1 (SDK V3 firmware))
+User config: 96 settings from firmware/aic8800D80-legacy-mcu1/aic_userconfig_8800d80.txt
+Stack started: 5 GHz supported, vendor info 0x00
+Firmware version: zh Dec 29 2023 16:46:29 - gf876b0f
+TX power levels: sent
+RF calibration done (rx gain tables 0x00181b2c / 0x00182540, tx 0x00182904 / 0x00182a8c)
+MAC address: 6c:1f:f7:8b:81:46
+MAC reset; LMAC 0x06090100, MAC HW 0x0002fdfb/0x00014047, PHY 0x5ee24111/0x01020000, features 0x01e877d5, 32 stations, 4 interfaces
+Phase 2b hardware check passed.
+```
+
+- USBDeviceOpen on the composite `8d81` worked (no exclusive-access fallback needed); pipes 1 = OUT 0x01,
+  2 = IN 0x81, 3 = OUT 0x02 (messages).
+- The MAC's OUI 6C:1F:F7 is registered to Ugreen Group Limited, i.e. the eFuse MAC is real.
+- 5 GHz supported; LMAC 6.9.1.0; firmware supports 32 stations and 4 virtual interfaces.
+- No `[firmware]` log packets were sent during the bring-up.

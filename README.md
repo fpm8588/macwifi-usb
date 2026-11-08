@@ -18,8 +18,8 @@ in its own menu bar app; it won't appear in the system Wi-Fi menu. Background an
 |---|---|---|
 | 1 | `macwifictl`: find the adapter, switch it out of driver-CD mode, read the chip revision through the ROM; message framing + WPA2 crypto + 802.11 parsing libraries with tests | **Passed on the adapter** (2026-11-07) |
 | 2a | `macwifictl fwload`: upload the ROM patches and Wi-Fi firmware, start it | **Passed on the adapter** (2026-11-07) |
-| 2b | FullMAC bring-up, MAC address | In progress |
-| 3 | Scan, connect, WPA2-PSK handshake, data path | Planned |
+| 2b | `macwifictl up`: start the Wi-Fi firmware, calibrate, read the MAC address | **Passed on the adapter** (2026-11-07) |
+| 3 | Scan, connect, WPA2-PSK handshake, data path | In progress |
 | 4 | macOS networking via a feth (virtual Ethernet) pair | Planned |
 | 5 | LaunchDaemon, menu bar app, installer | Planned |
 

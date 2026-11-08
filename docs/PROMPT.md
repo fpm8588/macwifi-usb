@@ -102,7 +102,7 @@ real pinned firmware in CI. I/O in `macwifictl fwload`:
 If it fails, rerun with `MACWIFI_DEBUG=1` and record the last transfers. If the adapter comes back with another
 ID, add it to `kAicIds` with a hardware-log citation.
 
-### 2b: FullMAC bring-up (code written; run it on the adapter)
+### 2b: FullMAC bring-up (PASSED 2026-11-07: MAC 6c:1f:f7:8b:81:46, 5 GHz, LMAC 6.9.1.0)
 
 `macwifictl up` = `modeswitch` (if in driver-CD mode) + `fwload` (if not already `8d81`) + bring-up on the
 running firmware. Ported from the Linux Wi-Fi driver on the same branch as the firmware (`legacy-mcu1`,
