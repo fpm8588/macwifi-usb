@@ -33,6 +33,7 @@ typedef struct {
     uint16_t assoc_status;      // SM_CONNECT_IND status
     int pmf_required;
     int open;                   // no RSN, no privacy: open network
+    int own_only_when_assoc, associated;
     // what happened
     int scans, connects, msg2_ok, msg2_bad, msg4_ok, ptk_ok, gtk_ok, ptk_before_msg4, port_open, dhcp_seen;
     int discs, data_bad, eapol_sta_ok, eapol_cfm_req, dhcp_sta_ok, key_dumped, connect_req_ok;
@@ -162,16 +163,24 @@ static int mic_ok(const uint8_t *f, size_t n) {
     return memcmp(mic, f + 81, 16) == 0;
 }
 
+static void beacon_result_for(const char *ssid, const uint8_t *bssid);
 static void beacon_result(void) {
+    beacon_result_for(S.ssid, kBssid);
+    // A neighbour's network; with own_only_when_assoc set, the "firmware" reports only our AP while associated
+    // (the behaviour suspected on the adapter, which the menu's merged list must survive).
+    static const uint8_t nb[6] = {0x02, 0x99, 0x88, 0x77, 0x66, 0x55};
+    if (!(S.own_only_when_assoc && S.associated)) beacon_result_for("Neighbor", nb);
+}
+static void beacon_result_for(const char *ssid, const uint8_t *bssid) {
     uint8_t f[256] = {0};
     size_t n = 0;
     f[0] = 0x50;                                            // probe response
-    memcpy(f + 4, kMac, 6); memcpy(f + 10, kBssid, 6); memcpy(f + 16, kBssid, 6);
+    memcpy(f + 4, kMac, 6); memcpy(f + 10, bssid, 6); memcpy(f + 16, bssid, 6);
     n = 24;
     f[n + 8] = 100; f[n + 10] = S.open ? 0x01 : 0x11; f[n + 11] = 0x04;   // interval, capability: ESS (+ privacy)
     n += 12;
-    size_t sl = strlen(S.ssid);
-    f[n++] = 0; f[n++] = (uint8_t)sl; memcpy(f + n, S.ssid, sl); n += sl;
+    size_t sl = strlen(ssid);
+    f[n++] = 0; f[n++] = (uint8_t)sl; memcpy(f + n, ssid, sl); n += sl;
     f[n++] = 3; f[n++] = 1; f[n++] = 1;                     // channel 1
     if (!S.open) {
         memcpy(f + n, kApRsn, sizeof kApRsn);
@@ -211,6 +220,7 @@ static void on_msg(uint16_t id, const uint8_t *p, uint16_t plen) {
             r[10] = AP_IDX; r[12] = 1; r[820] = 1; r[824] = 0x6c; r[825] = 0x09;
             in_msg(AIC_SM_CONNECT_IND, r, 852);
             if (S.assoc_status) break;
+            S.associated = 1;
             if (S.open) { S.port_open = 1; break; }        // no handshake, no control port
             for (int i = 0; i < 32; i++) S.anonce[i] = (uint8_t)(0x80 + i);
             uint8_t e[200];
@@ -253,6 +263,7 @@ static void on_msg(uint16_t id, const uint8_t *p, uint16_t plen) {
         }
         case AIC_SM_DISCONNECT_REQ:
             S.discs++;
+            S.associated = 0;
             in_msg(AIC_SM_DISCONNECT_CFM, r, 4);
             break;
         default:
@@ -284,6 +295,7 @@ static void on_data(const uint8_t *b, size_t n) {
             wpa_derive_ptk(S.pmk, kBssid, kMac, S.anonce, spa_nonce, S.ptk);
             if (!mic_ok(payload, k.frame_len)) {
                 S.msg2_bad++;
+                S.associated = 0;
                 uint8_t r[6] = {15, 0, 0, 0, 0, 0};          // the AP gives up: 4-way handshake timeout
                 in_msg(AIC_SM_DISCONNECT_IND, r, 6);
                 return;
@@ -525,8 +537,11 @@ static void test_daemon(void) {
     CHECK(gAcquired == 1);
 
     // the menu's scan
+    pthread_mutex_lock(&wlock);
+    S.own_only_when_assoc = 1;
+    pthread_mutex_unlock(&wlock);
     CHECK(ask("{\"cmd\":\"scan\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":true") && strstr(r, "\"ssid\":\"ExampleNet\"") &&
-          strstr(r, "\"usable\":true") && strstr(r, "\"known\":false"));
+          strstr(r, "\"usable\":true") && strstr(r, "\"known\":false") && strstr(r, "\"ssid\":\"Neighbor\""));
     // bad requests
     CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\",\"password\":\"short\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":false"));
     CHECK(ask("not json", r, sizeof r) == 0 && strstr(r, "bad request"));
@@ -554,6 +569,9 @@ static void test_daemon(void) {
     CHECK(ft && !strstr(ft, "horse") && strstr(ft, "4578616d706c654e6574 ") && fl == 20 + 1 + 64 + 3);
     free(ft);
     CHECK(ask("{\"cmd\":\"networks\"}", r, sizeof r) == 0 && strstr(r, "\"known\":true"));
+    // a scan while connected that only reports our own AP keeps the neighbour listed (merged, aged list)
+    CHECK(ask("{\"cmd\":\"scan\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":true") && strstr(r, "\"ssid\":\"Neighbor\"") &&
+          strstr(r, "\"ssid\":\"ExampleNet\""));
 
     // the AP drops us: macwifid rejoins the remembered network by itself
     int before = S_get(&S.connects);

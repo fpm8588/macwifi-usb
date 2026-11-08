@@ -1141,6 +1141,7 @@ typedef struct {
     Link *l;
     uint8_t mac[6], bssid[6], vif;
     int open_net;                     // no RSN: no handshake, the port opens at association
+    uint8_t ap_rsn[2 + 255];          // the AP's RSN element, owned here (scans reuse their lists)
     ScanList *scan;                   // set while a scan runs through pump()
     int usb_error;                    // the IN pipe failed (adapter unplugged or reset)
     int last_rssi;                    // from the RX header of the latest data frame
@@ -1557,7 +1558,10 @@ static JoinResult conn_associate(Conn *c, const ScanEntry *best, const uint8_t *
         memcpy(ws->aa, best->bss.bssid, 6);
         memcpy(ws->spa, c->mac, 6);
         ws->rsn_ie_len = wpa_build_rsn_ie(ws->rsn_ie, sizeof ws->rsn_ie);
-        ws->ap_rsn_ie = best->bss.rsn_ie;
+        // Keep our own copy: `best` lives in a scan list that the next scan (e.g. the menu's) overwrites, and a
+        // later 4-way handshake (PTK rekey) checks message 3 against this element.
+        memcpy(c->ap_rsn, best->bss.rsn_ie, best->bss.rsn_ie_len);
+        ws->ap_rsn_ie = c->ap_rsn;
         ws->ap_rsn_ie_len = best->bss.rsn_ie_len;
         arc4random_buf(c->snonce, sizeof c->snonce);
     }

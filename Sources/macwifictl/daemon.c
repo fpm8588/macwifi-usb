@@ -59,7 +59,10 @@ typedef struct {
     uint8_t ssid_len;
     int rssi, freq, secured, usable, known;
     const char *why;
+    double seen;              // when a scan last saw it
 } NetView;
+
+#define NET_KEEP_S 180        // a network stays listed this long after the last scan that saw it
 
 typedef struct {
     int (*adapter_present)(void);
@@ -397,10 +400,16 @@ static DCmd d_take(Daemon *d, uint8_t ssid[32], size_t *ssid_len, char pass[64],
     return c;
 }
 
-// Copies a scan into the client-visible list: one entry per name (the strongest AP), hidden networks skipped.
+// Merges a scan into the client-visible list: one entry per name (the strongest AP of this scan), hidden networks
+// skipped; networks no scan has seen for NET_KEEP_S drop out (as macOS's own Wi-Fi menu ages its list).
 static void d_publish_scan(Daemon *d, const ScanList *sl) {
+    double now = now_s();
     pthread_mutex_lock(&d->mu);
-    d->nnets = 0;
+    int keep = 0;
+    for (int i = 0; i < d->nnets; i++)
+        if (now - d->nets[i].seen < NET_KEEP_S) d->nets[keep++] = d->nets[i];
+    d->nnets = keep;
+    uint8_t fresh[48] = {0};   // entries already updated by this scan
     for (int i = 0; i < sl->n; i++) {
         const ScanEntry *e = &sl->e[i];
         int blank = 1;
@@ -410,13 +419,18 @@ static void d_publish_scan(Daemon *d, const ScanList *sl) {
         const char *why;
         int usable = bss_usable(&e->bss, &sec, &why);
         NetView *v = NULL;
+        int vi = -1;
         for (int k = 0; k < d->nnets; k++)
-            if (d->nets[k].ssid_len == e->bss.ssid_len && !memcmp(d->nets[k].ssid, e->bss.ssid, e->bss.ssid_len)) v = &d->nets[k];
-        if (v && (v->usable > usable || (v->usable == usable && v->rssi >= e->rssi))) continue;
+            if (d->nets[k].ssid_len == e->bss.ssid_len && !memcmp(d->nets[k].ssid, e->bss.ssid, e->bss.ssid_len)) { v = &d->nets[k]; vi = k; }
+        // within this scan keep the best AP of a name; an older entry is simply refreshed
+        if (v && fresh[vi] && (v->usable > usable || (v->usable == usable && v->rssi >= e->rssi))) continue;
         if (!v) {
             if (d->nnets >= (int)(sizeof d->nets / sizeof d->nets[0])) continue;
+            vi = d->nnets;
             v = &d->nets[d->nnets++];
         }
+        fresh[vi] = 1;
+        v->seen = now;
         memcpy(v->ssid, e->bss.ssid, e->bss.ssid_len);
         v->ssid_len = e->bss.ssid_len;
         v->rssi = e->rssi;
@@ -431,7 +445,7 @@ static void d_publish_scan(Daemon *d, const ScanList *sl) {
         for (int b = a; b > 0 && d->nets[b].rssi > d->nets[b - 1].rssi; b--) {
             NetView t = d->nets[b]; d->nets[b] = d->nets[b - 1]; d->nets[b - 1] = t;
         }
-    d->scan_time = now_s();
+    d->scan_time = now;
     pthread_mutex_unlock(&d->mu);
 }
 
@@ -474,7 +488,19 @@ static int d_scan(Daemon *d, Adapter *a, const uint8_t *ssid, size_t ssid_len) {
     if (!a->connected) d_set_state(d, DS_SCANNING);
     char name[33];
     if (ssid) { memcpy(name, ssid, ssid_len); name[ssid_len] = 0; }
+    double t0 = now_s();
     int r = conn_scan(&a->c, ssid ? name : NULL, &a->sl);
+    AicScanCfm sc = {0, 0xff, 0};
+    if (r == 0) aic_fmac_parse_scan_cfm(a->c.params, a->c.plen, &sc);
+    int names = 0;
+    for (int i = 0; i < a->sl.n; i++) {
+        int dup = 0;
+        for (int k = 0; k < i; k++) dup |= ssid_is(&a->sl.e[k].bss, (const uint8_t *)a->sl.e[i].bss.ssid, a->sl.e[i].bss.ssid_len);
+        names += !dup;
+    }
+    printf("[macwifid] %s scan%s in %.1f s: firmware status %u, %u results; %d frames, %d BSSs, %d names, %d unparsed\n",
+           ssid ? "directed" : "full", a->connected ? " while connected" : "", now_s() - t0, sc.status, sc.result_cnt,
+           a->sl.frames, a->sl.n, names, a->sl.unparsed);
     if (r == 0 && !ssid) d_publish_scan(d, &a->sl);
     if (!a->connected) d_set_state(d, prev == DS_SCANNING ? DS_IDLE : prev);
     return r;
