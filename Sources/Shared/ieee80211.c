@@ -29,7 +29,11 @@ int wifi_channel_to_mhz(int ch) {
 static int parse_rsn(const uint8_t *p, size_t n, WifiBss *b) {
     if (n < 2 || le16(p) != 1) return -1;              // version 1
     size_t off = 2;
-    if (off + 4 > n) { b->security = WIFI_SEC_WPA2_PSK; b->rsn_ccmp = true; return 0; }  // defaults per 802.11
+    if (off + 4 > n) {                                   // defaults per 802.11: CCMP / CCMP / PSK
+        b->security = WIFI_SEC_WPA2_PSK; b->rsn_ccmp = true; b->rsn_group_ccmp = true; b->rsn_akm_psk = true;
+        return 0;
+    }
+    b->rsn_group_ccmp = p[off] == 0x00 && p[off + 1] == 0x0F && p[off + 2] == 0xAC && p[off + 3] == 4;
     off += 4;                                            // group cipher
     bool ccmp = false, psk = false, sae = false, dot1x = false;
     if (off + 2 <= n) {
@@ -44,6 +48,7 @@ static int parse_rsn(const uint8_t *p, size_t n, WifiBss *b) {
         for (uint16_t i = 0; i < cnt; i++, off += 4) {
             if (off + 4 > n) return -1;
             if (!(p[off] == 0x00 && p[off + 1] == 0x0F && p[off + 2] == 0xAC)) continue;
+            if (p[off + 3] == 2) b->rsn_akm_psk = true;
             switch (p[off + 3]) {
                 case 2: case 4: case 6: psk = true; break;      // PSK, FT-PSK, PSK-SHA256
                 case 8: case 9: sae = true; break;              // SAE, FT-SAE
@@ -52,7 +57,10 @@ static int parse_rsn(const uint8_t *p, size_t n, WifiBss *b) {
             }
         }
     }
-    if (off + 2 <= n) b->rsn_pmf_required = (le16(p + off) & 0x0040) != 0;
+    if (off + 2 <= n) {
+        b->rsn_pmf_required = (le16(p + off) & 0x0040) != 0;
+        b->rsn_pmf_capable = (le16(p + off) & 0x0080) != 0;
+    }
     b->rsn_ccmp = ccmp;
     if (sae && psk) b->security = WIFI_SEC_WPA2_WPA3;
     else if (sae) b->security = WIFI_SEC_WPA3_SAE;
@@ -100,6 +108,8 @@ int wifi_parse_bss(const uint8_t *f, size_t len, WifiBss *b) {
                 break;
             case 48:                                    // RSN
                 if (parse_rsn(p, n, b) == 0) have_rsn = true;
+                memcpy(b->rsn_ie, f + off, (size_t)n + 2);
+                b->rsn_ie_len = (uint16_t)(n + 2);
                 break;
             case 221:                                   // Vendor: Microsoft WPA1 = 00:50:F2 type 1
                 if (n >= 4 && p[0] == 0x00 && p[1] == 0x50 && p[2] == 0xF2 && p[3] == 0x01) have_wpa1 = true;

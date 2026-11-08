@@ -48,6 +48,12 @@ enum {
     AIC_SCANU_START_REQ           = 0x1000, AIC_SCANU_START_CFM           = 0x1001,   // TASK_SCANU = 4
     AIC_SCANU_RESULT_IND          = 0x1004,
     AIC_SCANU_START_CFM_ADDTIONAL = 0x1009,   // (sic) immediate acknowledgement of SCANU_START_REQ
+    AIC_MM_KEY_ADD_REQ            = 0x0024, AIC_MM_KEY_ADD_CFM            = 0x0025,
+    AIC_ME_SET_CONTROL_PORT_REQ   = 0x1404, AIC_ME_SET_CONTROL_PORT_CFM   = 0x1405,
+    AIC_SM_CONNECT_REQ            = 0x1800, AIC_SM_CONNECT_CFM            = 0x1801,   // TASK_SM = 6
+    AIC_SM_CONNECT_IND            = 0x1802,
+    AIC_SM_DISCONNECT_REQ         = 0x1803, AIC_SM_DISCONNECT_CFM         = 0x1804,
+    AIC_SM_DISCONNECT_IND         = 0x1805,
 };
 #define AIC_TASK_MM_ID 0
 #define AIC_USB_TYPE_CFG_PRINT 0x13   // firmware log text (aicwf_usb.h); payload starts at packet + 4
@@ -66,6 +72,10 @@ enum {
 #define AIC_SZ_COEX_REQ          16
 #define AIC_SZ_ADD_IF_REQ        10
 #define AIC_SZ_SCANU_START_REQ   376
+#define AIC_SZ_SM_CONNECT_REQ    320
+#define AIC_SZ_KEY_ADD_REQ       44
+#define AIC_SZ_CTRL_PORT_REQ     2
+#define AIC_SZ_SM_DISCONNECT_REQ 4
 
 // ---------------------------------------------------------------- user config (aic_userconfig_8800d80.txt)
 // Raw images of the Linux structures, so builders can copy them byte for byte.
@@ -127,6 +137,35 @@ typedef struct { uint8_t vif_idx, status, result_cnt; } AicScanCfm;
 int aic_fmac_parse_add_if_cfm(const uint8_t *p, size_t n, uint8_t *status, uint8_t *inst_nbr);
 int aic_fmac_parse_scan_result(const uint8_t *p, size_t n, AicScanResult *r);
 int aic_fmac_parse_scan_cfm(const uint8_t *p, size_t n, AicScanCfm *c);
+
+// ---------------------------------------------------------------- phase 3b: connect, keys, control port
+// SM_CONNECT_REQ as rwnx_send_sm_connect_req builds it from wpa_supplicant's nl80211 connect for WPA2-PSK:
+// flags CONTROL_PORT_HOST | WPA_WPA2_IN_USE (0x09) when `ie` holds an RSN element (0 for an open network), EAPOL
+// as the control-port ethertype, open-system authentication, uapsd_queues = AC_VO, listen interval 0.
+size_t aic_fmac_connect_params(uint8_t out[AIC_SZ_SM_CONNECT_REQ], const uint8_t *ssid, size_t ssid_len,
+                               const uint8_t bssid[6], uint16_t freq, uint8_t band, uint8_t vif_idx,
+                               const uint8_t *ie, size_t ie_len);
+// MM_KEY_ADD_REQ: pairwise key (sta_idx = the AP's index from SM_CONNECT_IND) or group key (sta_idx 0xFF,
+// key_idx = GTK index). cipher: MAC_CIPHER_CCMP = 2.
+#define AIC_MAC_CIPHER_CCMP 2
+size_t aic_fmac_key_add_params(uint8_t out[AIC_SZ_KEY_ADD_REQ], uint8_t vif_idx, uint8_t sta_idx, int pairwise,
+                               const uint8_t *key, uint8_t key_len, uint8_t key_idx, uint8_t cipher);
+size_t aic_fmac_ctrl_port_params(uint8_t out[AIC_SZ_CTRL_PORT_REQ], uint8_t sta_idx, int open);
+size_t aic_fmac_disconnect_params(uint8_t out[AIC_SZ_SM_DISCONNECT_REQ], uint16_t reason, uint8_t vif_idx);
+
+typedef struct {
+    uint16_t status_code;       // 802.11 status code; 0 = success
+    uint8_t bssid[6];
+    uint8_t roamed, vif_idx, ap_idx, ch_idx, qos, acm;
+    uint16_t assoc_req_ie_len, assoc_rsp_ie_len;
+    const uint8_t *assoc_ies;   // request IEs then response IEs, inside the caller's buffer
+    uint16_t aid;
+    uint8_t band;
+    uint16_t center_freq;
+    uint8_t width;
+} AicConnectInd;
+int aic_fmac_parse_connect_ind(const uint8_t *p, size_t n, AicConnectInd *c);
+int aic_fmac_parse_disconnect_ind(const uint8_t *p, size_t n, uint16_t *reason, uint8_t *vif_idx);
 
 // ---------------------------------------------------------------- confirmations
 typedef struct { uint8_t is_5g_support, vendor_info; } AicStackStartCfm;

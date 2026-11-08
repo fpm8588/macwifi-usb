@@ -53,7 +53,12 @@ typedef struct {
     WifiSecurity security;
     bool     rsn_ccmp;          // RSN offers CCMP as a pairwise cipher (what we support)
     bool     rsn_pmf_required;  // MFPR bit set
+    bool     rsn_pmf_capable;   // MFPC bit set
+    bool     rsn_group_ccmp;    // group cipher is CCMP (00-0F-AC:4)
+    bool     rsn_akm_psk;       // plain WPA2-PSK (AKM 00-0F-AC:2) offered; what `connect` uses
     bool     ht, vht, he;
+    uint8_t  rsn_ie[2 + 255];   // the RSN element as sent (id, length, body); rsn_ie_len 0 if absent
+    uint16_t rsn_ie_len;
 } WifiBss;
 
 const char *wifi_security_name(WifiSecurity s);

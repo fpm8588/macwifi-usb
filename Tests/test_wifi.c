@@ -96,10 +96,19 @@ static void test_bss(void) {
     CHECK(b.channel == 6 && b.ht && !b.vht);
     CHECK(b.security == WIFI_SEC_WPA2_PSK && b.rsn_ccmp);
     CHECK(b.bssid[0] == 0x10 && b.bssid[5] == 0x15 && b.beacon_interval == 100);
+    CHECK(b.rsn_group_ccmp && b.rsn_akm_psk && !b.rsn_pmf_capable && !b.rsn_pmf_required);
+    CHECK(b.rsn_ie_len >= 2 && b.rsn_ie[0] == 48 && b.rsn_ie[1] == b.rsn_ie_len - 2 &&
+          memcmp(b.rsn_ie, f + n - b.rsn_ie_len, b.rsn_ie_len) == 0);   // the raw element, for the msg 3 check
+    f[n - 2] = 0x80;                                        // RSN capabilities: MFPC
+    CHECK(wifi_parse_bss(f, n, &b) == 0 && b.rsn_pmf_capable && !b.rsn_pmf_required);
+    f[n - 2] = 0xC0;                                        // MFPC | MFPR
+    CHECK(wifi_parse_bss(f, n, &b) == 0 && b.rsn_pmf_capable && b.rsn_pmf_required);
+    f[n - 15] = 2;                                          // group cipher TKIP (00-0F-AC:2)
+    CHECK(wifi_parse_bss(f, n, &b) == 0 && !b.rsn_group_ccmp && b.rsn_ccmp);
 
     n = build_beacon(f, "Office5G", 36, 8, 1);             // SAE only, 5 GHz (no DS element)
     CHECK(wifi_parse_bss(f, n, &b) == 0);
-    CHECK(b.channel == 36 && b.security == WIFI_SEC_WPA3_SAE);
+    CHECK(b.channel == 36 && b.security == WIFI_SEC_WPA3_SAE && !b.rsn_akm_psk);
     CHECK(wifi_channel_to_mhz(36) == 5180 && wifi_channel_to_mhz(6) == 2437 && wifi_channel_to_mhz(14) == 2484);
 
     n = build_beacon(f, "Cafe", 1, 0, 0);                  // privacy bit but no RSN -> WEP

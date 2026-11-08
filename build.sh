@@ -35,6 +35,22 @@ run_tests() {
         real="$real --legacy firmware/aic8800D80-legacy-mcu1"
     # shellcheck disable=SC2086
     "$B/test_fwload" $real
+    # shellcheck disable=SC2086
+    $cc "${CFLAGS[@]}" Tests/test_eapol.c "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" $libs -o "$B/test_eapol"
+    "$B/test_eapol"
+    $cc "${CFLAGS[@]}" Tests/test_data.c "$S/aic_data.c" "$S/aic_msg.c" -o "$B/test_data"
+    "$B/test_data"
+    $cc "${CFLAGS[@]}" Tests/test_dhcp.c "$S/dhcp.c" -o "$B/test_dhcp"
+    "$B/test_dhcp"
+    if [[ "$(uname)" != "Darwin" ]]; then
+        # connect logic from main.c against a simulated firmware + AP, behind stand-in IOKit headers
+        $cc "${CFLAGS[@]}" -Wno-unused-function -no-pie -I Tests/macstubs -I Sources/macwifictl Tests/sim_connect.c \
+            Sources/macwifictl/descdump.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" \
+            "$S/aic_data.c" "$S/dhcp.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" $libs \
+            -Wl,--unresolved-symbols=ignore-all -o "$B/sim_connect"
+        "$B/sim_connect" > "$B/sim_connect.log" || { cat "$B/sim_connect.log"; exit 1; }
+        tail -1 "$B/sim_connect.log"
+    fi
     $cc "${CFLAGS[@]}" -I Tests Tests/test_fmac.c "$S/aic_fmac.c" "$S/aic_msg.c" -o "$B/test_fmac"
     if [[ -f firmware/aic8800D80-legacy-mcu1/aic_userconfig_8800d80.txt ]]; then
         "$B/test_fmac" --legacy firmware/aic8800D80-legacy-mcu1
@@ -47,7 +63,7 @@ build_cli() {
     [[ "$(uname)" == "Darwin" ]] || { echo "macwifictl needs macOS (IOKit)"; exit 1; }
     echo "== macwifictl (arm64)"
     clang "${CFLAGS[@]}" -arch arm64 -mmacosx-version-min=$MINOS -Wno-deprecated-declarations \
-        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" \
+        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" "$S/aic_data.c" "$S/dhcp.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" \
         -framework IOKit -framework CoreFoundation -o "$B/macwifictl"
     codesign --force --sign - "$B/macwifictl"
     file "$B/macwifictl"

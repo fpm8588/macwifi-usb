@@ -145,18 +145,27 @@ which phase 2a already does.
    The resulting bytes are pinned in `Tests/fmac_golden.h`. SCANU_START / ADD_IF / COEX were compared with the
    driver's own structs filled as `rwnx_send_*` fills them.
    → **Checkpoint: `macwifictl scan` lists your networks with sensible RSSI on 2.4 and 5 GHz.**
-2. **Data path**: port the USB TX descriptor (`rwnx_tx.c` USB path / `txdesc_api` + host descriptor, type byte
-   `0x00`) and RX parsing (`rwnx_rx.c`: the 60-byte RX header, flags telling 802.3 data from forwarded 802.11
-   management frames). Put both codecs in `Sources/Shared` with tests built from captured transfers.
-3. **Connect**: `SM_CONNECT_REQ` (`rwnx_send_sm_connect_req`: SSID, BSSID, channel, RSN IE for WPA2-PSK/CCMP,
-   auth type) → `SM_CONNECT_IND` (status, AID, AP's RSN IE). Handle `SM_DISCONNECT_IND`.
-4. **WPA2-PSK supplicant** (`Sources/Shared/eapol.c`): EAPOL-Key frames (ethertype 0x888E) arrive on the data
-   path; msg 1 → 2 (SNonce, `wpa_derive_ptk`, `wpa_eapol_mic`), verify msg 3 (MIC, RSN IE), unwrap the GTK with
-   `wpa_aes_unwrap`, send msg 4, then `MM_KEY_ADD_REQ` for the pairwise key (and the group key), then
-   `MM_SET_CTRL_PORT` / control-port open as the Linux driver does. Test against IEEE 802.11 Annex J vectors and
-   a handshake you capture from your own network.
-   → **Checkpoint: `sudo macwifictl connect "<SSID>"` reports "connected, keys installed", then receives
-   ARP/mDNS broadcasts from your network.**
+2. **Data path** (built, `Sources/Shared/aic_data.c`): TX on bulk OUT 0x01 = 4-byte header (length, type
+   `0x01`) + `struct hostdesc` (28 bytes, ethertype in network order, staid = the AP's station index for all
+   station-mode traffic, tid 0 → BE) + the payload without its Ethernet header; EAPOL asks for a TX confirmation
+   (`status_desc_addr = BIT31 | idx`), which comes back as bulk IN type `0x12` (u32 status: bit0 done, bit3 acked;
+   u32 idx). RX data = 56-byte `hw_rxhdr` + 4 pad + the 802.11 frame (CCMP header still present) → 802.3 as
+   `rwnx_rxdataind_aicwf` does, including A-MSDU and the NETGEAR quirk.
+3. **Connect** (built): `SM_CONNECT_REQ` (320 bytes; flags `CONTROL_PORT_HOST | WPA_WPA2_IN_USE`, EAPOL as the
+   control-port ethertype, open auth, uapsd AC_VO, our RSN element in `ie_buf`) → `SM_CONNECT_CFM` →
+   `SM_CONNECT_IND` (status, AP station index, AID) ; `SM_DISCONNECT_IND` handled throughout; `SM_DISCONNECT_REQ`
+   (reason 3) on exit. All request layouts were compared byte for byte with the driver's structs filled as
+   `rwnx_send_*` fills them, and are pinned in `Tests/test_fmac.c`.
+4. **WPA2-PSK supplicant** (built, `Sources/Shared/eapol.c`, original code): msg 1 → 2, msg 3 checked (MIC,
+   replay counter, ANonce, RSN element against the beacon's, GTK unwrap) → 4, group rekeys. Then, in
+   wpa_supplicant's order: wait for msg 4's TX confirmation, `MM_KEY_ADD_REQ` pairwise (sta = AP index) and group
+   (sta 0xFF), `ME_SET_CONTROL_PORT_REQ(open)`. Key material is never printed, even with `MACWIFI_DEBUG=1`; the
+   passphrase is read with `readpassphrase` (no echo) and wiped after PBKDF2.
+5. **Probe** (`Sources/Shared/dhcp.c`): one DHCPDISCOVER (no REQUEST, so no address is taken), report the offer,
+   count received frames by type. `Tests/sim_connect.c` runs the whole command against a simulated firmware + AP
+   (happy path, wrong password, not found, PMF required, association refused, short password).
+   → **Checkpoint: `macwifictl connect "<SSID>"` reports "keys installed, port open", a DHCP offer, and
+   broadcast traffic from your network.**
 
 ## Phase 4: macOS networking
 

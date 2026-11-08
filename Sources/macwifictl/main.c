@@ -17,6 +17,8 @@
 #include <IOKit/IOKitLib.h>
 #include <IOKit/usb/IOUSBLib.h>
 
+#include <readpassphrase.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -28,8 +30,12 @@
 #include "aic8800.h"
 #include "aic_fmac.h"
 #include "aic_fwload.h"
+#include "aic_data.h"
 #include "aic_msg.h"
+#include "dhcp.h"
+#include "eapol.h"
 #include "ieee80211.h"
+#include "wpa.h"
 #include "descdump.h"
 
 extern char **environ;
@@ -38,9 +44,14 @@ typedef IOUSBDeviceInterface320 **Dev;
 typedef IOUSBInterfaceInterface300 **Intf;
 
 static int gDebug = 0;
+static int gNoDump = 0;           // set while key material is on the wire, so MACWIFI_DEBUG=1 never prints keys
 static size_t gDumpLimit = 256;   // bytes shown per transfer with MACWIFI_DEBUG=1 (lowered during uploads)
 
 static void hexdump(const char *tag, const uint8_t *p, size_t n) {
+    if (gNoDump) {
+        if (gDebug) fprintf(stderr, "%s %zu bytes (contents hidden: key material)\n", tag, n);
+        return;
+    }
     if (!gDebug) return;
     fprintf(stderr, "%s (%zu bytes):", tag, n);
     for (size_t i = 0; i < n && i < gDumpLimit; i++) fprintf(stderr, "%s%02x", (i % 16) ? " " : "\n  ", p[i]);
@@ -144,6 +155,7 @@ typedef struct {
     Dev dev;
     Intf intf;
     UInt8 in_pipe, out_pipe, msg_pipe;   // pipe refs (0 = none)
+    UInt8 out_ep;                         // endpoint number behind out_pipe (data must go to bulk OUT 0x01)
     const AicId *id;
     int dev_open;                         // 0 when macOS's composite-device driver holds the device
 } Link;
@@ -248,7 +260,7 @@ static int link_open(Link *l) {
         if (gDebug) fprintf(stderr, "pipe %u: ep %u %s type %u mps %u\n", p, num, dir == kUSBIn ? "IN" : "OUT", type, mps);
         if (type != kUSBBulk) continue;
         if (dir == kUSBIn && !l->in_pipe) l->in_pipe = p;
-        else if (dir == kUSBOut && !l->out_pipe) l->out_pipe = p;
+        else if (dir == kUSBOut && !l->out_pipe) { l->out_pipe = p; l->out_ep = num; }
         else if (dir == kUSBOut && !l->msg_pipe) l->msg_pipe = p;
     }
     if (!l->in_pipe || !l->out_pipe) {
@@ -1077,10 +1089,529 @@ static int cmd_scan(int argc, char **argv) {
     return rc;
 }
 
+// ---------------------------------------------------------------- Phase 3b: connect (WPA2-PSK) and a DHCP probe
+//
+// Order as the Linux driver does it with wpa_supplicant (rwnx_cfg80211_connect / add_key / change_station):
+// SM_CONNECT_REQ (the firmware authenticates and associates, holding the control port closed), SM_CONNECT_IND
+// (gives the AP's station index), the EAPOL 4-way handshake over the data path, MM_KEY_ADD_REQ for the pairwise
+// and group keys, then ME_SET_CONTROL_PORT_REQ(open). The supplicant (eapol.c) is our own code.
+
+static volatile sig_atomic_t gStop = 0;
+static void on_sigint(int sig) { (void)sig; gStop = 1; }
+
+static void secure_zero(void *p, size_t n) {
+    volatile uint8_t *v = (volatile uint8_t *)p;
+    while (n--) *v++ = 0;
+}
+
+static int link_send_data(Link *l, const uint8_t *buf, size_t len) {
+    hexdump("OUT data", buf, len);
+    IOReturn kr = (*l->intf)->WritePipeTO(l->intf, l->out_pipe, (void *)buf, (UInt32)len, 1000, 2000);
+    if (kr != kIOReturnSuccess) {
+        fprintf(stderr, "bulk OUT (data) failed: 0x%08x\n", kr);
+        if (kr == kIOUSBPipeStalled) (*l->intf)->ClearPipeStallBothEnds(l->intf, l->out_pipe);
+        return -1;
+    }
+    return 0;
+}
+
+static int send_msg(Link *l, uint16_t id, const void *params, uint16_t plen) {
+    uint8_t cmd[16 + 1024];
+    size_t n = aic_build_cmd(cmd, sizeof cmd, id, (uint16_t)(id >> 10), params, plen);
+    return (!n || link_send(l, cmd, n)) ? -1 : 0;
+}
+
+typedef struct {
+    Link *l;
+    uint8_t mac[6], bssid[6], vif;
+    // association
+    int connect_cfm, associated, disconnected;
+    uint8_t connect_status;
+    uint16_t disc_reason;
+    AicConnectInd ind;
+    uint8_t ind_buf[900];
+    // handshake
+    WpaSupplicant *ws;
+    uint8_t snonce[32];
+    int pending, keys_installed, port_open, eapol_rejects;
+    uint8_t next_cfm_idx, last_eapol_idx;
+    int last_eapol_cfm;
+    uint32_t last_eapol_status;
+    // message wait
+    uint16_t want;
+    int got;
+    uint8_t params[1024];
+    uint16_t plen;
+    // traffic
+    uint8_t cur_decr;
+    uint32_t xid;
+    int offer;
+    uint8_t offer_decr;
+    DhcpReply reply;
+    unsigned rx, rx_group, rx_ipv4, rx_arp, rx_ipv6, rx_eapol, rx_other, rx_plain, rx_not_eth, tx;
+} Conn;
+
+static void conn_send_eth(Conn *c, const uint8_t *eth, size_t len, int eapol) {
+    uint8_t out[2048];
+    uint8_t idx = 0;
+    if (eapol) {
+        idx = c->next_cfm_idx++ & 0x1f;
+        c->last_eapol_idx = idx;
+        c->last_eapol_cfm = 0;
+    }
+    size_t n = aic_data_build_tx(out, sizeof out, eth, len, c->vif, c->ind.ap_idx, 0, idx);
+    if (n && link_send_data(c->l, out, n) == 0) c->tx++;
+}
+
+static void on_eth(void *ctx, const uint8_t *eth, size_t len) {
+    Conn *c = (Conn *)ctx;
+    if (len < 14) return;
+    c->rx++;
+    if (eth[0] & 1) c->rx_group++;
+    if (!c->cur_decr) c->rx_plain++;
+    uint16_t type = (uint16_t)((eth[12] << 8) | eth[13]);
+    if (type == 0x888E) {
+        c->rx_eapol++;
+        if (!c->associated || !c->ws || memcmp(eth + 6, c->bssid, 6) != 0) return;
+        uint8_t reply[512], frame[14 + 512];
+        size_t rl = 0;
+        const char *err = NULL;
+        int ev = wpa_supp_rx(c->ws, eth + 14, len - 14, c->snonce, reply, sizeof reply, &rl, &err);
+        if (ev < 0) {
+            c->eapol_rejects++;
+            printf("  EAPOL frame rejected: %s\n", err ? err : "?");
+            return;
+        }
+        if (ev & WPA_EV_SEND) {
+            memcpy(frame, c->bssid, 6);
+            memcpy(frame + 6, c->mac, 6);
+            frame[12] = 0x88;
+            frame[13] = 0x8E;
+            memcpy(frame + 14, reply, rl);
+            conn_send_eth(c, frame, 14 + rl, 1);
+        }
+        if (ev & ~WPA_EV_SEND) printf("  EAPOL: %s\n", (ev & WPA_EV_DONE) ? "message 3 accepted, message 4 sent"
+                                                    : (ev & WPA_EV_INSTALL_GTK) ? "group key update answered"
+                                                                                : "message accepted");
+        else if (ev & WPA_EV_SEND) printf("  EAPOL: message 1 received, message 2 sent\n");
+        c->pending |= ev & ~WPA_EV_SEND;
+        return;
+    }
+    if (type == 0x0800) {
+        c->rx_ipv4++;
+        DhcpReply r;
+        if (!c->offer && dhcp_parse_reply(eth, len, c->mac, c->xid, &r) == 0 && r.type == 2) {
+            c->offer = 1;
+            c->reply = r;
+            c->offer_decr = c->cur_decr;
+        }
+    } else if (type == 0x0806) c->rx_arp++;
+    else if (type == 0x86DD) c->rx_ipv6++;
+    else c->rx_other++;
+}
+
+// Reads the bulk IN pipe for up to `timeout_ms`, handling messages, data and TX confirmations, until `done` says
+// so. Returns 0 when done, 1 on timeout, -1 on a USB error or Ctrl-C.
+static int pump(Conn *c, int timeout_ms, int (*done)(const Conn *)) {
+    static uint8_t buf[32768], scratch[4096];
+    double t0 = now_s();
+    while (!(done && done(c))) {
+        if (gStop) return -1;
+        if ((now_s() - t0) * 1000 >= timeout_ms) return 1;
+        UInt32 size = sizeof buf;
+        IOReturn kr = (*c->l->intf)->ReadPipeTO(c->l->intf, c->l->in_pipe, buf, &size, 200, 200);
+        if (kr == kIOUSBTransactionTimeout || kr == kIOReturnTimeout) continue;
+        if (kr != kIOReturnSuccess) {
+            fprintf(stderr, "bulk IN failed: 0x%08x\n", kr);
+            if (kr == kIOUSBPipeStalled) (*c->l->intf)->ClearPipeStallBothEnds(c->l->intf, c->l->in_pipe);
+            return -1;
+        }
+        hexdump("IN", buf, size);
+        size_t off = 0;
+        AicRxPacket pk;
+        int r;
+        while ((r = aic_rx_next(buf, size, &off, &pk)) == 1) {
+            uint8_t t = pk.type & 0x7f;
+            if (t == AIC_USB_TYPE_CFG_PRINT) {
+                size_t tl = pk.packet[0] | (pk.packet[1] << 8);
+                const char *s = (const char *)pk.packet + 4;
+                if (tl > pk.packet_len - 4) tl = pk.packet_len - 4;
+                while (tl && (s[tl - 1] == '\n' || s[tl - 1] == '\r' || s[tl - 1] == 0)) tl--;
+                fprintf(stderr, "  [firmware] %.*s\n", (int)tl, s);
+                continue;
+            }
+            if (t == AIC_USB_TYPE_CFG_DATA_CFM) {
+                uint32_t st = 0, idx = 0;
+                if (aic_data_parse_tx_cfm(pk.packet, pk.packet_len, &st, &idx) == 0 && idx == c->last_eapol_idx) {
+                    c->last_eapol_cfm = 1;
+                    c->last_eapol_status = st;
+                }
+                continue;
+            }
+            if (pk.is_msg) {
+                if (pk.id == c->want && !c->got) {
+                    size_t n = pk.param_len < sizeof c->params ? pk.param_len : sizeof c->params;
+                    memcpy(c->params, pk.params, n);
+                    c->plen = (uint16_t)n;
+                    c->got = 1;
+                }
+                if (pk.id == AIC_SM_CONNECT_CFM) {
+                    c->connect_cfm = 1;
+                    c->connect_status = pk.param_len ? pk.params[0] : 0xff;
+                } else if (pk.id == AIC_SM_CONNECT_IND) {
+                    size_t n = pk.param_len < sizeof c->ind_buf ? pk.param_len : sizeof c->ind_buf;
+                    memcpy(c->ind_buf, pk.params, n);
+                    if (aic_fmac_parse_connect_ind(c->ind_buf, n, &c->ind) != 0) {
+                        fprintf(stderr, "SM_CONNECT_IND too short (%zu bytes)\n", n);
+                        c->disconnected = 1;
+                    } else if (c->ind.status_code != 0) {
+                        c->disconnected = 1;
+                    } else {
+                        c->associated = 1;
+                    }
+                } else if (pk.id == AIC_SM_DISCONNECT_IND) {
+                    uint8_t v = 0;
+                    aic_fmac_parse_disconnect_ind(pk.params, pk.param_len, &c->disc_reason, &v);
+                    c->disconnected = 1;
+                    c->associated = 0;
+                } else if (pk.id == AIC_DBG_ERROR_IND) {
+                    fprintf(stderr, "firmware reported DBG_ERROR_IND\n");
+                } else if (gDebug && pk.id != c->want) {
+                    fprintf(stderr, "(message 0x%04x, %u bytes)\n", pk.id, pk.param_len);
+                }
+                continue;
+            }
+            if (pk.type & AIC_USB_TYPE_CFG) continue;   // other config packets
+            AicRxInfo ri;
+            if (aic_data_parse_rx(pk.packet, pk.packet_len, &ri) != 0) { c->rx_not_eth++; continue; }
+            c->cur_decr = ri.decr_status;
+            if (aic_data_rx_to_eth(&ri, scratch, sizeof scratch, on_eth, c) < 0) c->rx_not_eth++;
+        }
+        if (r < 0) fprintf(stderr, "malformed IN transfer (%u bytes); set MACWIFI_DEBUG=1 to see it\n", size);
+    }
+    return 0;
+}
+
+static int w_got(const Conn *c) { return c->got || c->disconnected; }
+static int w_connect_cfm(const Conn *c) { return c->connect_cfm; }
+static int w_assoc(const Conn *c) { return c->associated || c->disconnected; }
+static int w_pending(const Conn *c) { return c->pending || c->disconnected; }
+static int w_eapol_cfm(const Conn *c) { return c->last_eapol_cfm; }
+
+// Sends a message and pumps until its confirmation. Returns 0 with c->params / c->plen, else -1.
+static int conn_call(Conn *c, uint16_t id, const void *params, uint16_t plen, uint16_t cfm, int timeout_ms) {
+    c->want = cfm;
+    c->got = 0;
+    if (send_msg(c->l, id, params, plen)) return -1;
+    int r = pump(c, timeout_ms, w_got);
+    if (c->got) return 0;
+    if (r == 1) fprintf(stderr, "no reply (message 0x%04x) within %d ms\n", cfm, timeout_ms);
+    return -1;
+}
+
+static int install_key(Conn *c, int pairwise, const uint8_t *key, uint8_t len, uint8_t idx) {
+    uint8_t p[AIC_SZ_KEY_ADD_REQ];
+    aic_fmac_key_add_params(p, c->vif, pairwise ? c->ind.ap_idx : 0xFF, pairwise, key, len, idx, AIC_MAC_CIPHER_CCMP);
+    gNoDump = 1;
+    int r = conn_call(c, AIC_MM_KEY_ADD_REQ, p, sizeof p, AIC_MM_KEY_ADD_CFM, 2000);
+    gNoDump = 0;
+    secure_zero(p, sizeof p);
+    if (r) return -1;
+    if (c->plen < 1 || c->params[0] != 0) {
+        fprintf(stderr, "MM_KEY_ADD refused (status %u)\n", c->plen ? c->params[0] : 0xff);
+        return -1;
+    }
+    printf("  %s key installed (hardware slot %u)\n", pairwise ? "Pairwise" : "Group", c->plen > 1 ? c->params[1] : 0);
+    return 0;
+}
+
+static const char *status_text(uint16_t s) {
+    switch (s) {
+        case 1: return "unspecified failure";
+        case 10: return "capabilities not supported";
+        case 12: return "denied for another reason";
+        case 13: return "authentication algorithm not supported";
+        case 15: return "authentication challenge failure";
+        case 17: return "the AP is full";
+        case 18: return "basic rates not supported";
+        case 30: return "temporarily rejected, try later";
+        case 31: return "robust management frame policy violation";
+        case 43: return "invalid AKM";
+        case 45: return "RSN capabilities not supported";
+        default: return "see IEEE 802.11 status codes";
+    }
+}
+
+static const char *reason_text(uint16_t r) {
+    switch (r) {
+        case 1: return "unspecified";
+        case 2: return "previous authentication no longer valid";
+        case 3: return "leaving";
+        case 4: return "inactivity";
+        case 6: case 7: return "frame from a station that isn't associated";
+        case 14: return "message integrity failure";
+        case 15: return "4-way handshake timeout (usually a wrong password)";
+        case 16: return "group key handshake timeout";
+        case 17: return "RSN element in the 4-way handshake differs";
+        case 23: return "802.1X authentication failed (usually a wrong password)";
+        default: return "see IEEE 802.11 reason codes";
+    }
+}
+
+static int hexval(char ch) {
+    if (ch >= '0' && ch <= '9') return ch - '0';
+    if (ch >= 'a' && ch <= 'f') return ch - 'a' + 10;
+    if (ch >= 'A' && ch <= 'F') return ch - 'A' + 10;
+    return -1;
+}
+
+// Asks for the passphrase on the terminal (never echoed, logged or stored) and derives the PMK.
+static int ask_pmk(const uint8_t *ssid, size_t ssid_len, uint8_t pmk[32]) {
+    char pass[128];
+    char prompt[96];
+    snprintf(prompt, sizeof prompt, "Wi-Fi password for \"%.*s\" (not shown, not saved): ", (int)ssid_len,
+             (const char *)ssid);
+    if (!readpassphrase(prompt, pass, sizeof pass, RPP_REQUIRE_TTY)) {
+        fprintf(stderr, "Couldn't read the password from the terminal.\n");
+        return -1;
+    }
+    size_t n = strlen(pass);
+    int rc = 0;
+    if (n == 64) {   // a raw 256-bit PSK in hex
+        for (size_t i = 0; i < 32 && rc == 0; i++) {
+            int h = hexval(pass[2 * i]), lo = hexval(pass[2 * i + 1]);
+            if (h < 0 || lo < 0) rc = -1;
+            else pmk[i] = (uint8_t)(h << 4 | lo);
+        }
+        if (rc) fprintf(stderr, "A 64-character key must be hexadecimal.\n");
+    } else if (n < 8 || n > 63) {
+        fprintf(stderr, "A WPA2 passphrase has 8 to 63 characters (this one has %zu).\n", n);
+        rc = -1;
+    } else if (wpa_pmk_from_passphrase(pass, ssid, ssid_len, pmk) != 0) {
+        fprintf(stderr, "Key derivation failed.\n");
+        rc = -1;
+    }
+    secure_zero(pass, sizeof pass);
+    return rc;
+}
+
+static void print_ip(const char *label, const uint8_t a[4]) {
+    if (a[0] | a[1] | a[2] | a[3]) printf("    %-10s %u.%u.%u.%u\n", label, a[0], a[1], a[2], a[3]);
+}
+
+static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *ssid, int listen_s);
+
+static int cmd_connect(int argc, char **argv) {
+    if (argc < 3 || argv[2][0] == '-' || !argv[2][0] || strlen(argv[2]) > 32) {
+        fprintf(stderr, "usage: macwifictl connect \"SSID\" [--seconds N] [--profile v5|legacy] [--fw DIR]\n");
+        return 2;
+    }
+    const char *ssid = argv[2];
+    const char *secs_opt = opt(argc, argv, "--seconds");
+    int listen_s = secs_opt ? atoi(secs_opt) : 15;
+    if (listen_s < 1) listen_s = 1;
+    if (listen_s > 600) listen_s = 600;
+
+    Link l;
+    uint8_t mac[6], vif = 0;
+    int rc = up_link(argc, argv, &l, mac);
+    if (rc) return rc;
+    rc = radio_start(&l, mac, &vif);
+    if (!rc) rc = connect_run(&l, mac, vif, ssid, listen_s);
+    link_close(&l);
+    return rc;
+}
+
+// Everything after the radio is up: scan, password, associate, handshake, probe, disconnect. Leaves `l` open.
+static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *ssid, int listen_s) {
+    Link l = *lp;
+    size_t ssid_len = strlen(ssid);
+
+    // 1. Directed scan for the network.
+    static ScanList sl;
+    memset(&sl, 0, sizeof sl);
+    uint8_t p[AIC_SZ_SCANU_START_REQ > AIC_SZ_SM_CONNECT_REQ ? AIC_SZ_SCANU_START_REQ : AIC_SZ_SM_CONNECT_REQ], r[16];
+    uint16_t rl = 0;
+    if (l.out_ep != 1) printf("(note: the first bulk OUT endpoint is 0x%02x, not 0x01; data may not flow)\n", l.out_ep);
+    size_t n = aic_fmac_scan_params(p, vif, ssid);
+    uint8_t cmd[16 + AIC_SZ_SCANU_START_REQ];
+    size_t cl = aic_build_cmd(cmd, sizeof cmd, AIC_SCANU_START_REQ, AIC_SCANU_START_REQ >> 10, p, (uint16_t)n);
+    printf("Looking for \"%s\"...\n", ssid);
+    fflush(stdout);
+    AicScanCfm sc;
+    if (!cl || link_send(&l, cmd, cl) || collect_scan(&l, &sl, AIC_SCANU_START_CFM, r, sizeof r, &rl, 20000, NULL) ||
+        aic_fmac_parse_scan_cfm(r, rl, &sc)) {
+        printf("Scan failed. Unplug and replug the adapter, then try again.\n");
+        return 1;
+    }
+    const ScanEntry *best = NULL;
+    int found = 0;
+    for (int i = 0; i < sl.n; i++) {
+        const ScanEntry *e = &sl.e[i];
+        if (e->bss.ssid_len != ssid_len || memcmp(e->bss.ssid, ssid, ssid_len) != 0) continue;
+        found++;
+        int ok = e->bss.rsn_akm_psk && e->bss.rsn_ccmp && e->bss.rsn_group_ccmp && !e->bss.rsn_pmf_required &&
+                 e->bss.rsn_ie_len >= 2;
+        printf("  %02x:%02x:%02x:%02x:%02x:%02x  %4d MHz  RSSI %4d  %-10s %s\n", e->bss.bssid[0], e->bss.bssid[1],
+               e->bss.bssid[2], e->bss.bssid[3], e->bss.bssid[4], e->bss.bssid[5], e->freq, e->rssi,
+               wifi_security_name(e->bss.security),
+               ok ? "usable" : !e->bss.rsn_akm_psk ? "no WPA2-PSK (WPA3-only, open or enterprise)"
+                             : e->bss.rsn_pmf_required ? "requires PMF (not supported yet)"
+                                                       : "needs CCMP for pairwise and group keys");
+        if (ok && (!best || e->rssi > best->rssi)) best = e;
+    }
+    if (!best) {
+        printf("%s\n", found ? "No access point for this network uses WPA2-PSK with CCMP, which is what this "
+                               "version supports."
+                             : "Network not found. Check the name (it is case-sensitive) and that it is in range.");
+        return 1;
+    }
+    int ch = best->bss.channel;
+    int freq = ch ? wifi_channel_to_mhz(ch) : 0;
+    if (!freq || (freq >= 5000) != (best->freq >= 5000)) freq = best->freq;   // trust the scan's band
+    uint8_t band = freq >= 5000 ? 1 : 0;
+
+    // 2. Password -> PMK. Nothing about it is printed or written anywhere.
+    static WpaSupplicant ws;
+    memset(&ws, 0, sizeof ws);
+    if (ask_pmk((const uint8_t *)ssid, ssid_len, ws.pmk)) {
+        return 2;
+    }
+    memcpy(ws.aa, best->bss.bssid, 6);
+    memcpy(ws.spa, mac, 6);
+    ws.rsn_ie_len = wpa_build_rsn_ie(ws.rsn_ie, sizeof ws.rsn_ie);
+    ws.ap_rsn_ie = best->bss.rsn_ie;
+    ws.ap_rsn_ie_len = best->bss.rsn_ie_len;
+
+    static Conn c;
+    memset(&c, 0, sizeof c);
+    c.l = &l;
+    memcpy(c.mac, mac, 6);
+    memcpy(c.bssid, best->bss.bssid, 6);
+    c.vif = vif;
+    c.ws = &ws;
+    arc4random_buf(c.snonce, sizeof c.snonce);
+    signal(SIGINT, on_sigint);
+
+    // 3. Associate.
+    printf("Connecting to %02x:%02x:%02x:%02x:%02x:%02x on %d MHz...\n", c.bssid[0], c.bssid[1], c.bssid[2],
+           c.bssid[3], c.bssid[4], c.bssid[5], freq);
+    fflush(stdout);
+    aic_fmac_connect_params(p, (const uint8_t *)ssid, ssid_len, c.bssid, (uint16_t)freq, band, vif, ws.rsn_ie,
+                            ws.rsn_ie_len);
+    double t0 = now_s();
+    int stage = 0;   // 1 associated, 2 handshake done, 3 traffic seen
+    if (send_msg(&l, AIC_SM_CONNECT_REQ, p, AIC_SZ_SM_CONNECT_REQ) || pump(&c, 3000, w_connect_cfm) || !c.connect_cfm) {
+        fprintf(stderr, "No SM_CONNECT_CFM from the firmware.\n");
+    } else if (c.connect_status != 0) {
+        fprintf(stderr, "The firmware refused the connect request (status %u).\n", c.connect_status);
+    } else if (pump(&c, 10000, w_assoc), !c.associated) {
+        if (c.ind_buf[0] | c.ind_buf[1])
+            printf("Association failed: status %u (%s).\n", c.ind.status_code, status_text(c.ind.status_code));
+        else if (c.disconnected)
+            printf("Disconnected during association: reason %u (%s).\n", c.disc_reason, reason_text(c.disc_reason));
+        else
+            printf("No association result within 10 s.\n");
+    } else {
+        stage = 1;
+        printf("Associated in %.2f s: AP station index %u, AID %u, %s, %u MHz, width code %u\n", now_s() - t0,
+               c.ind.ap_idx, c.ind.aid, c.ind.qos ? "QoS" : "no QoS", c.ind.center_freq, c.ind.width);
+
+        // 4. 4-way handshake (EAPOL frames are answered inside pump; keys are installed here).
+        double th = now_s();
+        while (!c.port_open && !c.disconnected && !gStop && now_s() - th < 15) {
+            pump(&c, 1000, w_pending);
+            int ev = c.pending;
+            c.pending = 0;
+            if (ev & WPA_EV_INSTALL_PTK) {
+                // Let message 4 leave unencrypted before the pairwise key exists (wpa_supplicant's order).
+                pump(&c, 500, w_eapol_cfm);
+                if (!c.last_eapol_cfm) printf("  (no TX confirmation for message 4 within 500 ms; continuing)\n");
+                else if (!(c.last_eapol_status & AIC_TXST_ACKED))
+                    printf("  (message 4 TX status 0x%x: not acknowledged by the AP)\n", c.last_eapol_status);
+                if (install_key(&c, 1, WPA_TK(ws.ptk), 16, 0)) break;
+                c.keys_installed = 1;
+            }
+            if ((ev & WPA_EV_INSTALL_GTK) && ws.gtk_len) {
+                if (install_key(&c, 0, ws.gtk, (uint8_t)ws.gtk_len, (uint8_t)ws.gtk_idx)) break;
+            }
+            if ((ev & WPA_EV_DONE) && !c.port_open) {
+                uint8_t cp[AIC_SZ_CTRL_PORT_REQ];
+                aic_fmac_ctrl_port_params(cp, c.ind.ap_idx, 1);
+                if (conn_call(&c, AIC_ME_SET_CONTROL_PORT_REQ, cp, sizeof cp, AIC_ME_SET_CONTROL_PORT_CFM, 2000)) break;
+                c.port_open = 1;
+            }
+        }
+        if (!c.port_open) {
+            if (c.disconnected)
+                printf("Disconnected during the handshake: reason %u (%s).\n", c.disc_reason, reason_text(c.disc_reason));
+            else if (!ws.have_ptk)
+                printf("No EAPOL message 1 from the AP (%u EAPOL frames seen).\n", c.rx_eapol);
+            else
+                printf("The 4-way handshake did not finish (%u EAPOL frames seen, %d rejected). A wrong password "
+                       "makes the AP stop after message 2.\n", c.rx_eapol, c.eapol_rejects);
+        } else {
+            stage = 2;
+            printf("Connected: WPA2-PSK handshake done in %.2f s, keys installed, port open.\n", now_s() - th);
+
+            // 5. DHCP probe: DISCOVER only (no address is taken), and count what arrives.
+            printf("Listening for %d s and asking the DHCP server for an offer...\n", listen_s);
+            fflush(stdout);
+            unsigned base = c.rx;
+            c.xid = arc4random();
+            uint8_t f[600];
+            size_t fl = dhcp_build_discover(f, sizeof f, mac, c.xid);
+            double tl = now_s();
+            for (int tries = 0; !c.disconnected && !gStop && now_s() - tl < listen_s; ) {
+                if (!c.offer && tries < 3 && now_s() - tl >= tries * 4.0) {
+                    conn_send_eth(&c, f, fl, 0);
+                    tries++;
+                }
+                pump(&c, 500, NULL);
+            }
+            if (c.offer) {
+                stage = 3;
+                printf("  DHCP offer received (%s):\n", c.offer_decr ? "arrived encrypted" : "arrived unencrypted");
+                print_ip("address", c.reply.yiaddr);
+                print_ip("netmask", c.reply.mask);
+                print_ip("router", c.reply.router);
+                print_ip("server", c.reply.server);
+                if (c.reply.lease_s) printf("    %-10s %u s\n", "lease", c.reply.lease_s);
+                printf("  (only offered: nothing was requested, so no address was assigned)\n");
+            } else {
+                printf("  No DHCP offer arrived.\n");
+            }
+            if (c.rx > base) stage = 3;
+            if (c.disconnected) printf("  Disconnected: reason %u (%s).\n", c.disc_reason, reason_text(c.disc_reason));
+        }
+    }
+
+    printf("Traffic: %u frames received (%u broadcast/multicast, %u unencrypted): IPv4 %u, ARP %u, IPv6 %u, EAPOL %u, "
+           "other %u; %u not convertible; %u frames sent\n", c.rx, c.rx_group, c.rx_plain, c.rx_ipv4, c.rx_arp,
+           c.rx_ipv6, c.rx_eapol, c.rx_other, c.rx_not_eth, c.tx);
+
+    // 6. Leave cleanly.
+    if (c.associated && !c.disconnected) {
+        uint8_t d[AIC_SZ_SM_DISCONNECT_REQ];
+        aic_fmac_disconnect_params(d, 3, vif);   // WLAN_REASON_DEAUTH_LEAVING
+        gStop = 0;
+        if (conn_call(&c, AIC_SM_DISCONNECT_REQ, d, sizeof d, AIC_SM_DISCONNECT_CFM, 3000) == 0) printf("Disconnected.\n");
+    }
+    signal(SIGINT, SIG_DFL);
+    secure_zero(&ws, sizeof ws);
+    secure_zero(c.snonce, sizeof c.snonce);
+    printf("\n%s\n", stage == 3 ? "Phase 3b hardware check passed: connected and traffic flowed."
+                     : stage == 2 ? "Connected, but no traffic arrived. Unplug and replug the adapter, then try "
+                                    "again with MACWIFI_DEBUG=1."
+                                  : "Connect stopped. Unplug and replug the adapter before the next try.");
+    return stage == 3 ? 0 : 1;
+}
+
 static void usage(void) {
     fprintf(stderr, "usage: macwifictl list [--all] | modeswitch | info | identify | memr <addr> | memw <addr> <val>\n"
                     "       fwload [--profile v5|legacy] [--fw DIR] | up [--profile v5|legacy] [--fw DIR] |\n"
-                    "       scan [SSID] [--profile v5|legacy] [--fw DIR]\n"
+                    "       scan [SSID] [--profile v5|legacy] [--fw DIR] |\n"
+                    "       connect SSID [--seconds N] [--profile v5|legacy] [--fw DIR]\n"
                     "Supported: AICsemi AIC8800 family, e.g. UGREEN AX900 (CM762). MACWIFI_DEBUG=1 dumps USB traffic.\n");
 }
 
@@ -1095,6 +1626,7 @@ int main(int argc, char **argv) {
     if (!strcmp(c, "fwload")) return cmd_fwload(argc, argv);
     if (!strcmp(c, "up")) return cmd_up(argc, argv);
     if (!strcmp(c, "scan")) return cmd_scan(argc, argv);
+    if (!strcmp(c, "connect")) return cmd_connect(argc, argv);
     if ((!strcmp(c, "memr") && argc > 2) || (!strcmp(c, "memw") && argc > 3)) {
         Link l;
         int rc = link_open(&l);

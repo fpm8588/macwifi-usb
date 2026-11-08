@@ -472,3 +472,83 @@ int aic_fmac_parse_scan_cfm(const uint8_t *p, size_t n, AicScanCfm *c) {
     c->result_cnt = p[2];
     return 0;
 }
+
+size_t aic_fmac_connect_params(uint8_t out[AIC_SZ_SM_CONNECT_REQ], const uint8_t *ssid, size_t ssid_len,
+                               const uint8_t bssid[6], uint16_t freq, uint8_t band, uint8_t vif_idx,
+                               const uint8_t *ie, size_t ie_len) {
+    if (ssid_len > 32 || ie_len > 256) return 0;
+    memset(out, 0, AIC_SZ_SM_CONNECT_REQ);
+    out[0] = (uint8_t)ssid_len;                 // struct mac_ssid
+    if (ssid_len) memcpy(out + 1, ssid, ssid_len);
+    memcpy(out + 34, bssid, 6);                 // struct mac_addr
+    put16(out + 40, freq);                      // struct mac_chan_def: freq, band, flags 0, tx_power 0
+    out[42] = band;
+    put32(out + 48, ie_len ? 0x09u : 0u);       // CONTROL_PORT_HOST | WPA_WPA2_IN_USE
+    out[52] = 0x88;                             // ctrl_port_ethertype: cfg80211's __be16 ETH_P_PAE, as stored
+    out[53] = 0x8E;
+    put16(out + 54, (uint16_t)ie_len);
+    put16(out + 56, 0);                         // listen_interval (listen_itv 0)
+    out[58] = 0;                                // dont_wait_bcmc = !listen_bcmc
+    out[59] = 0;                                // auth_type WLAN_AUTH_OPEN
+    out[60] = 0x01;                             // uapsd_queues = IEEE80211_WMM_IE_STA_QOSINFO_AC_VO
+    out[61] = vif_idx;
+    if (ie_len) memcpy(out + 64, ie, ie_len);
+    return AIC_SZ_SM_CONNECT_REQ;
+}
+
+size_t aic_fmac_key_add_params(uint8_t out[AIC_SZ_KEY_ADD_REQ], uint8_t vif_idx, uint8_t sta_idx, int pairwise,
+                               const uint8_t *key, uint8_t key_len, uint8_t key_idx, uint8_t cipher) {
+    if (key_len > 32) return 0;
+    memset(out, 0, AIC_SZ_KEY_ADD_REQ);
+    out[0] = sta_idx == 0xFF ? key_idx : 0;     // key_idx: only for default (group) keys
+    out[1] = sta_idx;
+    out[4] = key_len;                           // struct mac_sec_key: length, then u32 array
+    memcpy(out + 8, key, key_len);
+    out[40] = cipher;
+    out[41] = vif_idx;                          // inst_nbr
+    out[42] = 0;                                // spp
+    out[43] = pairwise ? 1 : 0;
+    return AIC_SZ_KEY_ADD_REQ;
+}
+
+size_t aic_fmac_ctrl_port_params(uint8_t out[AIC_SZ_CTRL_PORT_REQ], uint8_t sta_idx, int open) {
+    out[0] = sta_idx;
+    out[1] = open ? 1 : 0;
+    return AIC_SZ_CTRL_PORT_REQ;
+}
+
+size_t aic_fmac_disconnect_params(uint8_t out[AIC_SZ_SM_DISCONNECT_REQ], uint16_t reason, uint8_t vif_idx) {
+    memset(out, 0, AIC_SZ_SM_DISCONNECT_REQ);
+    put16(out, reason);
+    out[2] = vif_idx;
+    return AIC_SZ_SM_DISCONNECT_REQ;
+}
+
+int aic_fmac_parse_connect_ind(const uint8_t *p, size_t n, AicConnectInd *c) {
+    if (!p || n < 827) return -1;
+    memset(c, 0, sizeof *c);
+    c->status_code = (uint16_t)(p[0] | (p[1] << 8));
+    memcpy(c->bssid, p + 2, 6);
+    c->roamed = p[8];
+    c->vif_idx = p[9];
+    c->ap_idx = p[10];
+    c->ch_idx = p[11];
+    c->qos = p[12];
+    c->acm = p[13];
+    c->assoc_req_ie_len = (uint16_t)(p[14] | (p[15] << 8));
+    c->assoc_rsp_ie_len = (uint16_t)(p[16] | (p[17] << 8));
+    if ((size_t)c->assoc_req_ie_len + c->assoc_rsp_ie_len > 800) return -1;
+    c->assoc_ies = p + 20;
+    c->aid = (uint16_t)(p[820] | (p[821] << 8));
+    c->band = p[822];
+    c->center_freq = (uint16_t)(p[824] | (p[825] << 8));
+    c->width = p[826];
+    return 0;
+}
+
+int aic_fmac_parse_disconnect_ind(const uint8_t *p, size_t n, uint16_t *reason, uint8_t *vif_idx) {
+    if (!p || n < 3) return -1;
+    *reason = (uint16_t)(p[0] | (p[1] << 8));
+    *vif_idx = p[2];
+    return 0;
+}

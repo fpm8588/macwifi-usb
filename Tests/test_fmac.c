@@ -208,6 +208,53 @@ static void test_real(const char *dir) {
     printf("real user config: %d settings\n", k);
 }
 
+// Phase 3b requests. The expected bytes came from filling the Linux structs (lmac_msg.h, legacy-mcu1 @ bbf6cb4)
+// exactly as rwnx_send_sm_connect_req / rwnx_send_key_add / rwnx_send_me_set_control_port_req /
+// rwnx_send_sm_disconnect_req do, with the default module parameters; the user-space comparison matched all of them.
+static void test_phase3b(void) {
+    CHECK(AIC_SM_CONNECT_REQ == ((6 << 10) | 0) && AIC_SM_CONNECT_IND == 0x1802 && AIC_SM_DISCONNECT_IND == 0x1805);
+    CHECK(AIC_MM_KEY_ADD_REQ == 0x24 && AIC_ME_SET_CONTROL_PORT_REQ == ((5 << 10) | 4));
+    static const uint8_t rsn[22] = {0x30,0x14,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,2,0,0};
+    static const uint8_t bssid[6] = {0x02,0x11,0x22,0x33,0x44,0x55};
+    static const uint8_t want_head[64] = {
+        10,'E','x','a','m','p','l','e','N','e','t',0,0,0,0,0, 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,
+        0,0,0x02,0x11,0x22,0x33,0x44,0x55, 0x3c,0x14,0x01,0,0,0,0,0, 0x09,0,0,0,0x88,0x8e,22,0, 0,0,0,0,1,0,0,0 };
+    uint8_t p[AIC_SZ_SM_CONNECT_REQ];
+    CHECK(aic_fmac_connect_params(p, (const uint8_t *)"ExampleNet", 10, bssid, 5180, 1, 0, rsn, 22) == 320);
+    CHECK(memcmp(p, want_head, 64) == 0 && memcmp(p + 64, rsn, 22) == 0);
+    int zero = 1; for (int i = 86; i < 320; i++) zero &= p[i] == 0;
+    CHECK(zero);
+    CHECK(aic_fmac_connect_params(p, (const uint8_t *)"x", 1, bssid, 2412, 0, 1, NULL, 0) == 320);
+    CHECK(p[48] == 0 && p[54] == 0 && p[61] == 1 && p[40] == 0x6c && p[41] == 0x09 && p[42] == 0);   // open network
+    CHECK(aic_fmac_connect_params(p, (const uint8_t *)"x", 33, bssid, 2412, 0, 0, NULL, 0) == 0);
+    CHECK(aic_fmac_connect_params(p, (const uint8_t *)"x", 1, bssid, 2412, 0, 0, rsn, 257) == 0);
+
+    uint8_t key[16], k[AIC_SZ_KEY_ADD_REQ];
+    for (int i = 0; i < 16; i++) key[i] = (uint8_t)(0xa0 + i);
+    CHECK(aic_fmac_key_add_params(k, 0, 3, 1, key, 16, 0, AIC_MAC_CIPHER_CCMP) == 44);
+    CHECK(k[0] == 0 && k[1] == 3 && k[2] == 0 && k[4] == 16 && memcmp(k + 8, key, 16) == 0 && k[24] == 0 &&
+          k[40] == 2 && k[41] == 0 && k[42] == 0 && k[43] == 1);
+    CHECK(aic_fmac_key_add_params(k, 0, 0xFF, 0, key, 16, 2, AIC_MAC_CIPHER_CCMP) == 44);
+    CHECK(k[0] == 2 && k[1] == 0xFF && k[43] == 0);
+    CHECK(aic_fmac_key_add_params(k, 0, 3, 1, key, 33, 0, 2) == 0);
+    CHECK(aic_fmac_ctrl_port_params(k, 3, 1) == 2 && k[0] == 3 && k[1] == 1);
+    CHECK(aic_fmac_disconnect_params(k, 3, 0) == 4 && k[0] == 3 && k[1] == 0 && k[2] == 0 && k[3] == 0);
+
+    uint8_t ind[852] = {0};
+    ind[0] = 0; memcpy(ind + 2, bssid, 6); ind[10] = 5; ind[11] = 1; ind[12] = 1; ind[14] = 30; ind[16] = 40;
+    ind[820] = 7; ind[822] = 1; ind[824] = 0x3c; ind[825] = 0x14; ind[826] = 2;
+    AicConnectInd c;
+    CHECK(aic_fmac_parse_connect_ind(ind, sizeof ind, &c) == 0 && c.ap_idx == 5 && c.qos == 1 && c.aid == 7 &&
+          c.center_freq == 5180 && c.assoc_req_ie_len == 30 && c.assoc_rsp_ie_len == 40 && c.assoc_ies == ind + 20);
+    CHECK(aic_fmac_parse_connect_ind(ind, 826, &c) == -1);
+    ind[14] = 0xff; ind[15] = 0x03;
+    CHECK(aic_fmac_parse_connect_ind(ind, sizeof ind, &c) == -1);   // IE lengths beyond the 800-byte buffer
+    uint16_t reason; uint8_t vif;
+    uint8_t di[6] = {15, 0, 0, 0, 0, 0};
+    CHECK(aic_fmac_parse_disconnect_ind(di, 6, &reason, &vif) == 0 && reason == 15 && vif == 0);
+    CHECK(aic_fmac_parse_disconnect_ind(di, 2, &reason, &vif) == -1);
+}
+
 int main(int argc, char **argv) {
     test_ids();
     test_defaults();
@@ -215,6 +262,7 @@ int main(int argc, char **argv) {
     test_builders();
     test_cfms();
     test_phase3();
+    test_phase3b();
     int real = 0;
     for (int i = 1; i + 1 < argc; i += 2)
         if (!strcmp(argv[i], "--legacy")) { test_real(argv[i + 1]); real = 1; }

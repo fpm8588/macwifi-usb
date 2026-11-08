@@ -20,7 +20,7 @@ in its own menu bar app; it won't appear in the system Wi-Fi menu. Background an
 | 2a | `macwifictl fwload`: upload the ROM patches and Wi-Fi firmware, start it | **Passed on the adapter** (2026-11-07) |
 | 2b | `macwifictl up`: start the Wi-Fi firmware, calibrate, read the MAC address | **Passed on the adapter** (2026-11-07) |
 | 3a | `macwifictl scan`: start the radio and list nearby networks | **Passed on the adapter** (2026-11-07) |
-| 3b | Data path, connect, WPA2-PSK handshake | Next |
+| 3b | `macwifictl connect "SSID"`: data path, association, WPA2-PSK handshake, key install, DHCP probe | Built and simulated; waiting for the adapter test |
 | 4 | macOS networking via a feth (virtual Ethernet) pair | Planned |
 | 5 | LaunchDaemon, menu bar app, installer | Planned |
 
@@ -37,6 +37,7 @@ git clone https://github.com/fpm8588/macwifi-usb.git && cd macwifi-usb
 ./build.sh test && ./build.sh cli
 scripts/fetch-firmware.sh
 build/macwifictl scan
+build/macwifictl connect "YourNetwork"
 ```
 
 What each command does:
@@ -46,8 +47,13 @@ What each command does:
   pinned commits of the Linux driver and checks every file's SHA-256. There are two matched sets: newer chips
   take the SDK V5 set; older "MCU1" chips, like the UGREEN AX900 tested here, need the SDK V3 set
   (`fwload` picks automatically and prints which).
+- `macwifictl connect "SSID" [--seconds N]` runs `up`, finds the network, asks for its password on the
+  terminal (typed hidden; it is never printed, logged or saved), joins with WPA2-PSK, then asks the DHCP server
+  for an offer (without taking an address) and counts the traffic it hears for N seconds (default 15) before
+  leaving. It's the current end-to-end test. WPA2/WPA3 transition networks work through their WPA2 side;
+  WPA3-only networks and networks that require PMF aren't supported yet.
 - `macwifictl scan [SSID]` runs `up`, starts the radio and lists nearby networks (SSID, channel, signal,
-  security). It's the current end-to-end test.
+  security).
 - `macwifictl up` does everything below in one go: switch modes, load the firmware, then start the Wi-Fi
   firmware and read the adapter's MAC address. Each step also exists on its own:
 - `macwifictl modeswitch` ejects the adapter's virtual driver CD, which switches it to Wi-Fi mode (`a69c:8d80`).
