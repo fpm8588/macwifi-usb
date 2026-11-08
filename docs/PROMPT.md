@@ -201,11 +201,28 @@ RX aggregated like the chip). Found on the way: data packets in an aggregated RX
 
 ## Phase 5: product
 
-`macwifid` LaunchDaemon (`io.github.fpm8588.macwifid`) that owns the adapter: auto mode-switch on plug-in,
-firmware load, reconnect to known networks, replug and sleep/wake handling. A SwiftUI menu bar app that behaves
-like the Wi-Fi menu (networks with signal bars, lock, band; join with password; forget; on/off), talking JSON
-over `/var/run/macwifid.sock` (root:admin 0660; protocol codec tested). `build.sh pkg` builds an ad-hoc-signed
-installer package (note the one-time **Open Anyway**) and an uninstaller.
+Built 2026-11-07, simulated end to end in `Tests/sim_connect.c`; waiting for the adapter test.
+
+- `macwifid` (`Sources/macwifictl/daemon.c`, compiled into the same binary as `macwifictl`; LaunchDaemon
+  `io.github.fpm8588.macwifid`, KeepAlive, log `/Library/Logs/macwifid.log`): owns the adapter; polls for it,
+  mode-switches, loads firmware, starts the radio, auto-joins the strongest remembered network (`knownnet.c`),
+  rejoins after drops with backoff, handles unplug (IN-pipe failure), Wi-Fi on/off (persisted). The connect steps
+  are shared with the CLI (`scan_pick`, `conn_scan` through `pump`, `conn_associate`, `bridge_*`, `conn_leave`).
+  Open networks are supported too.
+- Control socket `/var/run/macwifid.sock`, root:admin 0660, one JSON request per connection (`json.c`), a thread
+  per client; commands are handed to the main thread through a one-slot mailbox.
+- Remembered networks: SSID + PMK (never the passphrase), `/Library/Application Support/macwifi/networks`, 0600.
+- Sleep/wake (`power.c`, IORegisterForSystemPower): no power assertions; idle-sleep questions answered yes;
+  on kIOMessageSystemWillSleep the main thread leaves the network, removes the interface and service and releases
+  USB, then sleep is allowed (callback waits at most 20 s); on kIOMessageSystemHasPoweredOn the adapter is found
+  again in whatever mode it woke (driver CD, ROM, running firmware) and the remembered network is rejoined.
+- Menu bar app (`App/MacWifi`, SwiftUI MenuBarExtra, macOS 13+, built with `swiftc`): networks with signal bars,
+  lock, band; join (password prompt only for new secured networks), disconnect, forget, on/off; LaunchAgent
+  `io.github.fpm8588.macwifi.menu` starts it at login (Quit keeps it closed until the next login).
+- `./build.sh pkg`: ad-hoc-signed component package (non-relocatable app), pre/postinstall scripts that stop and
+  start the service and the app; `scripts/uninstall.sh` (also installed next to the service).
+   → **Checkpoint: install the package, join from the menu, unplug/replug, sleep the Mac and wake it; the
+   connection comes back by itself.**
 
 ## Phase 6: later
 

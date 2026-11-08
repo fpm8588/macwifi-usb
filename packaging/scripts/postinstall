@@ -1,0 +1,14 @@
+#!/bin/sh
+# Start the background service, put macwifictl on the PATH, and start the menu bar app for the logged-in user.
+D="/Library/Application Support/macwifi"
+chown -R root:wheel "$D"
+chmod 755 "$D" "$D/macwifid" "$D/macwifictl" "$D/uninstall.sh"
+touch /Library/Logs/macwifid.log && chmod 644 /Library/Logs/macwifid.log
+mkdir -p /usr/local/bin && ln -sf "$D/macwifictl" /usr/local/bin/macwifictl
+launchctl bootstrap system /Library/LaunchDaemons/io.github.fpm8588.macwifid.plist 2>/dev/null ||
+    launchctl kickstart -k system/io.github.fpm8588.macwifid
+user=$(stat -f %Su /dev/console 2>/dev/null)
+if [ -n "$user" ] && [ "$user" != "root" ]; then
+    launchctl bootstrap "gui/$(id -u "$user")" /Library/LaunchAgents/io.github.fpm8588.macwifi.menu.plist 2>/dev/null || true
+fi
+exit 0

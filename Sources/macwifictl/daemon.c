@@ -25,8 +25,32 @@
 #define MW_DIR "/Library/Application Support/macwifi"
 #define MW_SOCK "/var/run/macwifid.sock"
 
-typedef enum { DS_OFF, DS_NO_ADAPTER, DS_STARTING, DS_IDLE, DS_SCANNING, DS_CONNECTING, DS_CONNECTED, DS_ERROR } DState;
-static const char *const kStateName[] = {"off", "no_adapter", "starting", "idle", "scanning", "connecting", "connected", "error"};
+typedef enum { DS_OFF, DS_NO_ADAPTER, DS_STARTING, DS_IDLE, DS_SCANNING, DS_CONNECTING, DS_CONNECTED, DS_ERROR, DS_ASLEEP } DState;
+static const char *const kStateName[] = {"off", "no_adapter", "starting", "idle", "scanning", "connecting", "connected", "error", "asleep"};
+
+// ---------------------------------------------------------------- sleep / wake (power.c calls these)
+//
+// Before sleep the power callback asks the main thread to shut the adapter down cleanly (leave the network, remove
+// the macOS interface and service, release USB) and waits for it, at most 20 s; macOS sleeps right after. After
+// wake the main thread finds the adapter again (whatever state it woke up in) and auto-joins as usual.
+static atomic_int gSleepReq, gWake;
+static pthread_mutex_t gPmMu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t gPmCv = PTHREAD_COND_INITIALIZER;
+static int gSleepReady;
+
+static void d_will_sleep(void) {
+    pthread_mutex_lock(&gPmMu);
+    gSleepReady = 0;
+    gSleepReq = 1;
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    ts.tv_sec += 20;
+    while (!gSleepReady)
+        if (pthread_cond_timedwait(&gPmCv, &gPmMu, &ts) != 0) break;
+    pthread_mutex_unlock(&gPmMu);
+}
+
+static void d_did_wake(void) { gWake = 1; }
 
 typedef enum { DC_NONE, DC_SCAN, DC_JOIN, DC_DISCONNECT, DC_FORGET, DC_POWER } DCmd;
 
@@ -626,9 +650,37 @@ static int daemon_main(const DaemonHooks *hooks) {
     Adapter *a = &gA;
     memset(a, 0, sizeof *a);
     double next_try = 0, next_autojoin = 0, autojoin_backoff = 5;
-    int manual_off = 0;
+    int manual_off = 0, sleeping = 0, quick_retries = 0;
     d->state = d->power ? DS_NO_ADAPTER : DS_OFF;
     while (!gStop) {
+        if (gSleepReq) {
+            printf("[macwifid] shutting the adapter down for sleep\n");
+            if (a->up) d_release(d, a);
+            pthread_mutex_lock(&d->mu);
+            d->adapter = 0;
+            pthread_mutex_unlock(&d->mu);
+            sleeping = 1;
+            d_set_state(d, DS_ASLEEP);
+            pthread_mutex_lock(&gPmMu);
+            gSleepReq = 0;
+            gSleepReady = 1;
+            pthread_cond_broadcast(&gPmCv);
+            pthread_mutex_unlock(&gPmMu);
+        }
+        if (gWake) {
+            gWake = 0;
+            if (sleeping) {
+                sleeping = 0;
+                next_try = now_s() + 1;   // give USB a moment to bring the adapter back
+                quick_retries = 5;
+                d_set_state(d, d->power ? DS_NO_ADAPTER : DS_OFF);
+            }
+        }
+        if (sleeping) {
+            d_handle(d, a, &manual_off, &next_autojoin);
+            usleep(200000);
+            continue;
+        }
         if (!d->power) {
             if (a->up) d_release(d, a);
             d_set_state(d, DS_OFF);
@@ -662,7 +714,8 @@ static int daemon_main(const DaemonHooks *hooks) {
                 } else {
                     d_set_error(d, "the adapter didn't start; unplug it and plug it back in");
                     d_set_state(d, DS_ERROR);
-                    next_try = now_s() + 15;
+                    next_try = now_s() + (quick_retries > 0 ? 3 : 15);   // right after wake USB may still be settling
+                    if (quick_retries > 0) quick_retries--;
                 }
             } else if (!present) {
                 d_set_state(d, DS_NO_ADAPTER);
@@ -798,6 +851,7 @@ static int cmd_daemon(void) {
         return 2;
     }
     if (chdir(MW_DIR) != 0) fprintf(stderr, "note: %s not found; firmware is looked up relative to the current folder\n", MW_DIR);
+    power_watch_start(d_will_sleep, d_did_wake);   // no power assertions: never keeps the Mac awake
     DaemonHooks h = {real_adapter_present, real_acquire, real_release, MW_DIR, MW_SOCK};
     return daemon_main(&h);
 }

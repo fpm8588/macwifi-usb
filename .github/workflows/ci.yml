@@ -44,6 +44,14 @@ jobs:
           ./build/macwifictl list --all; echo "list --all exit $?"
           lipo -archs build/macwifictl | grep -q arm64 || exit 1
           codesign --verify --verbose build/macwifictl || exit 1
+      - name: Build the menu bar app
+        run: ./build.sh app && codesign --verify --verbose build/MacWifi.app
+      - name: Build the installer package (firmware downloaded here; the package is not uploaded)
+        run: |
+          chmod +x scripts/fetch-firmware.sh && scripts/fetch-firmware.sh
+          ./build.sh pkg
+          pkgutil --payload-files build/MacWifi.pkg | grep -E "macwifid$|MacWifi.app/Contents/MacOS/MacWifi$|LaunchDaemons|LaunchAgents|uninstall.sh"
+          pkgutil --expand build/MacWifi.pkg build/pkgx && ls build/pkgx/Scripts
       - uses: actions/upload-artifact@v7
         with:
           name: macwifictl-arm64

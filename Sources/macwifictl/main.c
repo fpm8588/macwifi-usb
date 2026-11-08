@@ -43,6 +43,7 @@
 #include "descdump.h"
 #include "feth.h"
 #include "json.h"
+#include "power.h"
 #include "knownnet.h"
 
 extern char **environ;

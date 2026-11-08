@@ -1,0 +1,10 @@
+#!/bin/sh
+# Stop the running copies so their files can be replaced. macwifid removes its network service and interfaces
+# when it stops.
+user=$(stat -f %Su /dev/console 2>/dev/null)
+if [ -n "$user" ] && [ "$user" != "root" ]; then
+    launchctl bootout "gui/$(id -u "$user")/io.github.fpm8588.macwifi.menu" 2>/dev/null || true
+fi
+launchctl bootout system/io.github.fpm8588.macwifid 2>/dev/null || true
+pkill -x MacWifi 2>/dev/null || true
+exit 0

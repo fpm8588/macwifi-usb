@@ -22,15 +22,46 @@ in its own menu bar app; it won't appear in the system Wi-Fi menu. Background an
 | 3a | `macwifictl scan`: start the radio and list nearby networks | **Passed on the adapter** (2026-11-07) |
 | 3b | `macwifictl connect "SSID"`: data path, association, WPA2-PSK handshake, key install, DHCP probe | **Passed on the adapter** (2026-11-07) |
 | 4 | `sudo macwifictl join "SSID"`: macOS networking through a feth (virtual Ethernet) pair | **Passed on the adapter** (2026-11-07: Safari and a speed test over the UGREEN) |
-| 5 | LaunchDaemon, menu bar app, installer | Next |
+| 5 | Background service (`macwifid`), menu bar app, installer; sleep/wake | Built and simulated; waiting for the adapter test |
 
 The phase-by-phase plan, written as a Claude Code prompt: [docs/PROMPT.md](docs/PROMPT.md). Results from the
 real adapter: [docs/HARDWARE_LOG.md](docs/HARDWARE_LOG.md).
 
-## Try it
+## Install (menu bar app + background service)
 
-Install the free Xcode Command Line Tools once with `xcode-select --install`. Then paste this (it has no
-comments, so it pastes cleanly into zsh):
+Install the free Xcode Command Line Tools once with `xcode-select --install`. Then, in Terminal:
+
+```bash
+git clone https://github.com/fpm8588/macwifi-usb.git && cd macwifi-usb
+scripts/fetch-firmware.sh
+./build.sh test && ./build.sh pkg
+sudo installer -pkg build/MacWifi.pkg -target /
+```
+
+A Wi-Fi icon appears in the menu bar ("UGREEN Wi-Fi"). Plug in the adapter, pick a network, type its password
+once. From then on:
+
+- `macwifid`, a background service (LaunchDaemon), owns the adapter: it switches it out of driver-CD mode, loads
+  the firmware, joins the strongest remembered network, rejoins after drops, and waits quietly when the adapter
+  is unplugged. While connected, macOS sees a network service "UGREEN USB Wi-Fi (macwifi)"; it's last in the
+  service order, so a wired connection or the Mac's own Wi-Fi still wins when they're up.
+- **Sleep:** it never keeps the Mac awake (no power assertions). Before sleep it leaves the network and releases the
+  adapter cleanly, then lets the Mac sleep; after wake it brings the adapter back (whatever state it woke in) and
+  rejoins the remembered network by itself.
+- Remembered networks are stored as WPA2 keys derived from the password (PMKs), never the password itself, in a
+  root-only file in `/Library/Application Support/macwifi/`. "Forget This Network" (right-click in the menu)
+  deletes one.
+- `macwifictl status`, `macwifictl networks` show what the service is doing; its log is
+  `/Library/Logs/macwifid.log`.
+- The package contains AICsemi's firmware, downloaded on your Mac. Don't share the package itself.
+
+Uninstall: `sudo "/Library/Application Support/macwifi/uninstall.sh"` (removes the service, the app and the
+remembered networks).
+
+## Try it step by step (developer commands)
+
+These talk to the adapter directly, so uninstall the service first if it's installed (they refuse while it
+runs). Paste this (it has no comments, so it pastes cleanly into zsh):
 
 ```bash
 git clone https://github.com/fpm8588/macwifi-usb.git && cd macwifi-usb
@@ -83,7 +114,7 @@ interfaces; `join` also does this by itself the next time it runs:
 sudo build/macwifictl cleanup
 ```
 
-Phase 5 will add a background daemon; its removal command will be listed here.
+If the package is installed: `sudo "/Library/Application Support/macwifi/uninstall.sh"` removes everything.
 
 ## License
 

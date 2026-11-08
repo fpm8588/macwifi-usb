@@ -589,6 +589,24 @@ static void test_daemon(void) {
     CHECK(ask("{\"cmd\":\"power\",\"on\":true}", r, sizeof r) == 0);
     CHECK(wait_for("\"state\":\"idle\"", 5) && gAcquired == 2);
 
+    // sleep and wake: before sleep the adapter is shut down cleanly (leave, remove interface, release USB) and
+    // the power callback returns only then; after wake it comes back and rejoins the remembered network.
+    CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\",\"password\":\"correct horse battery\"}", r, sizeof r) == 0 &&
+          strstr(r, "\"ok\":true"));
+    CHECK(wait_for("\"state\":\"connected\"", 3));
+    int discs = S_get(&S.discs), rel = gReleased, acq = gAcquired, conns = S_get(&S.connects);
+    double ts = now_s();
+    d_will_sleep();                                            // what power.c does on kIOMessageSystemWillSleep
+    CHECK(now_s() - ts < 5);                                   // answered quickly, not by the 20 s timeout
+    CHECK(S_get(&S.discs) == discs + 1 && gReleased == rel + 1 && gFethOpen == 0);
+    CHECK(wait_for("\"state\":\"asleep\",\"adapter\":false", 1));
+    usleep(1500000);
+    CHECK(gAcquired == acq && S_get(&S.connects) == conns);   // nothing happens while asleep
+    d_did_wake();                                              // kIOMessageSystemHasPoweredOn
+    CHECK(wait_for("\"state\":\"connected\"", 10));
+    CHECK(gAcquired == acq + 1 && S_get(&S.connects) == conns + 1 && gFethOpen == 1);
+    CHECK(wait_for("\"ip\":\"192.0.2.77\"", 5));
+
     // unplugged: back to waiting for the adapter
     gAdapterPresent = 0;
     gUnplugged = 1;

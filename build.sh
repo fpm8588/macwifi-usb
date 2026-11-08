@@ -69,16 +69,57 @@ build_cli() {
     [[ "$(uname)" == "Darwin" ]] || { echo "macwifictl needs macOS (IOKit)"; exit 1; }
     echo "== macwifictl (arm64)"
     clang "${CFLAGS[@]}" -arch arm64 -mmacosx-version-min=$MINOS -Wno-deprecated-declarations \
-        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c Sources/macwifictl/feth.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/json.c" "$S/knownnet.c" \
+        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c Sources/macwifictl/feth.c Sources/macwifictl/power.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/json.c" "$S/knownnet.c" \
         -framework IOKit -framework CoreFoundation -framework SystemConfiguration -o "$B/macwifictl"
     codesign --force --sign - "$B/macwifictl"
     file "$B/macwifictl"
 }
 
+build_app() {
+    [[ "$(uname)" == "Darwin" ]] || { echo "the menu bar app needs macOS"; exit 1; }
+    echo "== MacWifi.app (arm64)"
+    local app="$B/MacWifi.app"
+    rm -rf "$app"
+    mkdir -p "$app/Contents/MacOS"
+    cp App/MacWifi/Info.plist "$app/Contents/Info.plist"
+    swiftc -O -parse-as-library -target "arm64-apple-macos$MINOS" App/MacWifi/MacWifiApp.swift \
+        -o "$app/Contents/MacOS/MacWifi"
+    codesign --force --sign - "$app"
+}
+
+# An installer package built on this Mac from this Mac's downloaded firmware. The firmware is AICsemi's and has
+# no open-source license: don't redistribute the package.
+build_pkg() {
+    build_cli
+    build_app
+    for d in firmware/aic8800D80 firmware/aic8800D80-legacy-mcu1; do
+        [[ -d "$d" ]] || { echo "Run scripts/fetch-firmware.sh first ($d is missing)."; exit 1; }
+    done
+    echo "== MacWifi.pkg"
+    local root="$B/pkgroot" ver
+    local A="$root/Library/Application Support/macwifi"
+    ver=$(/usr/libexec/PlistBuddy -c "Print CFBundleShortVersionString" App/MacWifi/Info.plist)
+    rm -rf "$root"
+    mkdir -p "$A/firmware" "$root/Library/LaunchDaemons" "$root/Library/LaunchAgents" "$root/Applications"
+    cp "$B/macwifictl" "$A/macwifid"
+    cp "$B/macwifictl" "$A/macwifictl"
+    cp -R firmware/aic8800D80 firmware/aic8800D80-legacy-mcu1 "$A/firmware/"
+    cp scripts/uninstall.sh "$A/uninstall.sh"
+    cp packaging/io.github.fpm8588.macwifid.plist "$root/Library/LaunchDaemons/"
+    cp packaging/io.github.fpm8588.macwifi.menu.plist "$root/Library/LaunchAgents/"
+    cp -R "$B/MacWifi.app" "$root/Applications/"
+    pkgbuild --root "$root" --component-plist packaging/components.plist --scripts packaging/scripts \
+        --identifier io.github.fpm8588.macwifi --version "$ver" --install-location / --ownership recommended \
+        "$B/MacWifi.pkg"
+    echo "Built $B/MacWifi.pkg. Install: sudo installer -pkg $B/MacWifi.pkg -target /"
+}
+
 case "${1:-all}" in
     test)  run_tests ;;
     cli)   build_cli ;;
-    all)   run_tests; if [[ "$(uname)" == "Darwin" ]]; then build_cli; fi ;;
+    app)   build_app ;;
+    pkg)   build_pkg ;;
+    all)   run_tests; if [[ "$(uname)" == "Darwin" ]]; then build_cli; build_app; fi ;;
     clean) rm -rf "$B" ;;
-    *)     echo "usage: $0 test|cli|all|clean"; exit 2 ;;
+    *)     echo "usage: $0 test|cli|app|pkg|all|clean"; exit 2 ;;
 esac

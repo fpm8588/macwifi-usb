@@ -9,7 +9,8 @@ Files written from scratch for this project are **additionally** available under
 (Copyright (c) 2026 fpm8588), so they can be reused elsewhere:
 `Sources/Shared/aic8800.h`, `Sources/Shared/aic_msg.[ch]`, `Sources/Shared/ieee80211.[ch]`,
 `Sources/Shared/wpa.[ch]`, `Sources/Shared/crypto_backend.c`, `Sources/Shared/eapol.[ch]` (the WPA2-PSK
-supplicant), `Sources/Shared/dhcp.[ch]`, `Sources/Shared/bridge.[ch]`, `Sources/macwifictl/descdump.[ch]`,
+supplicant), `Sources/Shared/dhcp.[ch]`, `Sources/Shared/bridge.[ch]`, `Sources/Shared/json.[ch]`, `Sources/Shared/knownnet.[ch]`,
+`Sources/macwifictl/power.[ch]`, `App/*` (the menu bar app), `packaging/*`, `Sources/macwifictl/descdump.[ch]`,
 `Sources/macwifictl/feth.[ch]` (the feth arrangement follows facts documented in ZeroTier's
 `osdep/MacEthernetTapAgent.c`, MPL-2.0; no code was taken from it), `Sources/macwifictl/main.c` (except
 `fwload`, `up`, `scan`, `connect` and `join`), `Tests/*` (including the stand-in macOS headers in `Tests/macstubs`),
@@ -39,6 +40,8 @@ later phases keep their original copyright lines and are listed here:
 - The connect, key and control-port messages in `aic_fmac.c` come from `rwnx_send_sm_connect_req`,
   `rwnx_send_key_add`, `rwnx_send_me_set_control_port_req` and `rwnx_send_sm_disconnect_req` (`rwnx_msg_tx.c`)
   and `rwnx_rx_sm_connect_ind` (`rwnx_msg_rx.c`).
+- `Sources/macwifictl/daemon.c` (macwifid) is compiled as part of `main.c` and drives the same ported code, so it
+  is GPL-2.0-only too.
 - The `fwload`, `up`, `scan`, `connect` and `join` commands in `Sources/macwifictl/main.c` follow `aicfw_download_fw_8800d80` and
   `system_config_8800d80`; that part of the file is GPL-2.0-only.
 
