@@ -330,3 +330,145 @@ int aic_fmac_parse_rf_calib_cfm(const uint8_t *p, size_t n, AicRfCalibCfm *c) {
 }
 
 int aic_fmac_mac_valid(const uint8_t mac[6]) { return (mac[0] | mac[1] | mac[2] | mac[3]) != 0; }
+
+static void put16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
+
+size_t aic_fmac_me_config_params(uint8_t out[AIC_SZ_ME_CONFIG_REQ]) {
+    memset(out, 0, AIC_SZ_ME_CONFIG_REQ);
+    // struct mac_htcapability (offset 0): rwnx_set_ht_capa with nss forced to 1 (chipid <= D81), use_2040, sgi,
+    // stbc_on, ldpc_on, amsdu_rx_max; ME_CONFIG ORs in LDPC again. Copied from the 5 GHz band (band_5g_support).
+    put16(out + 0, 0x0963);   // LDPC | 20/40 | SGI20 | SGI40 | RX STBC 1 | max A-MSDU
+    out[2] = 0x1f;            // A-MPDU factor 64K (3) | density 16 us (7 << 2)
+    static const uint8_t ht_mcs[16] = {0xff, 0, 0, 0, 0x01, 0, 0, 0, 0, 0, 0x96, 0x00, 0x01, 0, 0, 0};
+    memcpy(out + 3, ht_mcs, 16);   // MCS 0-7 + MCS32, rx_highest 150 Mb/s, tx_params MCS_TX_DEFINED
+    // struct mac_vhtcapability (offset 32): rwnx_set_vht_capa, 1 SS, MCS 0-9, 80 MHz, SGI80, RX LDPC/STBC,
+    // SU+MU beamformee (STS 3), max MPDU 7991, A-MPDU exponent 7.
+    put32(out + 32, 0x03987131);
+    put16(out + 36, 0xfffe);   // rx_mcs_map: 1 SS MCS 0-9
+    put16(out + 38, 390);      // rx_highest
+    put16(out + 40, 0xfffe);   // tx_mcs_map
+    put16(out + 42, 390);      // tx_highest
+    // struct mac_hecapability (offset 44): rwnx_set_he_capa (2.4 GHz iftype data), MCS 0-11.
+    static const uint8_t he_mac[6] = {0x00, 0x00, 0x02, 0x00, 0x00, 0x00};
+    static const uint8_t he_phy[11] = {0x06, 0xe0, 0x2b, 0x58, 0x0d, 0xc0, 0xcf, 0x00, 0x02, 0x30, 0x00};
+    memcpy(out + 44, he_mac, 6);
+    memcpy(out + 50, he_phy, 11);
+    put16(out + 62, 0xfffe);   // rx_mcs_80 (after one pad byte at 61)
+    put16(out + 64, 0xfffe);   // tx_mcs_80
+    put16(out + 66, 0xffff);   // rx_mcs_160
+    put16(out + 68, 0xffff);   // tx_mcs_160
+    put16(out + 70, 0xffff);   // rx_mcs_80p80
+    put16(out + 72, 0xffff);   // tx_mcs_80p80
+    static const uint8_t ppe[4] = {0x38, 0x1c, 0xc7, 0x01};
+    memcpy(out + 74, ppe, 4);  // ppe_thres[25]
+    put16(out + 100, 1000);    // tx_lft (RWNX_TX_LIFETIME_MS)
+    out[102] = 2;              // phy_bw_max = PHY_CHNL_BW_80 (use_80)
+    out[103] = 1;              // ht_supp
+    out[104] = 1;              // vht_supp
+    out[105] = 1;              // he_supp
+    out[106] = 0;              // he_ul_on
+    out[107] = 1;              // ps_on
+    out[108] = 1;              // ant_div_on
+    out[109] = 0;              // dpsm
+    return AIC_SZ_ME_CONFIG_REQ;
+}
+
+// rwnx_2ghz_channels / rwnx_5ghz_channels (rwnx_main.c) without the PHY-measurement extras.
+static const uint16_t k2g4[] = {2412, 2417, 2422, 2427, 2432, 2437, 2442, 2447, 2452, 2457, 2462, 2467, 2472, 2484};
+static const uint16_t k5g[] = {5180, 5200, 5220, 5240, 5260, 5280, 5300, 5320, 5500, 5520, 5540, 5560, 5580,
+                               5600, 5620, 5640, 5660, 5680, 5700, 5720, 5745, 5765, 5785, 5805, 5825};
+#define N2G4 ((int)(sizeof k2g4 / sizeof k2g4[0]))
+#define N5G ((int)(sizeof k5g / sizeof k5g[0]))
+#define CHAN_TX_POWER 20   // MBM_TO_DBM(max_eirp) of the "00" rules
+
+int aic_fmac_channel_count_2g4(void) { return N2G4; }
+int aic_fmac_channel_count_5g(void) { return N5G; }
+
+static void put_chan(uint8_t *p, uint16_t freq, uint8_t band) {   // struct mac_chan_def
+    put16(p, freq);
+    p[2] = band;   // NL80211_BAND_2GHZ 0, NL80211_BAND_5GHZ 1
+    p[3] = 0;      // flags (get_chan_flags is empty without CONFIG_RADAR_OR_IR_DETECT; no channel disabled)
+    p[4] = CHAN_TX_POWER;
+    p[5] = 0;
+}
+
+size_t aic_fmac_me_chan_config_params(uint8_t out[AIC_SZ_ME_CHAN_CONFIG_REQ]) {
+    memset(out, 0, AIC_SZ_ME_CHAN_CONFIG_REQ);
+    for (int i = 0; i < N2G4; i++) put_chan(out + 6 * i, k2g4[i], 0);
+    for (int i = 0; i < N5G; i++) put_chan(out + 84 + 6 * i, k5g[i], 1);
+    out[252] = (uint8_t)N2G4;
+    out[253] = (uint8_t)N5G;
+    return AIC_SZ_ME_CHAN_CONFIG_REQ;
+}
+
+size_t aic_fmac_start_params(uint8_t out[AIC_SZ_MM_START_REQ]) {
+    memset(out, 0, AIC_SZ_MM_START_REQ);   // phy_cfg: rwnx_hw->phy.cfg, never set on USB (rwnx_set_rf_params is #if 0)
+    put32(out + 64, 300);                  // uapsd_timeout
+    put16(out + 68, 20);                   // lp_clk_accuracy (ppm)
+    return AIC_SZ_MM_START_REQ;
+}
+
+size_t aic_fmac_coex_params(uint8_t out[AIC_SZ_COEX_REQ]) {
+    memset(out, 0, AIC_SZ_COEX_REQ);
+    out[0] = 1;   // bt_on
+    out[1] = 0;   // disable_coexnull
+    out[2] = 1;   // enable_nullcts
+    return AIC_SZ_COEX_REQ;
+}
+
+size_t aic_fmac_add_if_params(uint8_t out[AIC_SZ_ADD_IF_REQ], const uint8_t mac[6]) {
+    memset(out, 0, AIC_SZ_ADD_IF_REQ);
+    out[0] = 0;               // type = MM_STA
+    memcpy(out + 2, mac, 6);  // struct mac_addr (u16 aligned)
+    out[8] = 0;               // p2p
+    return AIC_SZ_ADD_IF_REQ;
+}
+
+size_t aic_fmac_scan_params(uint8_t out[AIC_SZ_SCANU_START_REQ], uint8_t vif_idx, const char *ssid) {
+    memset(out, 0, AIC_SZ_SCANU_START_REQ);
+    int n = 0;
+    for (int i = 0; i < N2G4; i++, n++) put_chan(out + 6 * n, k2g4[i], 0);
+    for (int i = 0; i < N5G; i++, n++) put_chan(out + 6 * n, k5g[i], 1);   // 39 of SCAN_CHANNEL_MAX (42)
+    size_t sl = ssid ? strlen(ssid) : 0;
+    if (sl > 32) sl = 32;
+    out[252] = (uint8_t)sl;   // ssid[0].length; 0 = wildcard
+    if (sl) memcpy(out + 253, ssid, sl);
+    memset(out + 352, 0xff, 6);   // bssid = broadcast
+    // add_ies (360) and add_ie_len (364) stay 0: no extra probe-request IEs, so no SCANU_VENDOR_IE_REQ.
+    out[366] = vif_idx;
+    out[367] = (uint8_t)n;        // chan_cnt
+    out[368] = 1;                 // ssid_cnt
+    out[369] = 0;                 // no_cck
+    // duration (372) 0
+    return AIC_SZ_SCANU_START_REQ;
+}
+
+int aic_fmac_parse_add_if_cfm(const uint8_t *p, size_t n, uint8_t *status, uint8_t *inst_nbr) {
+    if (!p || n < 2) return -1;
+    *status = p[0];
+    *inst_nbr = p[1];
+    return 0;
+}
+
+int aic_fmac_parse_scan_result(const uint8_t *p, size_t n, AicScanResult *r) {
+    if (!p || n < 12) return -1;
+    r->length = (uint16_t)(p[0] | (p[1] << 8));
+    r->framectrl = (uint16_t)(p[2] | (p[3] << 8));
+    r->center_freq = (uint16_t)(p[4] | (p[5] << 8));
+    r->band = p[6];
+    r->sta_idx = p[7];
+    r->inst_nbr = p[8];
+    r->rssi = (int8_t)p[9];
+    if (r->length > n - 12) return -1;   // payload at offset 12 (u32-aligned)
+    r->frame = p + 12;
+    r->frame_len = r->length;
+    return 0;
+}
+
+int aic_fmac_parse_scan_cfm(const uint8_t *p, size_t n, AicScanCfm *c) {
+    if (!p || n < 3) return -1;
+    c->vif_idx = p[0];
+    c->status = p[1];
+    c->result_cnt = p[2];
+    return 0;
+}

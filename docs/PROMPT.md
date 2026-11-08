@@ -132,9 +132,19 @@ which phase 2a already does.
 
 ## Phase 3: scan and connect
 
-1. **Scan**: `SCANU_START_REQ` (`rwnx_send_scanu_req`), collect `SCANU_RESULT_IND` (beacon/probe-response
-   frames → `wifi_parse_bss`), finish on `SCANU_START_CFM`. → **Checkpoint: `macwifictl scan` lists your
-   networks with sensible RSSI on 2.4 and 5 GHz.**
+1. **Scan** (code written; run it on the adapter). `macwifictl scan [SSID]` = `up` + the Linux driver's
+   interface-open sequence + one scan, all in `Sources/Shared/aic_fmac.c`:
+   `ME_CONFIG` (HT/VHT/HE capabilities) -> `ME_CHAN_CONFIG` (world "00" domain: channels 1-14 and 25 5 GHz
+   channels, 20 dBm, none disabled) -> `MM_START` -> `MM_SET_COEX` (CONFIG_COEX) -> `MM_ADD_IF` (station, our MAC)
+   -> `SCANU_START` (all 39 channels, one wildcard or directed SSID, no extra IEs) -> `SCANU_RESULT_IND`
+   (beacon/probe response at offset 12 -> `wifi_parse_bss`) until `SCANU_START_CFM`.
+   ME_CONFIG / ME_CHAN_CONFIG / MM_START are byte-identical to what the Linux code produces: the harness compiles
+   `rwnx_set_{vht,he,ht}_capa` and the three senders from `aic8800_fdrv` with stand-in kernel types (constants
+   from the Linux kernel's `include/linux/ieee80211-*.h`) and the D81 path of `rwnx_handle_dynparams`; channel
+   power follows `handle_channel_custom` in the kernel's `net/wireless/reg.c` for the self-managed regdomain.
+   The resulting bytes are pinned in `Tests/fmac_golden.h`. SCANU_START / ADD_IF / COEX were compared with the
+   driver's own structs filled as `rwnx_send_*` fills them.
+   → **Checkpoint: `macwifictl scan` lists your networks with sensible RSSI on 2.4 and 5 GHz.**
 2. **Data path**: port the USB TX descriptor (`rwnx_tx.c` USB path / `txdesc_api` + host descriptor, type byte
    `0x00`) and RX parsing (`rwnx_rx.c`: the 60-byte RX header, flags telling 802.3 data from forwarded 802.11
    management frames). Put both codecs in `Sources/Shared` with tests built from captured transfers.

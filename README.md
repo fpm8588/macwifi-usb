@@ -35,7 +35,7 @@ comments, so it pastes cleanly into zsh):
 git clone https://github.com/fpm8588/macwifi-usb.git && cd macwifi-usb
 ./build.sh test && ./build.sh cli
 scripts/fetch-firmware.sh
-build/macwifictl up
+build/macwifictl scan
 ```
 
 What each command does:
@@ -45,6 +45,8 @@ What each command does:
   pinned commits of the Linux driver and checks every file's SHA-256. There are two matched sets: newer chips
   take the SDK V5 set; older "MCU1" chips, like the UGREEN AX900 tested here, need the SDK V3 set
   (`fwload` picks automatically and prints which).
+- `macwifictl scan [SSID]` runs `up`, starts the radio and lists nearby networks (SSID, channel, signal,
+  security). It's the current end-to-end test.
 - `macwifictl up` does everything below in one go: switch modes, load the firmware, then start the Wi-Fi
   firmware and read the adapter's MAC address. Each step also exists on its own:
 - `macwifictl modeswitch` ejects the adapter's virtual driver CD, which switches it to Wi-Fi mode (`a69c:8d80`).

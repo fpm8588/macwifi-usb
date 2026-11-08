@@ -36,6 +36,7 @@ jobs:
           ./build/macwifictl identify;   [ $? -eq 3 ] || exit 1   # 3 = no adapter on the runner, the expected answer
           ./build/macwifictl fwload;     [ $? -eq 4 ] || exit 1   # 4 = firmware not downloaded
           ./build/macwifictl up;         [ $? -eq 3 ] || exit 1   # 3 = no adapter
+          ./build/macwifictl scan;       [ $? -eq 3 ] || exit 1
           ./build/macwifictl list;       [ $? -eq 3 ] || exit 1   # no adapter on the runner
           ./build/macwifictl list --all; echo "list --all exit $?"
           lipo -archs build/macwifictl | grep -q arm64 || exit 1

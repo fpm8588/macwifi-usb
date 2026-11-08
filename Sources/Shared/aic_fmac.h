@@ -10,7 +10,8 @@
 //                   _txpwr_ofst2x_req, _rf_calib_req, _get_macaddr_req, _reset, _version_req
 //   rwnx_platform.c userconfig_info defaults, rwnx_plat_userconfig_parsing, rwnx_plat_nvram_set_value, rwnx_atoi
 //   aicwf_compat_8800d80.c  aicwf_set_rf_config_8800d80
-// Copyright (C) AICSemi 2018-2020. Rewritten for macOS user space, 2026. GPL-2.0-only; see NOTICE.md.
+// Copyright (C) AICSemi 2018-2020; Copyright (C) RivieraWaves 2012-2019 (rwnx_* files). Rewritten for macOS user
+// space, 2026. GPL-2.0-only; see NOTICE.md.
 //
 // Bring-up order for the D80 after firmware start (Linux "PRODUCT_ID_AIC8800D81" path, testmode 0, USE_5G):
 //   DBG_MEM_READ [0x40500000] (system_config_8800d80) -> user-config file -> MM_SET_STACK_START(1, 0, BIT(5), 0)
@@ -40,8 +41,13 @@ enum {
     AIC_MM_SET_STACK_START_REQ    = 0x007b, AIC_MM_SET_STACK_START_CFM    = 0x007c,
     AIC_MM_GET_FW_VERSION_REQ     = 0x0080, AIC_MM_GET_FW_VERSION_CFM     = 0x0081,
     AIC_MM_SET_TXPWR_LVL_ADJ_REQ  = 0x0089, AIC_MM_SET_TXPWR_LVL_ADJ_CFM  = 0x008a,
-    AIC_ME_CONFIG_REQ             = 0x1400,   // TASK_ME = 5
-    AIC_ME_CHAN_CONFIG_REQ        = 0x1402,
+    AIC_MM_START_CFM              = 0x0003,
+    AIC_MM_SET_COEX_REQ           = 0x0065, AIC_MM_SET_COEX_CFM           = 0x0066,
+    AIC_ME_CONFIG_REQ             = 0x1400, AIC_ME_CONFIG_CFM             = 0x1401,   // TASK_ME = 5
+    AIC_ME_CHAN_CONFIG_REQ        = 0x1402, AIC_ME_CHAN_CONFIG_CFM        = 0x1403,
+    AIC_SCANU_START_REQ           = 0x1000, AIC_SCANU_START_CFM           = 0x1001,   // TASK_SCANU = 4
+    AIC_SCANU_RESULT_IND          = 0x1004,
+    AIC_SCANU_START_CFM_ADDTIONAL = 0x1009,   // (sic) immediate acknowledgement of SCANU_START_REQ
 };
 #define AIC_TASK_MM_ID 0
 #define AIC_USB_TYPE_CFG_PRINT 0x13   // firmware log text (aicwf_usb.h); payload starts at packet + 4
@@ -54,6 +60,12 @@ enum {
 #define AIC_SZ_TXPWR_LVL_ADJ_REQ 10
 #define AIC_SZ_TXPWR_OFST_REQ    86
 #define AIC_SZ_RF_CALIB_REQ      24
+#define AIC_SZ_ME_CONFIG_REQ     112
+#define AIC_SZ_ME_CHAN_CONFIG_REQ 254  // chan2G4[14] + chan5G[28] (6 bytes each) + two counts
+#define AIC_SZ_MM_START_REQ      72   // phy_cfg (64, zero) + uapsd_timeout u32 + lp_clk_accuracy u16 + pad
+#define AIC_SZ_COEX_REQ          16
+#define AIC_SZ_ADD_IF_REQ        10
+#define AIC_SZ_SCANU_START_REQ   376
 
 // ---------------------------------------------------------------- user config (aic_userconfig_8800d80.txt)
 // Raw images of the Linux structures, so builders can copy them byte for byte.
@@ -84,6 +96,37 @@ size_t aic_fmac_txpwr_ofst2x_params(const AicUserConfig *uc, uint8_t out[AIC_SZ_
 // MM_SET_RF_CALIB for the D80/D81: cal_cfg 0x0f8f / 0x0f0f, param_alpha 0x0c34c008, bt_calib_param 0x264203,
 // crystal trim from the user config when enabled. Always AIC_SZ_RF_CALIB_REQ bytes.
 size_t aic_fmac_rf_calib_params(const AicUserConfig *uc, uint8_t out[AIC_SZ_RF_CALIB_REQ]);
+
+// ---------------------------------------------------------------- phase 3: radio start, interface, scan
+// ME_CONFIG: the HT/VHT/HE capabilities rwnx_handle_dynparams + rwnx_set_{vht,he,ht}_capa compute for
+// PRODUCT_ID_AIC8800D81 with the default module parameters (1 spatial stream, 80 MHz, LDPC, STBC RX, SGI, A-MSDU,
+// beamformee, power save on, antenna diversity on). Verified against the bytes the Linux code produces.
+size_t aic_fmac_me_config_params(uint8_t out[AIC_SZ_ME_CONFIG_REQ]);
+// ME_CHAN_CONFIG for the driver's "00" (world) regulatory domain: 2.4 GHz channels 1-14 and the 25 standard
+// 5 GHz channels, none disabled, 20 dBm each (handle_channel_custom with the regdb.c "00" rules).
+size_t aic_fmac_me_chan_config_params(uint8_t out[AIC_SZ_ME_CHAN_CONFIG_REQ]);
+size_t aic_fmac_start_params(uint8_t out[AIC_SZ_MM_START_REQ]);          // uapsd_timeout 300, lp_clk 20 ppm
+size_t aic_fmac_coex_params(uint8_t out[AIC_SZ_COEX_REQ]);               // bt_on 1, nullcts 1 (rwnx_open)
+size_t aic_fmac_add_if_params(uint8_t out[AIC_SZ_ADD_IF_REQ], const uint8_t mac[6]);   // MM_STA, not P2P
+// SCANU_START over every channel ME_CHAN_CONFIG enabled. `ssid` NULL or "" -> one wildcard SSID (active scan for
+// any network, like `iw scan`); otherwise a directed probe for that SSID (up to 32 bytes).
+size_t aic_fmac_scan_params(uint8_t out[AIC_SZ_SCANU_START_REQ], uint8_t vif_idx, const char *ssid);
+
+int aic_fmac_channel_count_2g4(void);
+int aic_fmac_channel_count_5g(void);
+
+typedef struct {
+    uint16_t length, framectrl, center_freq;
+    uint8_t band, sta_idx, inst_nbr;
+    int8_t rssi;               // dBm
+    const uint8_t *frame;      // the beacon / probe response (802.11 header first), inside the caller's buffer
+    size_t frame_len;
+} AicScanResult;
+typedef struct { uint8_t vif_idx, status, result_cnt; } AicScanCfm;
+
+int aic_fmac_parse_add_if_cfm(const uint8_t *p, size_t n, uint8_t *status, uint8_t *inst_nbr);
+int aic_fmac_parse_scan_result(const uint8_t *p, size_t n, AicScanResult *r);
+int aic_fmac_parse_scan_cfm(const uint8_t *p, size_t n, AicScanCfm *c);
 
 // ---------------------------------------------------------------- confirmations
 typedef struct { uint8_t is_5g_support, vendor_info; } AicStackStartCfm;

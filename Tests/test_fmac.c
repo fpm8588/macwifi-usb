@@ -4,6 +4,7 @@
 //   test_fmac --legacy DIR     also parses the real aic_userconfig_8800d80.txt from the legacy-mcu1 set
 #include "aic_fmac.h"
 #include "aic_msg.h"
+#include "fmac_golden.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -142,6 +143,49 @@ static void test_cfms(void) {
     CHECK(aic_fmac_parse_rf_calib_cfm(rc, 16, &cal) == 0 && cal.rxgain_24g_addr == 0x200010);
 }
 
+static void test_phase3(void) {
+    uint8_t b[512];
+    CHECK(aic_fmac_me_config_params(b) == sizeof kLinuxMeConfig && memcmp(b, kLinuxMeConfig, sizeof kLinuxMeConfig) == 0);
+    CHECK(aic_fmac_me_chan_config_params(b) == sizeof kLinuxMeChanConfig &&
+          memcmp(b, kLinuxMeChanConfig, sizeof kLinuxMeChanConfig) == 0);
+    CHECK(aic_fmac_start_params(b) == sizeof kLinuxMmStart && memcmp(b, kLinuxMmStart, sizeof kLinuxMmStart) == 0);
+    CHECK(aic_fmac_channel_count_2g4() == 14 && aic_fmac_channel_count_5g() == 25);
+
+    static const uint8_t coex[16] = {1, 0, 1};
+    CHECK(aic_fmac_coex_params(b) == 16 && memcmp(b, coex, 16) == 0);
+    const uint8_t mac[6] = {0x6c, 0x1f, 0xf7, 0x8b, 0x81, 0x46};   // the user's adapter
+    static const uint8_t add_if[10] = {0, 0, 0x6c, 0x1f, 0xf7, 0x8b, 0x81, 0x46, 0, 0};
+    CHECK(aic_fmac_add_if_params(b, mac) == 10 && memcmp(b, add_if, 10) == 0);
+
+    // SCANU_START: layout of struct scanu_start_req (checked against the Linux struct in the same harness).
+    CHECK(aic_fmac_scan_params(b, 2, NULL) == AIC_SZ_SCANU_START_REQ);
+    CHECK(b[0] == 0x6c && b[1] == 0x09 && b[2] == 0 && b[4] == 20);                     // ch 1, 2412 MHz, 20 dBm
+    CHECK(b[6 * 13] == 0xb4 && b[6 * 13 + 1] == 0x09);                                 // ch 14, 2484 MHz
+    CHECK(b[6 * 14] == 0x3c && b[6 * 14 + 1] == 0x14 && b[6 * 14 + 2] == 1);            // 5180 MHz, band 5 GHz
+    CHECK(b[6 * 38] == 0xc1 && b[6 * 38 + 1] == 0x16 && b[6 * 39] == 0);                // 5825 MHz, then empty
+    CHECK(b[252] == 0 && b[352] == 0xff && b[357] == 0xff && b[366] == 2 && b[367] == 39 && b[368] == 1 && b[369] == 0);
+    CHECK(aic_fmac_scan_params(b, 0, "MyNetwork") == AIC_SZ_SCANU_START_REQ);
+    CHECK(b[252] == 9 && memcmp(b + 253, "MyNetwork", 9) == 0 && b[262] == 0);
+    CHECK(aic_fmac_scan_params(b, 0, "0123456789012345678901234567890123456789") && b[252] == 32);   // clamped
+
+    uint8_t st = 9, inst = 9;
+    static const uint8_t aic[2] = {0, 1};
+    CHECK(aic_fmac_parse_add_if_cfm(aic, 2, &st, &inst) == 0 && st == 0 && inst == 1);
+    CHECK(aic_fmac_parse_add_if_cfm(aic, 1, &st, &inst) == -1);
+
+    // SCANU_RESULT_IND: 12-byte header then the frame.
+    uint8_t ind[12 + 40] = {40, 0, 0x80, 0x00, 0x6c, 0x09, 0, 0xff, 1, (uint8_t)-52};
+    ind[12] = 0x80;   // beacon frame control
+    AicScanResult r;
+    CHECK(aic_fmac_parse_scan_result(ind, sizeof ind, &r) == 0 && r.length == 40 && r.center_freq == 2412 &&
+          r.rssi == -52 && r.frame == ind + 12 && r.frame_len == 40 && r.framectrl == 0x0080);
+    CHECK(aic_fmac_parse_scan_result(ind, sizeof ind - 1, &r) == -1);                    // frame runs past the end
+    AicScanCfm sc;
+    static const uint8_t cfm[3] = {1, 0, 17};
+    CHECK(aic_fmac_parse_scan_cfm(cfm, 3, &sc) == 0 && sc.vif_idx == 1 && sc.status == 0 && sc.result_cnt == 17);
+    CHECK(AIC_SCANU_START_REQ >> 10 == 4 && AIC_ME_CHAN_CONFIG_REQ >> 10 == 5 && AIC_MM_SET_COEX_REQ >> 10 == 0);
+}
+
 static void test_real(const char *dir) {
     char path[512];
     snprintf(path, sizeof path, "%s/aic_userconfig_8800d80.txt", dir);
@@ -170,6 +214,7 @@ int main(int argc, char **argv) {
     test_parse();
     test_builders();
     test_cfms();
+    test_phase3();
     int real = 0;
     for (int i = 1; i + 1 < argc; i += 2)
         if (!strcmp(argv[i], "--legacy")) { test_real(argv[i + 1]); real = 1; }

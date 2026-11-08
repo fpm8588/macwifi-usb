@@ -35,7 +35,7 @@ run_tests() {
         real="$real --legacy firmware/aic8800D80-legacy-mcu1"
     # shellcheck disable=SC2086
     "$B/test_fwload" $real
-    $cc "${CFLAGS[@]}" Tests/test_fmac.c "$S/aic_fmac.c" "$S/aic_msg.c" -o "$B/test_fmac"
+    $cc "${CFLAGS[@]}" -I Tests Tests/test_fmac.c "$S/aic_fmac.c" "$S/aic_msg.c" -o "$B/test_fmac"
     if [[ -f firmware/aic8800D80-legacy-mcu1/aic_userconfig_8800d80.txt ]]; then
         "$B/test_fmac" --legacy firmware/aic8800D80-legacy-mcu1
     else
@@ -47,7 +47,7 @@ build_cli() {
     [[ "$(uname)" == "Darwin" ]] || { echo "macwifictl needs macOS (IOKit)"; exit 1; }
     echo "== macwifictl (arm64)"
     clang "${CFLAGS[@]}" -arch arm64 -mmacosx-version-min=$MINOS -Wno-deprecated-declarations \
-        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" \
+        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" \
         -framework IOKit -framework CoreFoundation -o "$B/macwifictl"
     codesign --force --sign - "$B/macwifictl"
     file "$B/macwifictl"

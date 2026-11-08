@@ -29,6 +29,7 @@
 #include "aic_fmac.h"
 #include "aic_fwload.h"
 #include "aic_msg.h"
+#include "ieee80211.h"
 #include "descdump.h"
 
 extern char **environ;
@@ -758,7 +759,7 @@ static int read_text(const char *dir, const char *name, char **buf, size_t *len)
     return *buf ? 0 : -1;
 }
 
-static int bringup(Link *l, const FwOpts *o) {
+static int bringup(Link *l, const FwOpts *o, uint8_t mac_out[6]) {
     uint8_t p[128], r[128];
     uint16_t rl = 0;
 
@@ -837,6 +838,7 @@ static int bringup(Link *l, const FwOpts *o) {
         return 1;
     printf("MAC address: %02x:%02x:%02x:%02x:%02x:%02x%s\n", mac[0], mac[1], mac[2], mac[3], mac[4], mac[5],
            aic_fmac_mac_valid(mac) ? "" : "  (none in efuse; Linux would use a random one)");
+    if (mac_out) memcpy(mac_out, mac, 6);
 
     if (fmac_step("MM_RESET", fmac_call(l, AIC_MM_RESET_REQ, NULL, 0, AIC_MM_RESET_CFM, NULL, 0, NULL, 2000))) return 1;
     AicVersionCfm vc;
@@ -849,7 +851,8 @@ static int bringup(Link *l, const FwOpts *o) {
     return 0;
 }
 
-static int cmd_up(int argc, char **argv) {
+// modeswitch + fwload as needed, then open the Wi-Fi interface and run the bring-up. On success `l` stays open.
+static int up_link(int argc, char **argv, Link *l, uint8_t mac[6]) {
     const AicId *id = NULL;
     io_service_t svc = find_adapter(AIC_MODE_NONE, &id);
     if (!svc) { fprintf(stderr, "No AIC8800 adapter found.\n"); return 3; }
@@ -865,28 +868,217 @@ static int cmd_up(int argc, char **argv) {
         if (rc) return rc;
         usleep(300 * 1000);   // let IOKit finish publishing the new device's interfaces
     } else {
-        printf("Firmware already running (a69c:8d81).\n");
+        printf("Firmware already running (a69c:8d81). If a step fails, unplug and replug the adapter for a clean "
+               "start.\n");
     }
     FwOpts o = {opt(argc, argv, "--fw"), -1};
     const char *pf = opt(argc, argv, "--profile");
     if (pf) o.profile = !strcmp(pf, "legacy") ? AIC_D80_PROFILE_LEGACY_MCU1 : AIC_D80_PROFILE_V5;
-    Link l;
     int rc = 1;
     for (int i = 0; i < 10 && rc; i++) {   // the interface can take a moment to appear after re-enumeration
-        rc = link_open(&l);
+        rc = link_open(l);
         if (rc) usleep(300 * 1000);
     }
     if (rc) return rc;
-    printf("Wi-Fi interface: pipes in %u, out %u, msg %u\n", l.in_pipe, l.out_pipe, l.msg_pipe);
-    rc = bringup(&l, &o);
-    link_close(&l);
+    printf("Wi-Fi interface: pipes in %u, out %u, msg %u\n", l->in_pipe, l->out_pipe, l->msg_pipe);
+    rc = bringup(l, &o, mac);
+    if (rc) link_close(l);
+    return rc;
+}
+
+static int cmd_up(int argc, char **argv) {
+    Link l;
+    uint8_t mac[6];
+    int rc = up_link(argc, argv, &l, mac);
+    if (!rc) link_close(&l);
     printf("%s\n", rc ? "Bring-up stopped. Unplug and replug the adapter to reset it." : "Phase 2b hardware check passed.");
+    return rc;
+}
+
+// ---------------------------------------------------------------- Phase 3a: scan
+
+typedef struct {
+    WifiBss bss;
+    int rssi, freq;
+    int seen;
+} ScanEntry;
+
+typedef struct {
+    ScanEntry e[256];
+    int n, frames, unparsed;
+} ScanList;
+
+static int mhz_to_channel(int mhz) {
+    if (mhz == 2484) return 14;
+    if (mhz >= 2412 && mhz <= 2472) return (mhz - 2407) / 5;
+    if (mhz >= 5000 && mhz <= 5900) return (mhz - 5000) / 5;
+    return 0;
+}
+
+static void scan_add(ScanList *sl, const AicScanResult *r) {
+    sl->frames++;
+    WifiBss b;
+    if (wifi_parse_bss(r->frame, r->frame_len, &b) != 0) { sl->unparsed++; return; }
+    for (int i = 0; i < sl->n; i++) {
+        if (memcmp(sl->e[i].bss.bssid, b.bssid, 6) != 0) continue;
+        sl->e[i].seen++;
+        if (r->rssi > sl->e[i].rssi) sl->e[i].rssi = r->rssi;
+        if (!sl->e[i].bss.ssid_len && b.ssid_len) sl->e[i].bss = b;   // probe response revealing a hidden SSID
+        return;
+    }
+    if (sl->n >= (int)(sizeof sl->e / sizeof sl->e[0])) return;
+    ScanEntry *e = &sl->e[sl->n++];
+    e->bss = b;
+    e->rssi = r->rssi;
+    e->freq = r->center_freq;
+    e->seen = 1;
+}
+
+static int by_rssi(const void *a, const void *b) {
+    return ((const ScanEntry *)b)->rssi - ((const ScanEntry *)a)->rssi;
+}
+
+// Reads messages until `end_id` arrives, handing SCANU_RESULT_IND to the list. Returns 0 and the end message's
+// parameters, or -1 on timeout / USB error.
+static int collect_scan(Link *l, ScanList *sl, uint16_t end_id, uint8_t *params, size_t cap, uint16_t *plen,
+                        int timeout_ms, int *ack_seen) {
+    static uint8_t buf[16384];
+    double t0 = now_s();
+    while ((now_s() - t0) * 1000 < timeout_ms) {
+        UInt32 size = sizeof buf;
+        IOReturn kr = (*l->intf)->ReadPipeTO(l->intf, l->in_pipe, buf, &size, 500, 500);
+        if (kr == kIOUSBTransactionTimeout || kr == kIOReturnTimeout) continue;
+        if (kr != kIOReturnSuccess) {
+            fprintf(stderr, "bulk IN failed: 0x%08x\n", kr);
+            return -1;
+        }
+        hexdump("IN", buf, size);
+        size_t off = 0;
+        AicRxPacket pk;
+        while (aic_rx_next(buf, size, &off, &pk) == 1) {
+            if ((pk.type & 0x7f) == AIC_USB_TYPE_CFG_PRINT) {
+                size_t tl = pk.packet[0] | (pk.packet[1] << 8);
+                const char *t = (const char *)pk.packet + 4;
+                while (tl && (t[tl - 1] == '\n' || t[tl - 1] == '\r' || t[tl - 1] == 0)) tl--;
+                fprintf(stderr, "  [firmware] %.*s\n", (int)tl, t);
+                continue;
+            }
+            if (!pk.is_msg) continue;
+            if (pk.id == AIC_SCANU_RESULT_IND) {
+                AicScanResult r;
+                if (aic_fmac_parse_scan_result(pk.params, pk.param_len, &r) == 0) scan_add(sl, &r);
+                else sl->unparsed++;
+                continue;
+            }
+            if (pk.id == AIC_SCANU_START_CFM_ADDTIONAL) {   // the request's acknowledgement
+                if (ack_seen) *ack_seen = 1;
+                continue;
+            }
+            if (pk.id == end_id) {
+                size_t n = pk.param_len < cap ? pk.param_len : cap;
+                if (params) memcpy(params, pk.params, n);
+                if (plen) *plen = pk.param_len;
+                return 0;
+            }
+            if (gDebug) fprintf(stderr, "(skipping message 0x%04x)\n", pk.id);
+        }
+    }
+    fprintf(stderr, "no end-of-scan message (0x%04x) within %d ms\n", end_id, timeout_ms);
+    return -1;
+}
+
+static int radio_start(Link *l, const uint8_t mac[6], uint8_t *vif) {
+    uint8_t p[512], r[64];
+    uint16_t rl = 0;
+    size_t n = aic_fmac_me_config_params(p);
+    if (fmac_step("ME_CONFIG", fmac_call(l, AIC_ME_CONFIG_REQ, p, (uint16_t)n, AIC_ME_CONFIG_CFM, NULL, 0, NULL, 2000)))
+        return 1;
+    n = aic_fmac_me_chan_config_params(p);
+    if (fmac_step("ME_CHAN_CONFIG", fmac_call(l, AIC_ME_CHAN_CONFIG_REQ, p, (uint16_t)n, AIC_ME_CHAN_CONFIG_CFM, NULL,
+                                              0, NULL, 2000)))
+        return 1;
+    printf("Capabilities and channels set (%d at 2.4 GHz, %d at 5 GHz, world regulatory domain)\n",
+           aic_fmac_channel_count_2g4(), aic_fmac_channel_count_5g());
+    n = aic_fmac_start_params(p);
+    if (fmac_step("MM_START", fmac_call(l, AIC_MM_START_REQ, p, (uint16_t)n, AIC_MM_START_CFM, NULL, 0, NULL, 5000)))
+        return 1;
+    n = aic_fmac_coex_params(p);
+    if (fmac_step("MM_SET_COEX", fmac_call(l, AIC_MM_SET_COEX_REQ, p, (uint16_t)n, AIC_MM_SET_COEX_CFM, NULL, 0,
+                                           NULL, 2000)))
+        return 1;
+    n = aic_fmac_add_if_params(p, mac);
+    uint8_t status = 0xff;
+    if (fmac_step("MM_ADD_IF", fmac_call(l, AIC_MM_ADD_IF_REQ, p, (uint16_t)n, AIC_MM_ADD_IF_CFM, r, sizeof r, &rl,
+                                         2000)) ||
+        aic_fmac_parse_add_if_cfm(r, rl, &status, vif))
+        return 1;
+    if (status != 0) {
+        fprintf(stderr, "MM_ADD_IF refused (status %u).\n", status);
+        return 1;
+    }
+    printf("Radio started; station interface %u\n", *vif);
+    return 0;
+}
+
+static int cmd_scan(int argc, char **argv) {
+    const char *ssid = (argc > 2 && argv[2][0] != '-') ? argv[2] : NULL;
+    Link l;
+    uint8_t mac[6], vif = 0;
+    int rc = up_link(argc, argv, &l, mac);
+    if (rc) return rc;
+    rc = radio_start(&l, mac, &vif);
+    if (!rc) {
+        static ScanList sl;
+        memset(&sl, 0, sizeof sl);
+        uint8_t p[AIC_SZ_SCANU_START_REQ], r[16];
+        uint16_t rl = 0;
+        size_t n = aic_fmac_scan_params(p, vif, ssid);
+        uint8_t cmd[16 + AIC_SZ_SCANU_START_REQ];
+        size_t cl = aic_build_cmd(cmd, sizeof cmd, AIC_SCANU_START_REQ, AIC_SCANU_START_REQ >> 10, p, (uint16_t)n);
+        printf("Scanning %d channels%s%s%s...\n", aic_fmac_channel_count_2g4() + aic_fmac_channel_count_5g(),
+               ssid ? " for \"" : "", ssid ? ssid : "", ssid ? "\"" : "");
+        fflush(stdout);
+        double t0 = now_s();
+        AicScanCfm sc = {0, 0xff, 0};
+        // SCANU_START_CFM_ADDTIONAL acknowledges the request; results follow; SCANU_START_CFM ends the scan.
+        int ack = 0;
+        if (!cl || link_send(&l, cmd, cl) ||
+            collect_scan(&l, &sl, AIC_SCANU_START_CFM, r, sizeof r, &rl, 20000, &ack) ||
+            aic_fmac_parse_scan_cfm(r, rl, &sc)) {
+            if (sl.frames) printf("(%d scan frames arrived before the stop)\n", sl.frames);
+            rc = 1;
+        } else {
+            if (!ack) printf("(note: no SCANU_START_CFM_ADDTIONAL acknowledgement was seen)\n");
+            qsort(sl.e, (size_t)sl.n, sizeof sl.e[0], by_rssi);
+            printf("Scan done in %.1f s: status %u, firmware counted %u results; %d frames, %d networks%s\n\n",
+                   now_s() - t0, sc.status, sc.result_cnt, sl.frames, sl.n, sl.unparsed ? " (some frames unparsed)" : "");
+            printf("  %-32s  %-17s  %4s  %5s  %4s  %-10s %s\n", "SSID", "BSSID", "CH", "BAND", "RSSI", "SECURITY", "PHY");
+            for (int i = 0; i < sl.n; i++) {
+                const ScanEntry *e = &sl.e[i];
+                int ch = e->bss.channel ? e->bss.channel : mhz_to_channel(e->freq);
+                char name[40];
+                if (e->bss.ssid_len) snprintf(name, sizeof name, "%s", e->bss.ssid);
+                else snprintf(name, sizeof name, "(hidden)");
+                printf("  %-32s  %02x:%02x:%02x:%02x:%02x:%02x  %4d  %5s  %4d  %-10s %s%s\n", name, e->bss.bssid[0],
+                       e->bss.bssid[1], e->bss.bssid[2], e->bss.bssid[3], e->bss.bssid[4], e->bss.bssid[5], ch,
+                       e->freq >= 5000 ? "5G" : "2.4G", e->rssi, wifi_security_name(e->bss.security),
+                       e->bss.he ? "ax" : e->bss.vht ? "ac" : e->bss.ht ? "n" : "a/b/g",
+                       e->bss.rsn_pmf_required ? ", PMF required" : "");
+            }
+            if (sl.n == 0) printf("  (nothing found)\n");
+        }
+    }
+    link_close(&l);
+    printf("\n%s\n", rc ? "Scan stopped. Unplug and replug the adapter to reset it, then try again with "
+                          "MACWIFI_DEBUG=1."
+                        : "Phase 3a hardware check: compare this list with your Mac's Wi-Fi menu.");
     return rc;
 }
 
 static void usage(void) {
     fprintf(stderr, "usage: macwifictl list [--all] | modeswitch | info | identify | memr <addr> | memw <addr> <val>\n"
-                    "       fwload [--profile v5|legacy] [--fw DIR] | up [--profile v5|legacy] [--fw DIR]\n"
+                    "       fwload [--profile v5|legacy] [--fw DIR] | up [--profile v5|legacy] [--fw DIR] |\n"
+                    "       scan [SSID] [--profile v5|legacy] [--fw DIR]\n"
                     "Supported: AICsemi AIC8800 family, e.g. UGREEN AX900 (CM762). MACWIFI_DEBUG=1 dumps USB traffic.\n");
 }
 
@@ -900,6 +1092,7 @@ int main(int argc, char **argv) {
     if (!strcmp(c, "identify")) return cmd_identify();
     if (!strcmp(c, "fwload")) return cmd_fwload(argc, argv);
     if (!strcmp(c, "up")) return cmd_up(argc, argv);
+    if (!strcmp(c, "scan")) return cmd_scan(argc, argv);
     if ((!strcmp(c, "memr") && argc > 2) || (!strcmp(c, "memw") && argc > 3)) {
         Link l;
         int rc = link_open(&l);

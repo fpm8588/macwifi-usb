@@ -123,3 +123,9 @@ Phase 2b hardware check passed.
 - The MAC's OUI 6C:1F:F7 is registered to Ugreen Group Limited, i.e. the eFuse MAC is real.
 - 5 GHz supported; LMAC 6.9.1.0; firmware supports 32 stations and 4 virtual interfaces.
 - No `[firmware]` log packets were sent during the bring-up.
+
+## Phase 3a: scan (waiting for a run)
+
+Expected: after the 2b output, "Capabilities and channels set (14 at 2.4 GHz, 25 at 5 GHz...)", "Radio started;
+station interface N", then a table of nearby networks sorted by signal. The firmware's `SCANU_START_CFM` gives a
+result count; every `SCANU_RESULT_IND` carries one beacon or probe response.
