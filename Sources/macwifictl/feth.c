@@ -21,6 +21,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <CoreFoundation/CoreFoundation.h>
+#include <SystemConfiguration/SystemConfiguration.h>
+
 #include "bridge.h"
 
 // bridge_bpf_next (Sources/Shared/bridge.c) walks BPF buffers with these offsets; make sure they hold.
@@ -156,4 +159,140 @@ void feth_ipv4(const Feth *f, char *out, size_t cap) {
         break;
     }
     freeifaddrs(ifa);
+}
+
+// ---------------------------------------------------------------- the network service (SystemConfiguration)
+
+static CFStringRef cfstr(const char *s) { return CFStringCreateWithCString(NULL, s, kCFStringEncodingUTF8); }
+
+static void sc_error(const char *what) { fprintf(stderr, "%s: %s\n", what, SCErrorString(SCError())); }
+
+// Opens and locks the network preferences; returns the current set's path ("/Sets/<id>") in *set.
+static SCPreferencesRef prefs_open(CFStringRef *set) {
+    SCPreferencesRef p = SCPreferencesCreate(NULL, CFSTR("macwifictl"), NULL);
+    if (!p) { sc_error("SCPreferencesCreate"); return NULL; }
+    if (!SCPreferencesLock(p, 1)) { sc_error("SCPreferencesLock"); CFRelease(p); return NULL; }
+    CFTypeRef cur = SCPreferencesGetValue(p, kSCPrefCurrentSet);
+    if (!cur || CFGetTypeID(cur) != CFStringGetTypeID()) {
+        fprintf(stderr, "network preferences have no current set\n");
+        SCPreferencesUnlock(p);
+        CFRelease(p);
+        return NULL;
+    }
+    *set = (CFStringRef)cur;
+    return p;
+}
+
+static int prefs_close(SCPreferencesRef p, int changed) {
+    int rc = 0;
+    if (changed) {
+        if (!SCPreferencesCommitChanges(p)) { sc_error("SCPreferencesCommitChanges"); rc = -1; }
+        else if (!SCPreferencesApplyChanges(p)) { sc_error("SCPreferencesApplyChanges"); rc = -1; }
+    }
+    SCPreferencesUnlock(p);
+    CFRelease(p);
+    return rc;
+}
+
+// Adds or removes our ID in <set>/Network/Global/IPv4 ServiceOrder. Returns 1 if it changed something.
+static int service_order(SCPreferencesRef p, CFStringRef set, CFStringRef id, int add) {
+    CFStringRef path = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@/%@/%@/%@"), set, kSCCompNetwork, kSCCompGlobal,
+                                                kSCEntNetIPv4);
+    CFDictionaryRef g = SCPreferencesPathGetValue(p, path);
+    CFMutableDictionaryRef ng = g ? CFDictionaryCreateMutableCopy(NULL, 0, g)
+                                  : CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks,
+                                                              &kCFTypeDictionaryValueCallBacks);
+    CFArrayRef order = CFDictionaryGetValue(ng, kSCPropNetServiceOrder);
+    CFMutableArrayRef no = (order && CFGetTypeID(order) == CFArrayGetTypeID())
+                               ? CFArrayCreateMutableCopy(NULL, 0, order)
+                               : CFArrayCreateMutable(NULL, 0, &kCFTypeArrayCallBacks);
+    CFIndex i = CFArrayGetFirstIndexOfValue(no, CFRangeMake(0, CFArrayGetCount(no)), id);
+    int changed = 0;
+    if (add && i == kCFNotFound) { CFArrayAppendValue(no, id); changed = 1; }
+    if (!add && i != kCFNotFound) { CFArrayRemoveValueAtIndex(no, i); changed = 1; }
+    if (changed) {
+        CFDictionarySetValue(ng, kSCPropNetServiceOrder, no);
+        if (!SCPreferencesPathSetValue(p, path, ng)) { sc_error("set ServiceOrder"); changed = 0; }
+    }
+    CFRelease(no);
+    CFRelease(ng);
+    CFRelease(path);
+    return changed;
+}
+
+static CFMutableDictionaryRef dict(void) {
+    return CFDictionaryCreateMutable(NULL, 0, &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+}
+
+int feth_service_add(const char *ifname) {
+    CFStringRef set = NULL;
+    SCPreferencesRef p = prefs_open(&set);
+    if (!p) return -1;
+    CFStringRef id = CFSTR(FETH_SERVICE_ID);
+    CFStringRef svc = CFStringCreateWithFormat(NULL, NULL, CFSTR("/%@/%@"), kSCPrefNetworkServices, id);
+    CFStringRef link = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@/%@/%@/%@"), set, kSCCompNetwork, kSCCompService, id);
+    CFStringRef dev = cfstr(ifname);
+
+    CFMutableDictionaryRef intf = dict(), v4 = dict(), v6 = dict(), dns = dict(), top = dict();
+    CFDictionarySetValue(intf, kSCPropNetInterfaceDeviceName, dev);
+    CFDictionarySetValue(intf, kSCPropNetInterfaceHardware, kSCEntNetEthernet);
+    CFDictionarySetValue(intf, kSCPropNetInterfaceType, kSCValNetInterfaceTypeEthernet);
+    CFDictionarySetValue(intf, kSCPropUserDefinedName, CFSTR(FETH_SERVICE_NAME));
+    CFDictionarySetValue(v4, kSCPropNetIPv4ConfigMethod, kSCValNetIPv4ConfigMethodDHCP);
+    CFDictionarySetValue(v6, kSCPropNetIPv6ConfigMethod, kSCValNetIPv6ConfigMethodAutomatic);
+    CFDictionarySetValue(top, kSCEntNetInterface, intf);
+    CFDictionarySetValue(top, kSCEntNetIPv4, v4);
+    CFDictionarySetValue(top, kSCEntNetIPv6, v6);
+    CFDictionarySetValue(top, kSCEntNetDNS, dns);
+    CFDictionarySetValue(top, kSCPropUserDefinedName, CFSTR(FETH_SERVICE_NAME));
+
+    int ok = SCPreferencesPathSetValue(p, svc, top) && SCPreferencesPathSetLink(p, link, svc);
+    if (!ok) sc_error("adding the network service");
+    else service_order(p, set, id, 1);
+    int rc = prefs_close(p, ok);
+
+    CFRelease(top); CFRelease(dns); CFRelease(v6); CFRelease(v4); CFRelease(intf);
+    CFRelease(dev); CFRelease(link); CFRelease(svc);
+    return ok ? rc : -1;
+}
+
+int feth_service_remove(void) {
+    CFStringRef set = NULL;
+    SCPreferencesRef p = prefs_open(&set);
+    if (!p) return -1;
+    CFStringRef id = CFSTR(FETH_SERVICE_ID);
+    CFStringRef svc = CFStringCreateWithFormat(NULL, NULL, CFSTR("/%@/%@"), kSCPrefNetworkServices, id);
+    int changed = 0;
+    // the link may exist in every set (location) if someone switched locations meanwhile
+    CFDictionaryRef sets = SCPreferencesGetValue(p, kSCPrefSets);
+    if (sets && CFGetTypeID(sets) == CFDictionaryGetTypeID()) {
+        CFIndex n = CFDictionaryGetCount(sets);
+        const void **keys = calloc((size_t)(n ? n : 1), sizeof *keys);
+        CFDictionaryGetKeysAndValues(sets, keys, NULL);
+        for (CFIndex i = 0; i < n; i++) {
+            CFStringRef sp = CFStringCreateWithFormat(NULL, NULL, CFSTR("/%@/%@"), kSCPrefSets, keys[i]);
+            CFStringRef link = CFStringCreateWithFormat(NULL, NULL, CFSTR("%@/%@/%@/%@"), sp, kSCCompNetwork,
+                                                        kSCCompService, id);
+            if (SCPreferencesPathGetValue(p, link) && SCPreferencesPathRemoveValue(p, link)) changed = 1;
+            if (service_order(p, sp, id, 0)) changed = 1;
+            CFRelease(link);
+            CFRelease(sp);
+        }
+        free(keys);
+    }
+    if (SCPreferencesPathGetValue(p, svc) && SCPreferencesPathRemoveValue(p, svc)) changed = 1;
+    CFRelease(svc);
+    int rc = prefs_close(p, changed);
+    return rc < 0 ? -1 : changed;
+}
+
+int feth_cleanup(void) {
+    int n = 0, r = feth_service_remove();
+    if (r < 0) return -1;
+    n += r;
+    const char *a[] = {"/sbin/ifconfig", FETH_PEER, "destroy", NULL};
+    const char *b[] = {"/sbin/ifconfig", FETH_NAME, "destroy", NULL};
+    if (if_nametoindex(FETH_PEER) && feth_run(a) == 0) n++;
+    if (if_nametoindex(FETH_NAME) && feth_run(b) == 0) n++;
+    return n;
 }

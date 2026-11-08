@@ -1513,26 +1513,49 @@ static int bridge_run(Conn *c, WpaSupplicant *ws, int seconds) {
         fprintf(stderr, "couldn't start the macOS->air thread\n");
         return 1;
     }
+    // A real network service, so macOS keeps DHCP running across configuration changes; the temporary
+    // `ipconfig set` service is the fallback (macOS drops it at the next change; the watchdog below re-sets it).
     const char *dhcp[] = {"/usr/sbin/ipconfig", "set", FETH_NAME, "DHCP", NULL};
-    if (feth_run(dhcp) != 0) fprintf(stderr, "ipconfig set %s DHCP failed\n", FETH_NAME);
+    int use_ipconfig = 0;
+    if (feth_service_add(FETH_NAME) == 0) {
+        printf("Added the network service \"%s\" for %s (System Settings > Network shows it while this runs).\n",
+               FETH_SERVICE_NAME, FETH_NAME);
+    } else {
+        use_ipconfig = 1;
+        printf("Couldn't add a network service; falling back to a temporary `ipconfig set` service.\n");
+        if (feth_run(dhcp) != 0) fprintf(stderr, "ipconfig set %s DHCP failed\n", FETH_NAME);
+    }
     printf("Bridging: %s is up and macOS is asking for an address by DHCP. Press Ctrl-C to stop.\n", FETH_NAME);
     fflush(stdout);
 
-    double t0 = now_s(), last_status = t0, last_ip_check = 0;
+    double t0 = now_s(), last_status = t0, last_ip_check = 0, last_reset = 0;
     char ip[64] = "";
+    int had_ip = 0, losses = 0;
     pid_t test_pid = 0;
     int rc = 0;
     while (!gStop && !c->disconnected && (seconds <= 0 || now_s() - t0 < seconds)) {
         pump(c, 500, w_pending);
         if (c->pending && handle_wpa_events(c, ws)) { rc = 1; break; }
         double t = now_s();
-        if (!ip[0] && t - last_ip_check >= 1) {
+        if (t - last_ip_check >= 1) {
             last_ip_check = t;
-            feth_ipv4(c->feth, ip, sizeof ip);
-            if (ip[0]) {
-                printf("macOS configured %s: %s (after %.1f s)\n", FETH_NAME, ip, t - t0);
+            char now_ip[64];
+            feth_ipv4(c->feth, now_ip, sizeof now_ip);
+            if (now_ip[0] && strcmp(now_ip, ip) != 0) {
+                printf("macOS configured %s: %s (after %.1f s)\n", FETH_NAME, now_ip, t - t0);
                 fflush(stdout);
-                test_pid = (pid_t)feth_spawn_sh(kSelfTest);
+                if (!had_ip && !test_pid) test_pid = (pid_t)feth_spawn_sh(kSelfTest);
+                had_ip = 1;
+            } else if (!now_ip[0] && ip[0]) {
+                losses++;
+                printf("macOS removed the address from %s after %.1f s%s\n", FETH_NAME, t - t0,
+                       use_ipconfig ? "; asking for DHCP again" : "; it should ask for a new one by itself");
+                fflush(stdout);
+            }
+            snprintf(ip, sizeof ip, "%s", now_ip);
+            if (use_ipconfig && !ip[0] && had_ip && t - last_reset >= 5) {   // temporary service dropped: re-set
+                last_reset = t;
+                feth_run(dhcp);
             }
         }
         if (test_pid && waitpid(test_pid, NULL, WNOHANG) == test_pid) {
@@ -1542,8 +1565,9 @@ static int bridge_run(Conn *c, WpaSupplicant *ws, int seconds) {
         }
         if (t - last_status >= 30) {
             last_status = t;
-            printf("  [%4.0f s] air->Mac %lu frames (%.1f MB), Mac->air %lu frames (%.1f MB)\n", t - t0, c->to_host,
-                   c->to_host_bytes / 1e6, c->from_host, c->from_host_bytes / 1e6);
+            printf("  [%4.0f s] %s %s; air->Mac %lu frames (%.1f MB), Mac->air %lu frames (%.1f MB)\n", t - t0,
+                   FETH_NAME, ip[0] ? ip : "has no IPv4 address", c->to_host, c->to_host_bytes / 1e6,
+                   (unsigned long)c->from_host, c->from_host_bytes / 1e6);
             fflush(stdout);
         }
     }
@@ -1551,15 +1575,21 @@ static int bridge_run(Conn *c, WpaSupplicant *ws, int seconds) {
         printf("The access point disconnected us: reason %u (%s).\n", c->disc_reason, reason_text(c->disc_reason));
         rc = 1;
     }
-    if (!ip[0] && rc == 0) rc = 1;
+    if (!had_ip && rc == 0) rc = 1;
     c->bridging = 0;
     pthread_join(th, NULL);
     if (test_pid) { kill(test_pid, SIGTERM); waitpid(test_pid, NULL, 0); }
-    const char *none[] = {"/usr/sbin/ipconfig", "set", FETH_NAME, "NONE", NULL};
-    feth_run(none);
+    if (use_ipconfig) {
+        const char *none[] = {"/usr/sbin/ipconfig", "set", FETH_NAME, "NONE", NULL};
+        feth_run(none);
+    } else if (feth_service_remove() < 0) {
+        fprintf(stderr, "Couldn't remove the network service; run `sudo build/macwifictl cleanup`.\n");
+    }
+    if (losses) printf("  macOS removed the address %d time(s) while bridging\n", losses);
     double el = now_s() - t0;
     printf("Bridged for %.0f s: air->Mac %lu frames (%.1f MB), Mac->air %lu frames (%.1f MB)%s\n", el, c->to_host,
-           c->to_host_bytes / 1e6, c->from_host, c->from_host_bytes / 1e6, c->host_write_err ? " (some writes failed)" : "");
+           c->to_host_bytes / 1e6, (unsigned long)c->from_host, c->from_host_bytes / 1e6,
+           c->host_write_err ? " (some writes failed)" : "");
     for (int v = 1; v < BRIDGE_DROP_COUNT; v++) {
         if (c->drop_to[v]) printf("  dropped on the way to macOS (%s): %lu\n", bridge_verdict_name((BridgeVerdict)v), c->drop_to[v]);
         if (c->drop_from[v]) printf("  dropped on the way from macOS (%s): %lu\n", bridge_verdict_name((BridgeVerdict)v), c->drop_from[v]);
@@ -1586,6 +1616,7 @@ static int cmd_join(int argc, char **argv) {
     rc = radio_start(&l, mac, &vif);
     if (!rc) {
         static Feth f;
+        if (feth_service_remove() == 1) printf("Removed a network service left over from an earlier run.\n");
         if (feth_open(&f, mac)) {
             rc = 1;
         } else {
@@ -1787,7 +1818,7 @@ static void usage(void) {
                     "       fwload [--profile v5|legacy] [--fw DIR] | up [--profile v5|legacy] [--fw DIR] |\n"
                     "       scan [SSID] [--profile v5|legacy] [--fw DIR] |\n"
                     "       connect SSID [--seconds N] [--profile v5|legacy] [--fw DIR] |\n"
-                    "       join SSID [--seconds N] [--profile v5|legacy] [--fw DIR]   (with sudo)\n"
+                    "       join SSID [--seconds N] [--profile v5|legacy] [--fw DIR] | cleanup   (both with sudo)\n"
                     "Supported: AICsemi AIC8800 family, e.g. UGREEN AX900 (CM762). MACWIFI_DEBUG=1 dumps USB traffic.\n");
 }
 
@@ -1804,6 +1835,13 @@ int main(int argc, char **argv) {
     if (!strcmp(c, "scan")) return cmd_scan(argc, argv);
     if (!strcmp(c, "connect")) return cmd_connect(argc, argv);
     if (!strcmp(c, "join")) return cmd_join(argc, argv);
+    if (!strcmp(c, "cleanup")) {
+        if (geteuid() != 0) { fprintf(stderr, "cleanup changes network settings: run it with sudo.\n"); return 2; }
+        int n = feth_cleanup();
+        printf("%s\n", n < 0 ? "Couldn't change the network settings." : n ? "Removed what join had left behind."
+                                                                           : "Nothing to clean up.");
+        return n < 0 ? 1 : 0;
+    }
     if ((!strcmp(c, "memr") && argc > 2) || (!strcmp(c, "memw") && argc > 3)) {
         Link l;
         int rc = link_open(&l);

@@ -186,3 +186,37 @@ What the hardware confirmed:
 - 4 frames were "not convertible" and 1 had another ethertype; to look at in Phase 4 with `MACWIFI_DEBUG=1`
   (likely 802.11 MPDUs the firmware forwards to the host, `is_80211_mpdu`, or a vendor ethertype from the router).
 - 4 frames sent = EAPOL 2 + EAPOL 4 + two DHCPDISCOVERs (the offer took more than 4 s, so the retry went out).
+
+## 2026-11-07: Phase 4, attempt 1 (`join` with `ipconfig set`): bridge works, macOS dropped the temporary service
+
+Commit `f0be36f`. The Mac's primary connection was a USB Ethernet adapter on the same network. Addresses, MACs and
+the network name are deliberately not recorded here.
+
+```
+Created feth4100 for macOS (MAC <adapter>; peer feth9100 for raw I/O)
+Connected: WPA2-PSK handshake done in 0.01 s, keys installed, port open.
+Bridging: feth4100 is up and macOS is asking for an address by DHCP. Press Ctrl-C to stop.
+macOS configured feth4100: <private address> (after 6.5 s)
+  [self-test] router <gateway>, DNS server from DHCP <gateway>
+  [self-test] ping router:  3 packets transmitted, 3 packets received, 0.0% packet loss
+  [self-test] ping 1.1.1.1: 3 packets transmitted, 3 packets received, 0.0% packet loss
+  [self-test] default route now uses: en7
+  [self-test] resolvers mentioning feth4100: 1
+      en7 : flags 0x5 (IPv4,DNS)  /  feth4100 : flags 0x5 (IPv4,DNS)
+  [  30 s] air->Mac 130 frames (0.0 MB), Mac->air 42 frames (0.0 MB)
+  ...
+  [ 243 s] air->Mac 1022 frames (0.3 MB), Mac->air 42 frames (0.0 MB)
+```
+
+- The data path works both ways through the feth pair: macOS's own DHCP client got a lease through the bridge,
+  and pings bound to feth4100 reached the router and the internet with 0 % loss. BPF read + AF_NDRV write on the
+  peer behave as documented; nothing echoed back caused an address conflict.
+- macOS then took the address away. configd's log (IPConfiguration):
+  `DHCP feth4100: BOUND` ... `publish success { IPv4, DNS, DHCP }`, then 13 s later `DHCP feth4100: stop`,
+  `RELEASE`, `removed IP address`, `status = 'media inactive'`, `INACTIVE`, and
+  `EAPOLController: feth4100 is no longer configured`. From then on macOS sent nothing (Mac->air stuck at 42),
+  and with the Ethernet unplugged there was no default route and no DNS server (`route: not in table`,
+  `ping: cannot resolve apple.com`, networkQuality "offline").
+- Cause: `ipconfig set` creates a temporary service that, per ipconfig(8), lasts only until the next network
+  configuration change. Fix in the next commit: a persistent network service for feth4100 in the network
+  preferences, removed on exit.

@@ -393,6 +393,10 @@ int feth_run(const char *const argv[]) {
     return 0;
 }
 int feth_spawn_sh(const char *script) { (void)script; return 0; }
+static int gSvcAdded, gSvcRemoved;
+int feth_service_add(const char *ifname) { (void)ifname; gSvcAdded++; return 0; }
+int feth_service_remove(void) { gSvcRemoved++; return 0; }
+int feth_cleanup(void) { return 0; }
 
 static IOUSBInterfaceInterface300 gVt;
 static IOUSBInterfaceInterface300 *gVtp = &gVt;
@@ -475,7 +479,8 @@ int main(void) {
     rc = sim_run_feth("ExampleNet", 2, &fe);
     CHECK(rc == 0);
     CHECK(S.ptk_ok && S.gtk_ok && S.port_open && !S.ptk_before_msg4);
-    CHECK(H.dhcp_set == 1 && H.none_set == 1);
+    CHECK(gSvcAdded == 1 && gSvcRemoved == 1);              // the network service, not `ipconfig set`
+    CHECK(H.dhcp_set == 0 && H.none_set == 0);
     CHECK(S.dhcp_seen == 1 && S.dhcp_sta_ok && S.data_bad == 0);   // only macOS's DISCOVER went out
     CHECK(H.offer_to_host == 1 && H.arp_to_host == 1);
     CHECK(H.echo_to_host == 0 && H.plain_to_host == 0 && H.eapol_to_host == 0);

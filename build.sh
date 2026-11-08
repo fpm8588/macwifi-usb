@@ -66,7 +66,7 @@ build_cli() {
     echo "== macwifictl (arm64)"
     clang "${CFLAGS[@]}" -arch arm64 -mmacosx-version-min=$MINOS -Wno-deprecated-declarations \
         -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c Sources/macwifictl/feth.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" \
-        -framework IOKit -framework CoreFoundation -o "$B/macwifictl"
+        -framework IOKit -framework CoreFoundation -framework SystemConfiguration -o "$B/macwifictl"
     codesign --force --sign - "$B/macwifictl"
     file "$B/macwifictl"
 }

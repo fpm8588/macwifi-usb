@@ -184,7 +184,13 @@ for the adapter test.
    either way (the supplicant owns it), frames from macOS with another source address or over 1518 bytes,
    unencrypted frames once keys are installed, unicast for other addresses, and **our own broadcasts reflected by
    the AP** (otherwise macOS sees its own ARP/ND and reports address conflicts). Group rekeys keep working.
-3. `ipconfig set feth4100 DHCP`, then a self-test bound to `feth4100` (ping router and 1.1.1.1 with `ping -b`,
+3. A persistent network service for feth4100 (SystemConfiguration preferences: `/NetworkServices/<fixed id>`
+   with Interface {DeviceName feth4100, Ethernet}, IPv4 DHCP, IPv6 Automatic, linked into the current set and
+   appended to its ServiceOrder; removed on exit, at the next `join`, or by `macwifictl cleanup`). Attempt 1 used
+   `ipconfig set feth4100 DHCP`: macOS bound a lease, then stopped the temporary service 13 s later at a network
+   configuration change ("DHCP feth4100: stop / RELEASE", "EAPOLController: feth4100 is no longer configured");
+   ipconfig(8) says such services only last until the next change. `ipconfig set` stays as the fallback, re-set
+   by a watchdog. Then a self-test bound to `feth4100` (ping router and 1.1.1.1 with `ping -b`,
    default-route interface, resolvers mentioning feth4100, `scutil --nwi` order); `ipconfig set feth4100 NONE`
    and interface removal on exit (Ctrl-C, SIGTERM, SIGHUP). The open question stays: does the `ipconfig`
    (temporary) service get DNS and become primary when the built-in Wi-Fi is off? If not: register a proper

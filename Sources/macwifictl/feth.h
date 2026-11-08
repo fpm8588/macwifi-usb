@@ -32,6 +32,20 @@ int feth_write(Feth *f, const uint8_t *eth, size_t len);
 void feth_close(Feth *f);
 // The interface's IPv4 address as text, or "" if it has none yet.
 void feth_ipv4(const Feth *f, char *out, size_t cap);
+// A persistent network service for `name` in macOS's network preferences (like the one macOS creates for a USB
+// Ethernet adapter): IPv4 by DHCP, IPv6 automatic, placed last in the service order. `ipconfig set` only makes
+// a temporary service that macOS drops at the next network configuration change (ipconfig(8)), which is
+// exactly what happens when the Mac's own Wi-Fi or Ethernet goes away. Fixed service ID so leftovers can be
+// found and removed. Return 0, or -1 with a message printed.
+#define FETH_SERVICE_ID "6D616377-6966-6900-0000-00000F004100"
+#define FETH_SERVICE_NAME "UGREEN USB Wi-Fi (macwifi)"
+int feth_service_add(const char *ifname);
+int feth_service_remove(void);   // also succeeds when there is nothing to remove; returns 1 if it removed one
+
+// Removes our network service and our two interfaces if they exist (after a crash). Returns the number of
+// things removed, or -1 if the preferences couldn't be changed.
+int feth_cleanup(void);
+
 // Runs a program and waits; returns its exit status (or -1).
 int feth_run(const char *const argv[]);
 // Starts `/bin/sh -c script` without waiting; returns its pid, or 0 if it couldn't start.
