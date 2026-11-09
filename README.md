@@ -25,6 +25,8 @@ uses it like any other connection.
 
 - WPA2-Personal (including the WPA2 side of WPA2/WPA3 "transition" networks) and open networks, 2.4 and 5 GHz,
   802.11n/ac/ax access points
+- Captive portals (hotel, café, airport "sign in to continue" pages): detected over the adapter, and the menu
+  opens the sign-in page, like macOS does for its own Wi-Fi
 - A menu bar app: networks with signal strength, lock and band; join; disconnect; forget; Wi-Fi on/off
 - Remembered networks, joined automatically when the adapter is plugged in, after a drop, and after sleep
 - Sleep and wake: the Mac sleeps normally; MacWifi disconnects cleanly first and reconnects after waking

@@ -19,12 +19,15 @@ Try it: `macwifictl ctl '{"cmd":"status"}'`.
 ```
 ```json
 {"ok":true,"state":"connected","adapter":true,"power":true,"ssid":"Home","rssi":-44,"freq":5745,
- "ip":"192.168.1.20","error":"","version":"0.6.0"}
+ "ip":"192.168.1.20","captive":"no","error":"","version":"0.6.0"}
 ```
 
 `state` is one of `off`, `no_adapter`, `starting`, `idle`, `scanning`, `connecting`, `connected`, `asleep`,
 `error`. `ssid`, `rssi` (dBm), `freq` (MHz) and `ip` (macOS's IPv4 address on `feth4100`, empty until DHCP
-finishes) are present while connecting or connected. `error` is the last problem, or empty.
+finishes) are present while connecting or connected, with `captive`: `"unknown"` until the check has run,
+`"no"`, or `"yes"` plus `portal` (where to sign in: the network's redirect target, else the check page). The
+check fetches `http://captive.apple.com/hotspot-detect.html` over the adapter only, right after macOS gets an
+address, then every 15 s while a portal is in the way and every 5 minutes otherwise. `error` is the last problem, or empty.
 
 ### scan / networks
 

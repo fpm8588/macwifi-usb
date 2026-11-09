@@ -61,6 +61,13 @@ that the network offers WPA2 (a WPA3-only network is shown greyed out).
   built-in Wi-Fi off, or change System Settings → Network → ⋯ → Set Service Order.
 - A VPN or firewall that only allows known interfaces may block `feth4100`.
 
+## A hotel/café network shows "sign-in needed" but the page doesn't load
+
+The sign-in window uses macOS's normal routing, so while wired Ethernet or the Mac's own Wi-Fi is connected the
+page may be fetched over those instead. Unplug Ethernet or turn the built-in Wi-Fi off for a moment, then click
+**Sign In…** again. The menu clears the notice by itself once the network lets you through (it re-checks every
+15 s).
+
 ## It disconnects now and then
 
 Look for "the network dropped us: reason N" in the log. Reason 34 means the access point thought we weren't

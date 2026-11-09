@@ -83,6 +83,8 @@ typedef struct {
     uint8_t ssid_len;
     int rssi, freq;
     char ip[64], error[200];
+    int captive;              // CaptiveState of the current connection
+    char portal[512];
     NetView nets[48];
     int nnets;
     double scan_time;
@@ -185,6 +187,8 @@ static void reply_status(Daemon *d, JsonOut *j) {
         jo_int(j, "rssi", d->rssi);
         jo_int(j, "freq", d->freq);
         jo_str(j, "ip", d->ip);
+        jo_str(j, "captive", d->captive == CAPTIVE_PORTAL ? "yes" : d->captive == CAPTIVE_NONE ? "no" : "unknown");
+        if (d->captive == CAPTIVE_PORTAL) jo_str(j, "portal", d->portal);
     }
     jo_str(j, "error", d->error);
     jo_str(j, "version", MW_VERSION);
@@ -450,6 +454,50 @@ static void d_publish_scan(Daemon *d, const ScanList *sl) {
     pthread_mutex_unlock(&d->mu);
 }
 
+// ---------------------------------------------------------------- captive portal checks (own thread each)
+// Started once macOS has an address; repeated every gCaptiveRecheck seconds while a portal is in the way (so the
+// menu notices when sign-in is done) and every 5 minutes otherwise. A result from an earlier connection is
+// ignored (generation counter).
+static double gCaptiveRecheck = 15;
+static atomic_int gCaptiveBusy;
+static atomic_uint gConnGen;
+typedef struct { Daemon *d; unsigned gen; } ProbeArg;
+static void *captive_thread(void *arg) {
+    ProbeArg *p = (ProbeArg *)arg;
+    char url[512];
+    int r = feth_captive_probe(FETH_NAME, url, sizeof url);
+    pthread_mutex_lock(&p->d->mu);
+    if (p->gen == gConnGen && r != CAPTIVE_UNKNOWN) {
+        if (r != p->d->captive)
+            printf("[macwifid] captive portal: %s\n", r == CAPTIVE_PORTAL ? "yes, sign-in needed" : "none");
+        p->d->captive = r;
+        snprintf(p->d->portal, sizeof p->d->portal, "%s", url);
+    }
+    pthread_mutex_unlock(&p->d->mu);
+    gCaptiveBusy = 0;
+    free(p);
+    return NULL;
+}
+
+static void captive_maybe_probe(Daemon *d, int have_ip, double *next) {
+    static unsigned probed_gen = ~0u;
+    if (!have_ip || gCaptiveBusy) return;
+    if (gConnGen != probed_gen) { probed_gen = gConnGen; *next = 0; }   // new connection: check right away
+    if (now_s() < *next) return;
+    pthread_mutex_lock(&d->mu);
+    int settled = d->captive == CAPTIVE_NONE;
+    pthread_mutex_unlock(&d->mu);
+    *next = now_s() + (settled ? 300 : gCaptiveRecheck);
+    ProbeArg *p = malloc(sizeof *p);
+    pthread_t t;
+    if (!p) return;
+    p->d = d;
+    p->gen = gConnGen;
+    gCaptiveBusy = 1;
+    if (pthread_create(&t, NULL, captive_thread, p) != 0) { gCaptiveBusy = 0; free(p); return; }
+    pthread_detach(t);
+}
+
 typedef struct {
     Link l;
     Conn c;
@@ -473,6 +521,8 @@ static void d_disconnect(Daemon *d, Adapter *a) {
     pthread_mutex_lock(&d->mu);
     d->ssid_len = 0;
     d->ip[0] = 0;
+    d->captive = CAPTIVE_UNKNOWN;
+    gConnGen++;
     pthread_mutex_unlock(&d->mu);
 }
 
@@ -569,6 +619,10 @@ static int d_join(Daemon *d, Adapter *a, const uint8_t *ssid, size_t ssid_len, c
         return -1;
     }
     a->connected = 1;
+    pthread_mutex_lock(&d->mu);
+    d->captive = CAPTIVE_UNKNOWN;
+    gConnGen++;
+    pthread_mutex_unlock(&d->mu);
     d_set_state(d, DS_CONNECTED);
     d_set_error(d, "");
     return 0;
@@ -698,7 +752,7 @@ static int daemon_main(const DaemonHooks *hooks) {
 
     Adapter *a = &gA;
     memset(a, 0, sizeof *a);
-    double next_try = 0, next_autojoin = 0, autojoin_backoff = 5, next_log_check = 0;
+    double next_try = 0, next_autojoin = 0, autojoin_backoff = 5, next_log_check = 0, next_captive = 0;
     int manual_off = 0, sleeping = 0, quick_retries = 0;
     d->state = d->power ? DS_NO_ADAPTER : DS_OFF;
     while (!gStop) {
@@ -809,6 +863,7 @@ static int daemon_main(const DaemonHooks *hooks) {
             d->ip[sizeof d->ip - 1] = 0;
             if (a->c.last_rssi) d->rssi = a->c.last_rssi;
             pthread_mutex_unlock(&d->mu);
+            captive_maybe_probe(d, a->c.br.ip[0] != 0, &next_captive);
             if (a->c.disconnected) {
                 char e[160];
                 snprintf(e, sizeof e, "the network dropped us: reason %u (%s)", a->c.disc_reason, reason_text(a->c.disc_reason));

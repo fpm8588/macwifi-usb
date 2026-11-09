@@ -62,6 +62,7 @@ This is the map for anyone reading or changing the code. The research behind the
 | `Sources/Shared/rxq.[ch]` | Thread-safe queue of USB IN transfers | MIT |
 | `Sources/Shared/bridge.[ch]` | BPF record walking, forwarding rules | MIT |
 | `Sources/Shared/dhcp.[ch]` | DHCPDISCOVER/OFFER (the `connect` probe) | MIT |
+| `Sources/Shared/captive.[ch]` | Captive portal check: request, response classification | MIT |
 | `Sources/Shared/json.[ch]`, `knownnet.[ch]` | Control-socket JSON, remembered networks | MIT |
 | `Sources/macwifictl/main.c` | USB transport, CLI commands, the connect/bridge steps | GPL-2.0 |
 | `Sources/macwifictl/daemon.c` | `macwifid` (included by main.c) | GPL-2.0 |

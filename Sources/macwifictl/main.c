@@ -36,6 +36,7 @@
 #include "aic_data.h"
 #include "aic_msg.h"
 #include "bridge.h"
+#include "captive.h"
 #include "dhcp.h"
 #include "eapol.h"
 #include "ieee80211.h"

@@ -13,6 +13,8 @@ The first release meant for other people: install a package, pick a network from
 - Remembered networks are stored as WPA2 keys (PMKs) in a root-only file, never as passwords.
 - 5 GHz is preferred over 2.4 GHz unless it's clearly weaker.
 - Open (password-less) networks.
+- Captive portals: after connecting, the service checks `captive.apple.com` over the adapter; when a sign-in page
+  is in the way the menu says so and opens it in a sign-in window, and closes it once you're through.
 - Installer package (the release package downloads the firmware at install time and checks its SHA-256) and an
   uninstaller; `report.sh` prints a diagnostics report with MAC/IP addresses and network names masked;
   `macwifictl --version`, `status`, `networks`.

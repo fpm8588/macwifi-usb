@@ -24,7 +24,11 @@
 #include <CoreFoundation/CoreFoundation.h>
 #include <SystemConfiguration/SystemConfiguration.h>
 
+#include <netdb.h>
+#include <poll.h>
+
 #include "bridge.h"
+#include "captive.h"
 
 // bridge_bpf_next (Sources/Shared/bridge.c) walks BPF buffers with these offsets; make sure they hold.
 _Static_assert(offsetof(struct bpf_hdr, bh_caplen) == 8, "bpf_hdr.bh_caplen offset");
@@ -295,4 +299,45 @@ int feth_cleanup(void) {
     if (if_nametoindex(FETH_PEER) && feth_run(a) == 0) n++;
     if (if_nametoindex(FETH_NAME) && feth_run(b) == 0) n++;
     return n;
+}
+
+// ---------------------------------------------------------------- captive portal check
+
+int feth_captive_probe(const char *ifname, char *url, size_t cap) {
+    snprintf(url, cap, "%s", CAPTIVE_URL);
+    unsigned idx = if_nametoindex(ifname);
+    if (!idx) return CAPTIVE_UNKNOWN;
+    struct addrinfo hints, *ai = NULL;
+    memset(&hints, 0, sizeof hints);
+    hints.ai_family = AF_INET;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(CAPTIVE_HOST, "80", &hints, &ai) != 0 || !ai) return CAPTIVE_UNKNOWN;
+    int rc = CAPTIVE_UNKNOWN;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd >= 0 && setsockopt(fd, IPPROTO_IP, IP_BOUND_IF, &idx, sizeof idx) == 0) {
+        struct timeval tv = {5, 0};
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof tv);
+        int fl = fcntl(fd, F_GETFL, 0);
+        fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+        int c = connect(fd, ai->ai_addr, ai->ai_addrlen);
+        if (c != 0 && errno == EINPROGRESS) {
+            struct pollfd pf = {fd, POLLOUT, 0};
+            int err = 0;
+            socklen_t el = sizeof err;
+            c = (poll(&pf, 1, 5000) == 1 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &el) == 0 && !err) ? 0 : -1;
+        }
+        fcntl(fd, F_SETFL, fl);
+        char req[256], resp[8192];
+        size_t rl = captive_request(req, sizeof req), got = 0;
+        if (c == 0 && rl && write(fd, req, rl) == (ssize_t)rl) {
+            ssize_t n;
+            while (got < sizeof resp - 1 && (n = read(fd, resp + got, sizeof resp - 1 - got)) > 0) got += (size_t)n;
+            resp[got] = 0;
+            rc = captive_classify(resp, got, url, cap);
+        }
+    }
+    if (fd >= 0) close(fd);
+    freeaddrinfo(ai);
+    return rc;
 }

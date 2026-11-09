@@ -6,6 +6,7 @@
 
 import AppKit
 import SwiftUI
+import WebKit
 
 // MARK: - Protocol
 
@@ -31,6 +32,8 @@ struct StatusReply: Decodable {
     let ip: String?
     let error: String?
     let version: String?
+    let captive: String?   // "yes" (sign-in page in the way), "no", "unknown"
+    let portal: String?
 }
 
 struct NetworksReply: Decodable {
@@ -107,6 +110,7 @@ final class Model: ObservableObject {
     @Published var joining: String?
 
     private var timer: Timer?
+    private var portalShownFor: String?    // open the sign-in window by itself once per connection
     private let queue = DispatchQueue(label: "macwifi.requests", qos: .userInitiated)
 
     init() {
@@ -150,6 +154,7 @@ final class Model: ObservableObject {
         case "connecting": return "Connecting to \(status?.ssid ?? "…")…"
         case "connected":
             let ip = status?.ip ?? ""
+            if status?.captive == "yes" { return "Connected · sign-in needed" }
             return ip.isEmpty ? "Connected, getting an address…" : "Connected · \(ip)"
         case "asleep": return "Paused while the Mac sleeps."
         case "error": return status?.error?.isEmpty == false ? status!.error! : "The adapter needs attention."
@@ -165,7 +170,29 @@ final class Model: ObservableObject {
             DispatchQueue.main.async {
                 self.daemonRunning = reply != nil
                 self.status = reply
+                self.updatePortal()
             }
+        }
+    }
+
+    var needsSignIn: Bool { state == "connected" && status?.captive == "yes" }
+
+    func openPortal() {
+        let url = URL(string: status?.portal ?? "") ?? URL(string: "http://captive.apple.com/hotspot-detect.html")!
+        PortalWindow.open(url, title: "Sign in to “\(status?.ssid ?? "network")”")
+    }
+
+    // Like macOS's own captive network assistant: show the page when a portal appears, close it when it's gone.
+    private func updatePortal() {
+        if needsSignIn {
+            let key = status?.ssid ?? ""
+            if portalShownFor != key {
+                portalShownFor = key
+                openPortal()
+            }
+        } else {
+            if state != "connected" { portalShownFor = nil }
+            if status?.captive == "no" { PortalWindow.close() }
         }
     }
 
@@ -254,6 +281,41 @@ final class Model: ObservableObject {
     }
 }
 
+// MARK: - Sign-in window for captive portals
+
+final class PortalWindow: NSObject, NSWindowDelegate {
+    private static var shared: PortalWindow?
+    private let window: NSWindow
+    private let web: WKWebView
+
+    private init(url: URL, title: String) {
+        let frame = NSRect(x: 0, y: 0, width: 900, height: 700)
+        web = WKWebView(frame: frame, configuration: WKWebViewConfiguration())
+        window = NSWindow(contentRect: frame, styleMask: [.titled, .closable, .resizable, .miniaturizable],
+                          backing: .buffered, defer: false)
+        super.init()
+        window.title = title
+        window.contentView = web
+        window.isReleasedWhenClosed = false
+        window.delegate = self
+        window.center()
+        web.load(URLRequest(url: url))
+    }
+
+    static func open(_ url: URL, title: String) {
+        if shared == nil { shared = PortalWindow(url: url, title: title) }
+        shared?.window.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    static func close() {
+        shared?.window.close()
+        shared = nil
+    }
+
+    func windowWillClose(_ notification: Notification) { PortalWindow.shared = nil }
+}
+
 // MARK: - Views
 
 struct NetworkRow: View {
@@ -320,6 +382,22 @@ struct MenuView: View {
                     Spacer()
                     Button("Disconnect") { model.disconnect() }
                 }
+            }
+            if model.needsSignIn {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Image(systemName: "person.badge.key")
+                        Text("This network wants you to sign in.").font(.callout)
+                        Spacer()
+                        Button("Sign In…") { model.openPortal() }
+                    }
+                    Text("If the page doesn't load, unplug Ethernet or turn off the Mac's own Wi-Fi for a moment.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.15)))
             }
             Divider()
             HStack {

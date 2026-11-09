@@ -10,7 +10,7 @@ Files written from scratch for this project are **additionally** available under
 `Sources/Shared/aic8800.h`, `Sources/Shared/aic_msg.[ch]`, `Sources/Shared/ieee80211.[ch]`,
 `Sources/Shared/wpa.[ch]`, `Sources/Shared/crypto_backend.c`, `Sources/Shared/eapol.[ch]` (the WPA2-PSK
 supplicant), `Sources/Shared/dhcp.[ch]`, `Sources/Shared/bridge.[ch]`, `Sources/Shared/json.[ch]`, `Sources/Shared/knownnet.[ch]`,
-`Sources/Shared/rxq.[ch]`, `Sources/Shared/reorder.[ch]`, `Sources/macwifictl/rx_async.[ch]`,
+`Sources/Shared/rxq.[ch]`, `Sources/Shared/reorder.[ch]`, `Sources/Shared/captive.[ch]`, `Sources/macwifictl/rx_async.[ch]`,
 `Sources/macwifictl/power.[ch]`, `App/*` (the menu bar app), `packaging/*`, `Sources/macwifictl/descdump.[ch]`,
 `Sources/macwifictl/feth.[ch]` (the feth arrangement follows facts documented in ZeroTier's
 `osdep/MacEthernetTapAgent.c`, MPL-2.0; no code was taken from it), `Sources/macwifictl/main.c` (except

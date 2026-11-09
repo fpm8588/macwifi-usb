@@ -46,6 +46,10 @@ int feth_service_remove(void);   // also succeeds when there is nothing to remov
 // things removed, or -1 if the preferences couldn't be changed.
 int feth_cleanup(void);
 
+// Captive portal check over `ifname` only (IP_BOUND_IF): fetches the captive.apple.com page with 5 s timeouts.
+// Returns a CaptiveState (captive.h); for a portal, `url` gets where to sign in.
+int feth_captive_probe(const char *ifname, char *url, size_t cap);
+
 // Runs a program and waits; returns its exit status (or -1).
 int feth_run(const char *const argv[]);
 // Starts `/bin/sh -c script` without waiting; returns its pid, or 0 if it couldn't start.

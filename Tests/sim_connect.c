@@ -497,6 +497,13 @@ static atomic_int gSvcAdded, gSvcRemoved;
 int feth_service_add(const char *ifname) { (void)ifname; gSvcAdded++; return 0; }
 int feth_service_remove(void) { gSvcRemoved++; return 0; }
 int feth_cleanup(void) { return 0; }
+static atomic_int gSimCaptive = CAPTIVE_NONE, gProbes;
+int feth_captive_probe(const char *ifname, char *url, size_t cap) {
+    (void)ifname;
+    gProbes++;
+    snprintf(url, cap, "%s", gSimCaptive == CAPTIVE_PORTAL ? "https://portal.example.net/login" : CAPTIVE_URL);
+    return gSimCaptive;
+}
 
 static int S_get(const int *field) {
     pthread_mutex_lock(&wlock);
@@ -610,6 +617,7 @@ static void test_daemon(void) {
           strstr(r, "\"ok\":true"));
     CHECK(wait_for("\"ip\":\"192.0.2.77\"", 5));
     CHECK(wait_for("\"state\":\"connected\",\"adapter\":true,\"power\":true,\"ssid\":\"ExampleNet\"", 1));
+    CHECK(wait_for("\"captive\":\"no\"", 3));
     CHECK(gSvcAdded >= 1 && gFethOpen == 1);
     CHECK(ask("{\"cmd\":\"known\"}", r, sizeof r) == 0 && strstr(r, "{\"ssid\":\"ExampleNet\",\"secured\":true}"));
     char path[128];
@@ -624,6 +632,15 @@ static void test_daemon(void) {
     // a scan while connected that only reports our own AP keeps the neighbour listed (merged, aged list)
     CHECK(ask("{\"cmd\":\"scan\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":true") && strstr(r, "\"ssid\":\"Neighbor\"") &&
           strstr(r, "\"ssid\":\"ExampleNet\""));
+
+    // captive portal: after a (re)connection the check finds one and reports where to sign in; once signed in
+    // the re-check (every gCaptiveRecheck s while a portal is in the way) clears it
+    gCaptiveRecheck = 0.5;
+    gSimCaptive = CAPTIVE_PORTAL;
+    CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":true"));
+    CHECK(wait_for("\"captive\":\"yes\",\"portal\":\"https://portal.example.net/login\"", 5));
+    gSimCaptive = CAPTIVE_NONE;
+    CHECK(wait_for("\"captive\":\"no\"", 5));
 
     // the AP drops us: macwifid rejoins the remembered network by itself
     int before = S_get(&S.connects);
