@@ -62,6 +62,8 @@ struct BtReply: Decodable {
     let controller: String?
     let error: String?
     let devices: [BtDevice]?
+    let last_classic: Int?
+    let last_le: Int?
 }
 
 struct SimpleReply: Decodable {
@@ -223,7 +225,11 @@ final class Model: ObservableObject {
         if bt.power != true { return "Bluetooth is off." }
         if bt.up == true {
             let what = bt.controller?.isEmpty == false ? bt.controller! : "Bluetooth"
-            return bt.scanning == true ? "\(what) · looking for devices…" : "\(what) · on"
+            if bt.scanning == true { return "\(what) · looking for devices…" }
+            if let c = bt.last_classic, let l = bt.last_le, c >= 0 {
+                return "\(what) · on · last scan: \(c) classic, \(l) LE responses"
+            }
+            return "\(what) · on"
         }
         if state == "off" { return "Bluetooth needs the adapter on (it shares the Wi-Fi chip)." }
         if state == "no_adapter" { return "Plug in the UGREEN adapter." }
@@ -460,7 +466,7 @@ struct BtDeviceRow: View {
                 .font(.body)
                 .frame(width: 22)
             VStack(alignment: .leading, spacing: 0) {
-                Text(dev.name.isEmpty ? "Unnamed device" : dev.name)
+                Text(dev.name.isEmpty ? (dev.type.isEmpty ? "Unnamed device" : "Unnamed \(dev.type.lowercased())") : dev.name)
                     .font(.body)
                     .foregroundStyle(dev.name.isEmpty ? Color.secondary : Color.primary)
                     .lineLimit(1)
@@ -493,8 +499,10 @@ struct BluetoothPane: View {
     @EnvironmentObject var model: Model
 
     var body: some View {
-        let named = model.btDevices.filter { !$0.name.isEmpty }
-        let unnamed = model.btDevices.filter { $0.name.isEmpty }
+        // "Hidden" = no name and no known type (mostly beacons). A device whose type is known (keyboard, mouse,
+        // headphones...) is always listed, even before its name arrives.
+        let named = model.btDevices.filter { !$0.name.isEmpty || !$0.type.isEmpty }
+        let unnamed = model.btDevices.filter { $0.name.isEmpty && $0.type.isEmpty }
         let rows = model.btShowUnnamed ? named + unnamed : named
         VStack(alignment: .leading, spacing: 8) {
             Text(model.btStatusLine)

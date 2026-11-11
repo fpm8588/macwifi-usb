@@ -269,19 +269,20 @@ static int d_post(Daemon *d, DCmd cmd, const uint8_t *ssid, size_t ssid_len, con
 // user turns Bluetooth off, or the adapter goes away. No power assertions.
 
 #define BT_DEV_KEEP_S 90      // a device stays listed this long after it was last heard
-#define BT_SCAN_S     11      // ~5 s classic inquiry alone, then ~5 s LE scan
+#define BT_SCAN_S     11      // ~5 s classic inquiry alone (+ name requests), then at least 3 s LE scan
 
 typedef struct {
     pthread_mutex_t mu;
     int power;                // user setting (persisted), default on
     int up, scanning, scan_req;
     char controller[96], error[160];
+    int last_classic, last_le;   // responses in the last scan (shown in the menu)
     HciDevice dev[HCI_SEEN_MAX];
     double seen[HCI_SEEN_MAX];
     int ndev;
 } BtState;
 
-static BtState gBt = {PTHREAD_MUTEX_INITIALIZER, 1, 0, 0, 0, "", "", {{0}}, {0}, 0};
+static BtState gBt = {PTHREAD_MUTEX_INITIALIZER, 1, 0, 0, 0, "", "", -1, -1, {{0}}, {0}, 0};
 
 static void bt_save_power(Daemon *d) {
     char path[512];
@@ -423,6 +424,53 @@ static int bt_listen(Daemon *d, BtLink *b, BtRun *run, double secs, int stop_on_
     return 0;
 }
 
+// Classic devices often leave their name out of the inquiry response; ask each unnamed one (up to a few, each
+// with its own timeout). Names arrive in Remote Name Request Complete events.
+static int bt_fetch_names(Daemon *d, BtLink *b, BtRun *run) {
+    HciDevice want[6];
+    int nw = 0;
+    pthread_mutex_lock(&gBt.mu);
+    for (int i = 0; i < gBt.ndev && nw < 6; i++)
+        if (gBt.dev[i].kind == HCI_DEV_CLASSIC && !gBt.dev[i].name[0] && now_s() - gBt.seen[i] < 15) want[nw++] = gBt.dev[i];
+    pthread_mutex_unlock(&gBt.mu);
+    int got = 0;
+    for (int k = 0; k < nw; k++) {
+        uint8_t prm[10];
+        hci_remote_name_params(&want[k], prm);
+        if (bt_call(b, HCI_OP_REMOTE_NAME_REQ, prm, 10, NULL, 0, NULL, 2000, bt_d_event, run) != 0) continue;
+        double end = now_s() + 4;
+        uint8_t ev[HCI_MAX_EVENT];
+        size_t n = 0;
+        int done = 0;
+        while (!done && now_s() < end) {
+            if (!bt_should_run(d)) return got;
+            int r = bt_next_event(b, ev, &n, 250);
+            if (r < 0) return -1;
+            HciEvent e;
+            if (r != 1 || hci_event(ev, n, &e)) continue;
+            if (e.code == HCI_EV_REMOTE_NAME_COMPLETE && e.len >= 7 && !memcmp(e.p + 1, want[k].addr, 6)) {
+                uint8_t a[6];
+                char name[HCI_NAME_MAX + 1];
+                if (hci_parse_remote_name(&e, a, name) == 0 && name[0]) {
+                    HciDevice upd = want[k];
+                    snprintf(upd.name, sizeof upd.name, "%s", name);
+                    upd.name_complete = 1;
+                    upd.rssi = 127;
+                    pthread_mutex_lock(&gBt.mu);
+                    bt_publish(&upd);
+                    pthread_mutex_unlock(&gBt.mu);
+                    got++;
+                }
+                done = 1;
+            } else {
+                bt_d_event(run, &e);
+            }
+        }
+        if (!done) bt_call(b, HCI_OP_REMOTE_NAME_CANCEL, want[k].addr, 6, NULL, 0, NULL, 1000, bt_d_event, run);
+    }
+    return got;
+}
+
 static void bt_count(int *le, int *classic) {
     *le = *classic = 0;
     for (int i = 0; i < gBt.ndev; i++) { if (gBt.dev[i].kind == HCI_DEV_LE) (*le)++; else (*classic)++; }
@@ -444,6 +492,11 @@ static int bt_scan_once(Daemon *d, BtLink *b) {
     int rc = ist == 0 ? bt_listen(d, b, &run, 6.0, 1) : 0;
     if (ist == 0 && rc == 0 && !run.inquiry_done)
         bt_call(b, HCI_OP_INQUIRY_CANCEL, NULL, 0, NULL, 0, NULL, 1000, bt_d_event, &run);
+    int names = 0;
+    if (rc == 0) {
+        names = bt_fetch_names(d, b, &run);
+        if (names < 0) rc = -1;
+    }
     pthread_mutex_lock(&gBt.mu);
     int le1, cl1;
     bt_count(&le1, &cl1);
@@ -461,14 +514,16 @@ static int bt_scan_once(Daemon *d, BtLink *b) {
     }
     pthread_mutex_lock(&gBt.mu);
     gBt.scanning = 0;
+    gBt.last_classic = run.n_classic;
+    gBt.last_le = run.n_le;
     int le2, cl2;
     bt_count(&le2, &cl2);
     bt_expire();
     pthread_mutex_unlock(&gBt.mu);
     // Counts only (no names or addresses in the log).
     printf("[macwifid] Bluetooth scan %.1f s: classic inquiry status %d%s, %d responses, %d new classic devices; "
-           "LE scan status %d, %d reports, %d new LE devices\n", now_s() - t0, ist, run.inquiry_done ? " (completed)" : "",
-           run.n_classic, cl2 - cl0, lst, run.n_le, le2 - le0);
+           "%d names fetched; LE scan status %d, %d reports, %d new LE devices\n", now_s() - t0, ist,
+           run.inquiry_done ? " (completed)" : "", run.n_classic, cl2 - cl0, names > 0 ? names : 0, lst, run.n_le, le2 - le0);
     fflush(stdout);
     if (ist != 0 && lst != 0) bt_set_error("the controller refused to scan");
     return rc < 0 ? -1 : 0;
@@ -514,6 +569,8 @@ static void reply_bt(JsonOut *j) {
     jo_bool(j, "scanning", gBt.scanning);
     jo_str(j, "controller", gBt.controller);
     jo_str(j, "error", gBt.error);
+    jo_int(j, "last_classic", gBt.last_classic);
+    jo_int(j, "last_le", gBt.last_le);
     jo_key_arr(j, "devices");
     double t = now_s();
     for (int i = 0; i < gBt.ndev; i++) {

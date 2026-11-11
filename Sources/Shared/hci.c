@@ -167,6 +167,8 @@ static int inquiry(const uint8_t *p, size_t n, int with_rssi, HciDeviceFn fn, vo
         dev_init(&d, HCI_DEV_CLASSIC);
         d.connectable = 1;
         memcpy(d.addr, q, 6);
+        d.psrm = q[6];
+        d.clock_offset = le16(q + ((with_rssi && rec == 14) ? 11 : 12));
         size_t cod_at = with_rssi ? (rec == 15 ? 9 : 8) : 9;
         d.cod = le24(q + cod_at);
         if (with_rssi) d.rssi = (int8_t)q[rec - 1];
@@ -181,7 +183,9 @@ static int ext_inquiry(const uint8_t *p, size_t n, HciDeviceFn fn, void *ctx) {
     dev_init(&d, HCI_DEV_CLASSIC);
     d.connectable = 1;
     memcpy(d.addr, p + 1, 6);
+    d.psrm = p[7];
     d.cod = le24(p + 9);
+    d.clock_offset = le16(p + 12);
     d.rssi = (int8_t)p[14];
     hci_parse_ad(p + 15, n - 15, &d);                               // EIR uses the same field format as AD
     fn(ctx, &d);
@@ -200,6 +204,30 @@ int hci_scan_event(const HciEvent *ev, HciDeviceFn fn, void *ctx) {
         return 0;
     default: return 0;
     }
+}
+
+size_t hci_remote_name_params(const HciDevice *d, uint8_t out[10]) {
+    memcpy(out, d->addr, 6);
+    out[6] = d->psrm;
+    out[7] = 0;
+    uint16_t co = (uint16_t)(d->clock_offset | 0x8000);   // bit 15: the offset is valid [7.1.19]
+    out[8] = (uint8_t)co;
+    out[9] = (uint8_t)(co >> 8);
+    return 10;
+}
+
+int hci_parse_remote_name(const HciEvent *ev, uint8_t addr[6], char name[HCI_NAME_MAX + 1]) {
+    if (ev->code != HCI_EV_REMOTE_NAME_COMPLETE || ev->len < 7 || ev->p[0] != 0) return -1;
+    memcpy(addr, ev->p + 1, 6);
+    HciDevice d;
+    memset(&d, 0, sizeof d);
+    size_t n = (size_t)ev->len - 7;
+    const uint8_t *s = ev->p + 7;
+    size_t z = 0;
+    while (z < n && s[z]) z++;                             // NUL-terminated within 248 bytes
+    set_name(&d, s, z, 1);
+    memcpy(name, d.name, sizeof d.name);
+    return 0;
 }
 
 void hci_addr_str(const uint8_t a[6], char out[18]) {
@@ -256,6 +284,7 @@ void hci_merge(HciDevice *e, const HciDevice *d) {
     if (!e->appearance) e->appearance = d->appearance;
     if (!e->has_company && d->has_company) { e->company = d->company; e->has_company = 1; }
     if (!e->cod) e->cod = d->cod;
+    if (d->kind == HCI_DEV_CLASSIC && (d->psrm || d->clock_offset)) { e->psrm = d->psrm; e->clock_offset = d->clock_offset; }
     e->connectable |= d->connectable;
 }
 

@@ -130,11 +130,31 @@ static void test_inquiry(void) {
     const uint8_t plain[] = {HCI_EV_INQUIRY_RESULT, 15, 1, 7, 7, 7, 7, 7, 7, 1, 0, 0, 0x00, 0x01, 0x00, 0, 0};
     CHECK(hci_event(plain, sizeof plain, &ev) == 0 && hci_scan_event(&ev, collect, NULL) == 1);
     CHECK(gSeen.n == 3 && gSeen.dev[2].cod == 0x000100 && gSeen.dev[2].rssi == 127);
+    // clock offsets: RSSI 14-byte layout at 11, plain at 12
+    const uint8_t co1[] = {HCI_EV_INQUIRY_RESULT_RSSI, 15, 1, 5, 5, 5, 5, 5, 5, 2, 0, 0, 0, 0, 0x34, 0x12, (uint8_t)(int8_t)-20};
+    const uint8_t co2[] = {HCI_EV_INQUIRY_RESULT, 15, 1, 4, 4, 4, 4, 4, 4, 1, 0, 0, 0, 0, 0, 0x78, 0x56};
+    HciSeen keep = gSeen;
+    memset(&gSeen, 0, sizeof gSeen);
+    CHECK(hci_event(co1, sizeof co1, &ev) == 0 && hci_scan_event(&ev, collect, NULL) == 1 && gSeen.dev[0].clock_offset == 0x1234 && gSeen.dev[0].psrm == 2);
+    CHECK(hci_event(co2, sizeof co2, &ev) == 0 && hci_scan_event(&ev, collect, NULL) == 1 && gSeen.dev[1].clock_offset == 0x5678 && gSeen.dev[1].psrm == 1);
+    gSeen = keep;
     // Extended Inquiry Result with a name in the EIR
     uint8_t eir[2 + 255] = {HCI_EV_EXT_INQUIRY_RESULT, 255, 1, 1, 2, 3, 4, 5, 6, 1, 0, 0x04, 0x04, 0x24, 0, 0,
                             (uint8_t)(int8_t)-40, 8, 0x09, 'S', 'p', 'e', 'a', 'k', 'e', 'r'};
     CHECK(hci_event(eir, sizeof eir, &ev) == 0 && hci_scan_event(&ev, collect, NULL) == 1);
     CHECK(gSeen.n == 3 && !strcmp(gSeen.dev[0].name, "Speaker") && gSeen.dev[0].rssi == -40);
+    // Inquiry with RSSI carried psrm 1 and clock offset 0x0000; remote name request parameters
+    CHECK(gSeen.dev[0].psrm == 1);
+    uint8_t rn[10];
+    CHECK(hci_remote_name_params(&gSeen.dev[0], rn) == 10 && rn[0] == 1 && rn[5] == 6 && rn[6] == 1 && rn[9] == 0x80);
+    // Remote Name Request Complete
+    uint8_t ne[2 + 255] = {HCI_EV_REMOTE_NAME_COMPLETE, 255, 0, 1, 2, 3, 4, 5, 6, 'M', 'a', 'g', 'i', 'c', 0};
+    uint8_t ra[6];
+    char nm[HCI_NAME_MAX + 1];
+    CHECK(hci_event(ne, sizeof ne, &ev) == 0 && hci_parse_remote_name(&ev, ra, nm) == 0 && !strcmp(nm, "Magic") &&
+          ra[0] == 1 && ra[5] == 6);
+    ne[2] = 0x04;   // page timeout
+    CHECK(hci_parse_remote_name(&ev, ra, nm) == -1);
     // Count too large for the length
     const uint8_t bad[] = {HCI_EV_INQUIRY_RESULT_RSSI, 15, 2, 1, 2, 3, 4, 5, 6, 1, 0, 0, 0, 0, 0, 0, 0};
     CHECK(hci_event(bad, sizeof bad, &ev) == 0 && hci_scan_event(&ev, collect, NULL) == -1);

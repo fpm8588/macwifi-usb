@@ -12,6 +12,8 @@
 #define HCI_OP(ogf, ocf)               ((uint16_t)(((ogf) << 10) | (ocf)))
 #define HCI_OP_INQUIRY                 HCI_OP(0x01, 0x0001)   // 7.1.1
 #define HCI_OP_INQUIRY_CANCEL          HCI_OP(0x01, 0x0002)   // 7.1.2
+#define HCI_OP_REMOTE_NAME_REQ         HCI_OP(0x01, 0x0019)   // 7.1.19
+#define HCI_OP_REMOTE_NAME_CANCEL      HCI_OP(0x01, 0x001A)   // 7.1.20
 #define HCI_OP_SET_EVENT_MASK          HCI_OP(0x03, 0x0001)   // 7.3.1
 #define HCI_OP_RESET                   HCI_OP(0x03, 0x0003)   // 7.3.2
 #define HCI_OP_READ_LOCAL_NAME         HCI_OP(0x03, 0x0014)   // 7.3.12
@@ -28,6 +30,7 @@
 // Event codes [Vol 4 Part E 7.7]
 #define HCI_EV_INQUIRY_COMPLETE        0x01
 #define HCI_EV_INQUIRY_RESULT          0x02
+#define HCI_EV_REMOTE_NAME_COMPLETE    0x07
 #define HCI_EV_CMD_COMPLETE            0x0E
 #define HCI_EV_CMD_STATUS              0x0F
 #define HCI_EV_HW_ERROR                0x10
@@ -98,6 +101,8 @@ typedef struct {
     int has_company;
     char name[HCI_NAME_MAX + 1]; // complete or shortened local name, "" if none
     int name_complete;
+    uint8_t psrm;               // classic: page scan repetition mode (for Remote Name Request / Create Connection)
+    uint16_t clock_offset;      // classic: clock offset from the inquiry result
 } HciDevice;
 
 // Fills name/appearance/company from AD or EIR data [Core Supplement Part A]: a sequence of
@@ -109,6 +114,11 @@ void hci_parse_ad(const uint8_t *ad, size_t n, HciDevice *d);
 // is one of those but malformed (devices before the bad one have already been reported), or 0 for other events.
 typedef void (*HciDeviceFn)(void *ctx, const HciDevice *d);
 int hci_scan_event(const HciEvent *ev, HciDeviceFn fn, void *ctx);
+
+// Remote Name Request parameters for a classic device seen in an inquiry: addr(6), psrm, 0, clock offset | 0x8000.
+size_t hci_remote_name_params(const HciDevice *d, uint8_t out[10]);
+// Remote Name Request Complete: 0 and the (terminal-safe) name if status 0; -1 otherwise.
+int hci_parse_remote_name(const HciEvent *ev, uint8_t addr[6], char name[HCI_NAME_MAX + 1]);
 
 // "AA:BB:CC:DD:EE:FF" (most significant byte first, the usual way to show it). out needs 18 bytes.
 void hci_addr_str(const uint8_t addr[6], char out[18]);
