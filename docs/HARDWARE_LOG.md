@@ -275,3 +275,11 @@ Found:
 - Reinstalling could leave the service unloaded (bootstrap racing the old copy's teardown); the installer now
   waits and retries. Replugging during start-up was recovered from by itself, but a freshly plugged adapter whose
   virtual CD wasn't mounted yet waited 15 s before the next try; now 3 s for the first few tries.
+
+## 2026-11-11: Bluetooth B2 (service + menu tab), first adapter test
+
+- The service opened the HCI interface next to the running Wi-Fi driver; the menu's Bluetooth tab showed nearby
+  devices, including the user's earbuds (they advertise over LE continuously). So: interface 0 opens from user
+  space while the composite device is held by macOS, HCI Reset / version / scan work after our firmware load.
+- Not found: a Magic Keyboard and Magic Mouse in pairing mode (classic devices, answer inquiries only).
+  Inquiry and LE scan ran at the same time; changed to inquiry alone first, then LE, with per-phase logging.
