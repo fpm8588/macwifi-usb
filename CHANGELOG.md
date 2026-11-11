@@ -7,6 +7,8 @@
   identifies it and lists nearby Bluetooth LE and classic devices. Plan: `docs/BLUETOOTH_PROMPT.md`.
 
 **Changed**
+- Faster Wi-Fi (to be measured): outgoing data frames are queued, up to 64 USB transfers in flight like the
+  Linux driver, instead of waiting for each transfer to finish. Downloads depend on these outgoing ACKs.
 - Sleep: the service now waits at most 3 s (was 20 s) for the adapter to shut down before letting the Mac sleep,
   and logs how long it took, so closing the lid always sleeps promptly. It still never takes a power assertion.
 

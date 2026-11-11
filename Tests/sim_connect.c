@@ -604,6 +604,16 @@ RxAsync *rx_async_start(void *intf, uint8_t pipe, RxQ *q) {
     gRxStarted++;
     return r;
 }
+// TX: the simulated device takes writes synchronously; same contract (copy, in order).
+static atomic_int gTxQueued;
+int rx_async_tx(RxAsync *r, uint8_t pipe, const void *buf, size_t len) {
+    (void)r;
+    if (len > TX_ASYNC_BUFSIZE) return -1;
+    gTxQueued++;
+    return f_write(NULL, pipe, (void *)buf, (UInt32)len, 0, 0) == kIOReturnSuccess ? 0 : -1;
+}
+int rx_async_tx_drain(RxAsync *r, int timeout_ms) { (void)r; (void)timeout_ms; return 0; }
+void rx_async_tx_stats(RxAsync *r, TxAsyncStats *s) { (void)r; memset(s, 0, sizeof *s); s->sent = (unsigned long)gTxQueued; }
 void rx_async_stop(RxAsync *r) {
     r->stop = 1;
     pthread_join(r->th, NULL);
@@ -1130,6 +1140,7 @@ int main(void) {
     test_daemon_wpa3();
     CHECK(gRxStarted == 0);    // every reader that was started was stopped
 
+    CHECK(gTxQueued > 0);   // bridged data went through the queued (async) TX path
     printf("sim_connect: %d checks, %d failures\n", checks, failures);
     return failures ? 1 : 0;
 }

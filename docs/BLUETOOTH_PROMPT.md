@@ -95,6 +95,29 @@ Input: BLE / classic HID reports turned into keyboard and pointer events with CG
 - Every phase's hardware checkpoint includes: close the lid with the feature active, wait a minute, open it,
   confirm it slept (`pmset -g log | grep -E " Sleep | Wake " | tail -4`) and recovered.
 
+### The adapter is the Mac's only radio (2026-11-11)
+The user's Mac has no working built-in Wi-Fi or Bluetooth. Everything wireless goes through the UGREEN
+adapter, so input devices (B4: Magic Keyboard, Magic Mouse) are a priority, and audio (B5: AirPods). Apple-only
+extras through a third-party controller are out of reach: Touch ID on the Magic Keyboard, Magic Mouse gestures
+beyond pointer and scroll unless its multitouch reports are decoded, AirPods automatic switching and spatial
+audio.
+
+### AirDrop (asked 2026-11-11): research phase A0 after B5
+- What AirDrop needs: Bluetooth LE advertisements (we will have LE), then AWDL (Apple Wireless Direct Link), a
+  Wi-Fi peer-to-peer protocol with tight timing (availability windows on channels 6/44/149), then an HTTPS
+  exchange. macOS's own AirDrop (sharingd) only uses Apple's Wi-Fi and Bluetooth hardware, so the Finder
+  "AirDrop" button can never use the dongle.
+- Prior art for facts (do not copy code: OpenDrop and OWL are GPL-3, this repo is GPL-2.0-only): SEEMOO's
+  OpenDrop and OWL reimplemented AirDrop and AWDL on Linux with Wi-Fi cards in monitor mode with frame
+  injection. Without Apple-signed identity records they only reach devices set to "Everyone for 10 minutes".
+- The AIC8800 Linux driver supports a monitor interface (`rwnx_mod_params.c`, NL80211_IFTYPE_MONITOR; TX
+  path in `rwnx_txq.c`), so frame injection may be possible through the firmware. Open questions for A0: does
+  monitor TX work on the D80 firmware, can we switch channels fast enough for AWDL's schedule over USB, and can
+  station mode stay up at the same time (one radio, so AirDrop would likely pause normal Wi-Fi briefly).
+- If A0 says yes: our own "Send with AirDrop" (menu and a Finder Quick Action) and receiving into Downloads,
+  "Everyone" mode only. If no: say so plainly and offer alternatives (a local web page for sending files
+  from the iPhone over the same network).
+
 ## Phases (stop at each hardware checkpoint and ask the user to run it)
 
 ### W1: band control (Wi-Fi)

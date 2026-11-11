@@ -30,6 +30,19 @@ Add `macwifictl stats` (and a JSON `stats` verb on the control socket) that repo
 Then measure with `networkQuality -s` and an iperf3-style test on the LAN, both directions, at 2.4 and 5 GHz.
 Record everything (redacted) in `docs/HARDWARE_LOG.md`. Each step below must show a measured gain.
 
+## Progress
+
+- 2026-11-11, first finding: every outgoing data frame was one synchronous USB transfer (write, wait for
+  completion, next). Downloads need a steady stream of TCP ACKs going out, so the per-transfer round trip
+  capped the packet rate. Linux keeps up to 200 TX URBs queued and limits each station to 64 pending
+  (`aicwf_usb.h`: AICWF_USB_TX_URBS, AICWF_USB_FC_PERSTA_HIGH_WATER; CONFIG_USB_TX_AGGR is off by default, so
+  no multi-frame aggregation). Now: `rx_async_tx`, up to 64 bulk-OUT transfers in flight on the async run
+  loop, EAPOL and SAE frames still synchronous after a drain. The session's end line logs TX transfers, the
+  most in flight and waits for a free slot. **Needs a before/after measurement on the adapter.**
+- Checked against Linux and unchanged: ME_CONFIG capabilities (HT 20/40 SGI, VHT 80 MHz SGI80, HE MCS 0-11,
+  phy_bw_max 80), ps_on (Linux default true, firmware dynamic PS). Home network already associates at 80 MHz
+  on 5 GHz (hardware log, "width code 2").
+
 ## Likely bottlenecks and fixes, in order
 
 1. **Link rate.** Check that our SM_CONNECT_REQ and the capabilities we give the firmware

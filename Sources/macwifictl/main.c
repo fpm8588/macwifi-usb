@@ -192,10 +192,17 @@ static void link_rx_start(Link *l) {
 
 static void link_rx_stop(Link *l) {
     if (!l->rx) return;
-    rx_async_stop(l->rx);
+    RxAsync *r = l->rx;
+    rx_async_tx_drain(r, 500);
+    TxAsyncStats t;
+    rx_async_tx_stats(r, &t);
+    l->rx = NULL;                                  // link_send_data falls back to synchronous writes from here
+    rx_async_stop(r);
     RxQStats s;
     rxq_stats(l->rxq, &s);
-    printf("RX: %lu transfers, deepest queue %zu, dropped %lu\n", s.pushed, s.max_depth, s.dropped);
+    printf("RX: %lu transfers, deepest queue %zu, dropped %lu; TX: %lu queued transfers, most in flight %d, "
+           "%lu waits for a free slot, %lu errors\n", s.pushed, s.max_depth, s.dropped, t.sent, t.max_inflight, t.waits,
+           t.errors);
     rxq_free(l->rxq);
     l->rx = NULL;
     l->rxq = NULL;
@@ -1146,7 +1153,22 @@ static void secure_zero(void *p, size_t n) {
     while (n--) *v++ = 0;
 }
 
+// Data frames: queued asynchronously once the RX machinery runs (rx_async_tx: up to 64 in flight, like Linux),
+// otherwise one synchronous transfer. link_send_data_sync is for frames whose timing matters relative to
+// messages (EAPOL, SAE): it first waits for the queue to empty, then writes and waits.
+static int link_send_data_sync(Link *l, const uint8_t *buf, size_t len);
 static int link_send_data(Link *l, const uint8_t *buf, size_t len) {
+    if (l->rx) {
+        hexdump("OUT data (queued)", buf, len);
+        if (rx_async_tx(l->rx, l->out_pipe, buf, len) == 0) return 0;
+        fprintf(stderr, "bulk OUT (data, queued) failed\n");
+        return -1;
+    }
+    return link_send_data_sync(l, buf, len);
+}
+
+static int link_send_data_sync(Link *l, const uint8_t *buf, size_t len) {
+    if (l->rx && rx_async_tx_drain(l->rx, 2000) != 0) fprintf(stderr, "queued bulk OUT still pending\n");
     hexdump("OUT data", buf, len);
     IOReturn kr = (*l->intf)->WritePipeTO(l->intf, l->out_pipe, (void *)buf, (UInt32)len, 1000, 2000);
     if (kr != kIOReturnSuccess) {
@@ -1241,7 +1263,7 @@ static void conn_send_eth(Conn *c, const uint8_t *eth, size_t len, int eapol) {
     size_t n = aic_data_build_tx(out, sizeof out, eth, len, c->vif, c->ind.ap_idx, 0, idx);
     if (!n) return;
     pthread_mutex_lock(&c->tx_lock);
-    if (link_send_data(c->l, out, n) == 0) c->tx++;
+    if ((eapol ? link_send_data_sync(c->l, out, n) : link_send_data(c->l, out, n)) == 0) c->tx++;
     pthread_mutex_unlock(&c->tx_lock);
 }
 
@@ -1311,7 +1333,7 @@ static void conn_send_auth(Conn *c, const uint8_t *body, size_t n) {
     size_t len = aic_data_build_mgmt_tx(out, sizeof out, frame, 24 + n, c->vif);
     if (!len) return;
     pthread_mutex_lock(&c->tx_lock);
-    if (link_send_data(c->l, out, len) == 0) c->tx++;
+    if (link_send_data_sync(c->l, out, len) == 0) c->tx++;
     pthread_mutex_unlock(&c->tx_lock);
 }
 
