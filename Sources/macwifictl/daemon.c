@@ -317,7 +317,16 @@ static struct {
 
 static BtHost gHost;           // Bluetooth thread only
 static BtLink *gBtLink;        // Bluetooth thread only
-static struct { uint8_t addr[6]; int used; HidKbState kb; uint8_t buttons; int unknown_logged; } gHid[BTH_MAX_CONN];
+static struct {
+    uint8_t addr[6];
+    int used;
+    HidKbState kb;
+    uint8_t buttons;
+    int unknown_logged;
+    // mouse report timing (logged every 20 s while it moves): how often reports come, the longest pause
+    unsigned reports;
+    double win_start, last, max_gap;
+} gHid[BTH_MAX_CONN];
 
 // Input for the menu app (it posts the events into the user's session): a ring of text lines, read by
 // `bt_input` streams. "k <macOS key code> <1 down|0 up> <modifier bits>" and "m <buttons> <dx> <dy> <wheel>".
@@ -543,6 +552,17 @@ static int bh_accept(void *ctx, const uint8_t a[6], uint32_t cod) {
 }
 static void bh_event(void *ctx, const uint8_t a[6], BtHostEvent ev, uint32_t v) {
     (void)ctx;
+    if (ev == BTH_EV_MODE) {                          // only logged: sniff mode explains a laggy mouse
+        pthread_mutex_lock(&gBt.mu);
+        const char *kind = bt_kind_for_log(a);
+        pthread_mutex_unlock(&gBt.mu);
+        unsigned mode = v & 0xFF, slots = v >> 8;
+        printf("[macwifid] Bluetooth %s: link %s", kind, mode == 0 ? "active" : mode == 2 ? "in sniff mode" : "in another mode");
+        if (mode == 2) printf(" (every %.1f ms; asking to leave it)", slots * 0.625);
+        printf("\n");
+        fflush(stdout);
+        return;
+    }
     pthread_mutex_lock(&gBt.mu);
     BtDevStatus *s = bs_get(a, 1);
     const char *kind = bt_kind_for_log(a);
@@ -554,6 +574,7 @@ static void bh_event(void *ctx, const uint8_t a[6], BtHostEvent ev, uint32_t v) 
     case BTH_EV_CONNECTED: snprintf(s->state, sizeof s->state, "connected"); s->has_passkey = 0; s->why[0] = 0; break;
     case BTH_EV_DISCONNECTED: s->state[0] = 0; s->has_passkey = 0; break;
     case BTH_EV_UNPLUGGED: s->state[0] = 0; s->has_passkey = 0; break;
+    case BTH_EV_MODE: break;
     case BTH_EV_FAILED:
         snprintf(s->state, sizeof s->state, "failed");
         s->has_passkey = 0;
@@ -594,6 +615,18 @@ static void bh_hid_input(void *ctx, const uint8_t a[6], const uint8_t *r, size_t
     }
     HidMouse m;
     if (r[0] == HID_REPORT_MOUSE && hid_mouse_parse(r + 1, n - 1, &m) == 0) {
+        double t = now_s();
+        if (gHid[slot].reports == 0) gHid[slot].win_start = t;
+        else if (t - gHid[slot].last < 0.5 && t - gHid[slot].last > gHid[slot].max_gap) gHid[slot].max_gap = t - gHid[slot].last;
+        gHid[slot].reports++;
+        gHid[slot].last = t;
+        if (t - gHid[slot].win_start >= 20) {
+            printf("[macwifid] Bluetooth mouse: %u reports in %.0f s, longest pause while moving %.0f ms\n",
+                   gHid[slot].reports, t - gHid[slot].win_start, gHid[slot].max_gap * 1000);
+            fflush(stdout);
+            gHid[slot].reports = 0;
+            gHid[slot].max_gap = 0;
+        }
         gHid[slot].buttons = m.buttons;
         snprintf(line, sizeof line, "m %u %d %d %d", m.buttons, m.dx, m.dy, m.wheel);
         in_push(line);
@@ -896,6 +929,9 @@ static int bt_scan_once(Daemon *d, BtLink *b) {
 
 static void *bt_thread(void *arg) {
     Daemon *d = arg;
+#ifdef __APPLE__
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   // input latency matters here
+#endif
     BtLink *b = NULL;
     double next_try = 0;
     while (!gStop) {

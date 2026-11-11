@@ -11,6 +11,7 @@
 #include <IOKit/IOCFPlugIn.h>
 #include <IOKit/usb/IOUSBLib.h>
 #include <pthread.h>
+#include <pthread/qos.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -57,6 +58,7 @@ static void dump(BtLink *b, const char *tag, const uint8_t *p, size_t n) {
 
 // Blocking reads into the queue, each chunk tagged with its packet type; AbortPipe ends them.
 static void read_loop(BtLink *b, UInt8 pipe, UInt32 len, uint8_t tag) {
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);   // keyboard and mouse input pass through here
     uint8_t buf[1 + 4096];
     buf[0] = tag;
     while (!b->stop) {

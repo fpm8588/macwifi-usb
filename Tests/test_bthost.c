@@ -190,6 +190,13 @@ static void test_pair_keyboard(void) {
     uint8_t ec[4] = {0, 0x0B, 0, 1};
     feed(&h, HCI_EV_ENCRYPT_CHANGE, ec, 4);
     CHECK(bthost_state(&h, ADDR) == BTC_CHANNELS);
+    CHECK(last_cmd()->op == HCI_OP_WRITE_LINK_POLICY && u16(last_cmd()->p) == 0x0B && u16(last_cmd()->p + 2) == 0x0001);
+    cc(&h, HCI_OP_WRITE_LINK_POLICY);
+    // The device puts the link in sniff mode anyway: reported, and we ask to exit
+    uint8_t mc[6] = {0, 0x0B, 0, 0x02, 0x12, 0x00};
+    feed(&h, HCI_EV_MODE_CHANGE, mc, 6);
+    CHECK(evs[nev - 1] == BTH_EV_MODE && evval[nev - 1] == (0x02 | (0x12 << 8)) && last_cmd()->op == HCI_OP_EXIT_SNIFF_MODE);
+    cc(&h, HCI_OP_EXIT_SNIFF_MODE);
     uint16_t lctrl = dev_accept_chan(&h, 0x0B, L2CAP_PSM_HID_CTRL, 0x0050);
     CHECK(lctrl >= L2CAP_FIRST_DYN_CID);
     CHECK(bthost_state(&h, ADDR) == BTC_CHANNELS && !had_event(BTH_EV_CONNECTED));
@@ -290,6 +297,7 @@ static void test_reconnect_incoming(void) {
     dev_sig(&h, 0x0C, L2CAP_CONF_REQ, 0x24, dreq2, 4);
     CHECK(bthost_state(&h, ADDR) == BTC_OPEN && had_event(BTH_EV_CONNECTED));
     // A second connection request for the same device while connected is rejected
+    cc(&h, HCI_OP_WRITE_LINK_POLICY);
     feed(&h, HCI_EV_CONN_REQUEST, cr, 10);
     CHECK(last_cmd()->op == HCI_OP_REJECT_CONN_REQ);
     // Virtual cable unplug from the device: forget + disconnect

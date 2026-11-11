@@ -19,6 +19,9 @@
 
 #include <ctype.h>
 #include <pthread.h>
+#ifdef __APPLE__
+#include <pthread/qos.h>
+#endif
 #include <readpassphrase.h>
 #include <signal.h>
 #include <spawn.h>

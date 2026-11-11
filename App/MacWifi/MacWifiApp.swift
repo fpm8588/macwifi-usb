@@ -170,7 +170,10 @@ final class InputInjector {
     func start() {
         guard !started else { return }
         started = true
-        Thread.detachNewThread { self.run() }
+        let t = Thread { self.run() }
+        t.qualityOfService = .userInteractive      // pointer latency
+        t.name = "bluetooth-input"
+        t.start()
     }
 
     static var trusted: Bool { AXIsProcessTrusted() }
@@ -467,9 +470,16 @@ final class Model: ObservableObject {
         }
     }
 
+    private var lastScan = Date.distantPast
+
+    func scanIfStale() {
+        if connectedSSID == nil || networks.isEmpty || Date().timeIntervalSince(lastScan) > 300 { scan() }
+    }
+
     func scan() {
         guard !scanning, daemonRunning, state != "off", state != "no_adapter" else { return }
         scanning = true
+        lastScan = Date()
         queue.async {
             let reply = (try? Daemon.request(["cmd": "scan"], timeout: 35)).flatMap {
                 try? JSONDecoder().decode(NetworksReply.self, from: $0)
@@ -874,7 +884,9 @@ struct MenuView: View {
         }
         .padding(14)
         .frame(width: 380)
-        .onAppear { model.refresh(); model.scan() }
+        // Scanning Wi-Fi takes the shared radio off its channel for a few seconds, which also stalls Bluetooth (a
+        // mouse would stutter): only scan on open when not connected or the list is old.
+        .onAppear { model.refresh(); model.scanIfStale() }
     }
 }
 

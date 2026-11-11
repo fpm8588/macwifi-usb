@@ -283,3 +283,14 @@ Found:
   space while the composite device is held by macOS, HCI Reset / version / scan work after our firmware load.
 - Not found: a Magic Keyboard and Magic Mouse in pairing mode (classic devices, answer inquiries only).
   Inquiry and LE scan ran at the same time; changed to inquiry alone first, then LE, with per-phase logging.
+
+## 2026-11-11: Bluetooth keyboard and mouse (B3/B4 classic) on the adapter
+
+- After the Extended Inquiry Result mask fix, the scan found the user's Magic Keyboard and Magic Mouse 2.
+- Both paired and connected from the menu (Secure Simple Pairing; link keys stored), and both work: typing and
+  pointing reach macOS through the menu app (CGEvent, Accessibility permission). First user-space Bluetooth
+  HID host on this adapter.
+- Reported: the Magic Mouse 2 feels slow to update ("refresh rate painfully slow"). Changes: link policy without
+  sniff mode (and Exit Sniff if the device enters it anyway, logged), user-interactive QoS for the Bluetooth
+  thread, USB readers and the app's input thread, no Wi-Fi scan on every menu open (off-channel time stalls
+  Bluetooth on this combo chip). The service now logs mouse reports per 20 s and the longest pause.

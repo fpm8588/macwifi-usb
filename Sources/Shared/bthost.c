@@ -511,6 +511,14 @@ void bthost_event(BtHost *h, const HciEvent *ev) {
         }
         c->encrypted = 1;
         if (c->state == BTC_SECURING) c->state = BTC_CHANNELS;
+        {
+            // Keep the link active: in sniff mode the device may only talk every few tens of milliseconds, and a
+            // mouse then moves in jumps (the classic "laggy Bluetooth mouse"). Allow role switch only.
+            uint8_t r[4];
+            put16(r, c->handle);
+            put16(r + 2, 0x0001);
+            bthost_cmd(h, HCI_OP_WRITE_LINK_POLICY, r, 4);
+        }
         accept_pending(h, c, &c->ctrl);
         accept_pending(h, c, &c->intr);
         if (c->initiator && c->ctrl.state == CH_CLOSED) open_chan(h, c, &c->ctrl, L2CAP_PSM_HID_CTRL);
@@ -563,6 +571,17 @@ void bthost_event(BtHost *h, const HciEvent *ev) {
     case HCI_EV_USER_PASSKEY_NOTIFY:
         if (n < 10) return;
         report(h, p, BTH_EV_PASSKEY, (uint32_t)p[6] | ((uint32_t)p[7] << 8) | ((uint32_t)p[8] << 16) | ((uint32_t)p[9] << 24));
+        return;
+    case HCI_EV_MODE_CHANGE:
+        if (n < 6 || p[0] != 0) return;
+        c = by_handle(h, le16(p + 1) & 0x0FFF);
+        if (!c) return;
+        report(h, c->addr, BTH_EV_MODE, (uint32_t)p[3] | ((uint32_t)le16(p + 4) << 8));
+        if (p[3] == 0x02) {                    // sniff anyway (the device insisted): ask to leave it
+            uint8_t r[2];
+            put16(r, c->handle);
+            bthost_cmd(h, HCI_OP_EXIT_SNIFF_MODE, r, 2);
+        }
         return;
     case HCI_EV_SIMPLE_PAIRING_COMPLETE:
         if (n < 7 || p[0] == 0) return;

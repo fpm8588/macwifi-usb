@@ -29,6 +29,8 @@
 #define HCI_OP_SET_CONN_ENCRYPT        HCI_OP(0x01, 0x0013)
 #define HCI_OP_IO_CAPABILITY_REPLY     HCI_OP(0x01, 0x002B)
 #define HCI_OP_USER_CONFIRM_REPLY      HCI_OP(0x01, 0x002C)
+#define HCI_OP_EXIT_SNIFF_MODE         HCI_OP(0x02, 0x0004)   // 7.2.3
+#define HCI_OP_WRITE_LINK_POLICY       HCI_OP(0x02, 0x000D)   // 7.2.10
 #define HCI_OP_WRITE_LOCAL_NAME        HCI_OP(0x03, 0x0013)
 #define HCI_OP_WRITE_SCAN_ENABLE       HCI_OP(0x03, 0x001A)
 #define HCI_OP_WRITE_CLASS_OF_DEVICE   HCI_OP(0x03, 0x0024)
@@ -41,6 +43,7 @@
 #define HCI_EV_AUTH_COMPLETE           0x06
 #define HCI_EV_ENCRYPT_CHANGE          0x08
 #define HCI_EV_NUM_COMPLETED_PKTS      0x13
+#define HCI_EV_MODE_CHANGE             0x14
 #define HCI_EV_PIN_CODE_REQUEST        0x16
 #define HCI_EV_LINK_KEY_REQUEST        0x17
 #define HCI_EV_LINK_KEY_NOTIFY         0x18
@@ -111,7 +114,8 @@ typedef enum {
     BTH_EV_CONNECTED,        // HID channels open
     BTH_EV_DISCONNECTED,     // `value` = HCI reason / status
     BTH_EV_FAILED,           // couldn't connect or pair; `value` = HCI status
-    BTH_EV_UNPLUGGED         // the device asked to be forgotten (virtual cable unplug)
+    BTH_EV_UNPLUGGED,        // the device asked to be forgotten (virtual cable unplug)
+    BTH_EV_MODE              // link mode changed: value = mode (0 active, 2 sniff) | interval in 0.625 ms slots << 8
 } BtHostEvent;
 
 typedef struct {
