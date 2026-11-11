@@ -18,6 +18,7 @@
 #include <IOKit/usb/IOUSBLib.h>
 
 #include <ctype.h>
+#include <math.h>
 #include <pthread.h>
 #ifdef __APPLE__
 #include <pthread/qos.h>
@@ -42,6 +43,9 @@
 #include "hci.h"
 #include "bthost.h"
 #include "hidboot.h"
+#include "avdtp.h"
+#include "sdp.h"
+#include "sbc.h"
 #include "bridge.h"
 #include "captive.h"
 #include "dhcp.h"

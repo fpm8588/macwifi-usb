@@ -57,6 +57,7 @@ struct BtDevice: Decodable, Identifiable, Hashable {
     let state: String?      // "connecting", "pairing", "connected", "failed", ""
     let passkey: Int?       // shown while pairing a keyboard
     let why: String?        // after "failed"
+    let audio: String?      // for the connected audio device: "setting up", "ready", "playing"
 
     var isConnected: Bool { state == "connected" }
     var isBusy: Bool { state == "connecting" || state == "pairing" }
@@ -414,6 +415,7 @@ final class Model: ObservableObject {
         btAction("bt_connect", dev)
     }
     func btDisconnect(_ dev: BtDevice) { btAction("bt_disconnect", dev) }
+    func btTestSound(_ dev: BtDevice) { btAction("bt_test_sound", dev) }
     func btForget(_ dev: BtDevice) { btAction("bt_forget", dev) }
 
     private func btAction(_ cmd: String, _ dev: BtDevice) {
@@ -647,7 +649,9 @@ struct BtDeviceRow: View {
         case "pairing":
             if let pk = dev.passkey { return String(format: "Type %06ld on the keyboard, then press Return", pk) }
             return "Pairing…"
-        case "connected": return "Connected"
+        case "connected":
+            if let a = dev.audio { return a == "playing" ? "Connected · playing" : a == "ready" ? "Connected · audio ready" : "Connected · setting up audio…" }
+            return "Connected"
         case "failed": return "Couldn't connect: \(dev.why ?? "unknown reason")"
         default: return dev.paired == true ? "Paired · not connected" : dev.type
         }
@@ -704,13 +708,17 @@ struct BtDeviceRow: View {
         .frame(minHeight: NetworkRow.height + 4)
         .contentShape(Rectangle())
         .opacity(dev.transport == "le" && dev.paired != true ? 0.6 : 1)
-        .help(dev.transport == "le" && dev.paired != true ? "Bluetooth LE devices can't be connected yet."
+        .help(dev.transport == "le" && dev.paired != true
+              ? (dev.type == "Audio" || dev.name.localizedCaseInsensitiveContains("AirPods")
+                 ? "This is the earbuds' LE signal. To connect, open the case and hold its button until the light flashes white, then Scan Again: they appear a second time as a Classic device."
+                 : "Bluetooth LE devices can't be connected yet.")
               : dev.isConnected ? "Right-click to disconnect or forget." : "Click to connect.")
         .onTapGesture {
             if !dev.isConnected && !dev.isBusy && !(dev.transport == "le" && dev.paired != true) { model.btConnect(dev) }
         }
         .contextMenu {
             if !dev.isConnected && !dev.isBusy { Button("Connect") { model.btConnect(dev) } }
+            if dev.audio != nil { Button("Play Test Sound") { model.btTestSound(dev) } }
             if dev.isConnected || dev.isBusy { Button("Disconnect") { model.btDisconnect(dev) } }
             if dev.paired == true { Button("Forget This Device") { model.btForget(dev) } }
         }

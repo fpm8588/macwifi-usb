@@ -12,6 +12,13 @@ void bthost_init(BtHost *h, const BtHostOps *ops) {
     h->ops = *ops;
     h->next_cid = L2CAP_FIRST_DYN_CID;
     h->credits = 1;
+    h->acl_mtu = 27;          // the smallest any controller has, until Read Buffer Size says otherwise
+    h->acl_total = h->acl_credits = 1;
+}
+
+void bthost_set_acl(BtHost *h, uint16_t mtu, int count) {
+    if (mtu >= 27) h->acl_mtu = mtu;
+    if (count > 0) h->acl_total = h->acl_credits = count;
 }
 
 void bthost_reset(BtHost *h) {
@@ -99,10 +106,15 @@ BtConnState bthost_state(const BtHost *h, const uint8_t addr[6]) {
 }
 
 int bthost_connect(BtHost *h, const uint8_t addr[6], uint8_t psrm, uint16_t clock_offset) {
+    return bthost_connect_profile(h, addr, psrm, clock_offset, L2CAP_PSM_HID_CTRL);
+}
+
+int bthost_connect_profile(BtHost *h, const uint8_t addr[6], uint8_t psrm, uint16_t clock_offset, uint16_t first_psm) {
     if (by_addr(h, addr)) return -1;
     BtConn *c = alloc_conn(h, addr);
     if (!c) return -1;
     c->initiator = 1;
+    c->first_psm = first_psm;
     uint8_t p[13];
     memcpy(p, addr, 6);
     put16(p + 6, 0xCC18);                 // DM1, DH1, DM3, DH3, DM5, DH5 (the 2/3-EDR "may not use" bits clear)
@@ -134,15 +146,27 @@ void bthost_disconnect_all(BtHost *h) {
 
 // ---------------------------------------------------------------- L2CAP
 
+// One L2CAP PDU, split into ACL packets of at most acl_mtu bytes (first: packet boundary 0b10, the rest 0b01).
+// Each ACL packet uses one controller buffer; signaling and HID go out regardless (they're tiny and must not be
+// lost), callers that can drop data check the credits first (bthost_l2cap_send).
 static int send_l2cap(BtHost *h, BtConn *c, uint16_t cid, const uint8_t *data, size_t n) {
-    uint8_t pkt[4 + 4 + 600];
-    if (n > 600 || !h->ops.send_acl) return -1;
-    put16(pkt, (uint16_t)((c->handle & 0x0FFF) | (0x2 << 12)));   // packet boundary: first, automatically flushable
-    put16(pkt + 2, (uint16_t)(4 + n));
-    put16(pkt + 4, (uint16_t)n);
-    put16(pkt + 6, cid);
-    memcpy(pkt + 8, data, n);
-    return h->ops.send_acl(h->ops.ctx, pkt, 8 + n);
+    uint8_t pdu[4 + 2048];
+    uint8_t pkt[4 + 2048];
+    if (n > 2048 || !h->ops.send_acl) return -1;
+    put16(pdu, (uint16_t)n);
+    put16(pdu + 2, cid);
+    memcpy(pdu + 4, data, n);
+    size_t total = 4 + n, off = 0;
+    while (off < total) {
+        size_t len = total - off < h->acl_mtu ? total - off : h->acl_mtu;
+        put16(pkt, (uint16_t)((c->handle & 0x0FFF) | ((off == 0 ? 0x2 : 0x1) << 12)));
+        put16(pkt + 2, (uint16_t)len);
+        memcpy(pkt + 4, pdu + off, len);
+        if (h->ops.send_acl(h->ops.ctx, pkt, 4 + len) != 0) return -1;
+        h->acl_credits--;
+        off += len;
+    }
+    return 0;
 }
 
 static void send_sig(BtHost *h, BtConn *c, uint8_t code, uint8_t id, const uint8_t *data, size_t n) {
@@ -185,6 +209,7 @@ static void conn_rsp(BtHost *h, BtConn *c, uint8_t id, uint16_t dcid, uint16_t s
 static void open_chan(BtHost *h, BtConn *c, BtChan *ch, uint16_t psm) {
     memset(ch, 0, sizeof *ch);
     ch->psm = psm;
+    ch->rmtu = L2CAP_DEFAULT_MTU;
     ch->lcid = new_cid(h);
     ch->state = CH_WAIT_CONN_RSP;
     uint8_t d[4];
@@ -196,12 +221,29 @@ static void open_chan(BtHost *h, BtConn *c, BtChan *ch, uint16_t psm) {
 static BtChan *chan_by_lcid(BtConn *c, uint16_t lcid) {
     if (c->ctrl.state != CH_CLOSED && c->ctrl.lcid == lcid) return &c->ctrl;
     if (c->intr.state != CH_CLOSED && c->intr.lcid == lcid) return &c->intr;
+    for (int i = 0; i < BTH_EXT_CHANS; i++)
+        if (c->ext[i].state != CH_CLOSED && c->ext[i].lcid == lcid) return &c->ext[i];
     return NULL;
 }
+
+static BtChan *free_ext(BtConn *c) {
+    for (int i = 0; i < BTH_EXT_CHANS; i++) if (c->ext[i].state == CH_CLOSED) return &c->ext[i];
+    return NULL;
+}
+
+static int is_ext(BtConn *c, BtChan *ch) { return ch >= c->ext && ch < c->ext + BTH_EXT_CHANS; }
 
 static void check_open(BtHost *h, BtConn *c, BtChan *ch) {
     if (ch->state != CH_CONFIG || !ch->cfg_in_ok || !ch->cfg_out_ok) return;
     ch->state = CH_OPEN;
+    if (is_ext(c, ch)) {
+        if (c->state != BTC_OPEN) {                // the profile's first channel: the device is "connected"
+            c->state = BTC_OPEN;
+            report(h, c->addr, BTH_EV_CONNECTED, 0);
+        }
+        if (h->ops.l2cap_open) h->ops.l2cap_open(h->ops.ctx, c->addr, ch->psm, ch->lcid);
+        return;
+    }
     if (ch == &c->ctrl && c->initiator && c->intr.state == CH_CLOSED) open_chan(h, c, &c->intr, L2CAP_PSM_HID_INTR);
     if (c->ctrl.state == CH_OPEN && c->intr.state == CH_OPEN && c->state != BTC_OPEN) {
         c->state = BTC_OPEN;
@@ -228,13 +270,18 @@ static void on_sig(BtHost *h, BtConn *c, uint8_t code, uint8_t id, const uint8_t
         if (n < 4) return;
         uint16_t psm = le16(d), scid = le16(d + 2);
         BtChan *ch = psm == L2CAP_PSM_HID_CTRL ? &c->ctrl : psm == L2CAP_PSM_HID_INTR ? &c->intr : NULL;
+        if (!ch && h->ops.l2cap_accept && h->ops.l2cap_accept(h->ops.ctx, c->addr, psm)) {
+            ch = free_ext(c);
+            if (!ch) { conn_rsp(h, c, id, 0, scid, 0x0004, 0); return; }        // no resources
+        }
         if (!ch) { conn_rsp(h, c, id, 0, scid, 0x0002, 0); return; }            // PSM not supported
         if (ch->state != CH_CLOSED) { conn_rsp(h, c, id, 0, scid, 0x0004, 0); return; }   // no resources
         memset(ch, 0, sizeof *ch);
         ch->psm = psm;
+        ch->rmtu = L2CAP_DEFAULT_MTU;
         ch->lcid = new_cid(h);
         ch->rcid = scid;
-        if (!c->encrypted) {                     // HID needs an encrypted link: say "pending" until it is
+        if (!c->encrypted && psm != L2CAP_PSM_SDP) {   // profiles need an encrypted link (SDP doesn't)
             ch->state = CH_WAIT_SECURITY;
             ch->rsp_id = id;
             conn_rsp(h, c, id, ch->lcid, scid, 0x0001, 0x0001);   // pending, authentication pending
@@ -273,6 +320,8 @@ static void on_sig(BtHost *h, BtConn *c, uint8_t code, uint8_t id, const uint8_t
             send_sig(h, c, L2CAP_CMD_REJECT, id, r, 6);
             return;
         }
+        for (size_t o = 4; o + 2 <= n && o + 2 + d[o + 1] <= n; o += 2 + d[o + 1])
+            if ((d[o] & 0x7F) == 0x01 && d[o + 1] == 2) ch->rmtu = le16(d + o + 2);   // MTU option
         uint8_t r[6];
         put16(r, ch->rcid);
         put16(r + 2, 0);
@@ -304,14 +353,27 @@ static void on_sig(BtHost *h, BtConn *c, uint8_t code, uint8_t id, const uint8_t
         put16(r, dcid);
         put16(r + 2, scid);
         send_sig(h, c, L2CAP_DISCONN_RSP, id, r, 4);
-        if (ch) ch->state = CH_CLOSED;
+        if (ch) {
+            int ext = is_ext(c, ch);
+            uint16_t psm = ch->psm, cid = ch->lcid;
+            ch->state = CH_CLOSED;
+            if (ext) {
+                if (h->ops.l2cap_closed) h->ops.l2cap_closed(h->ops.ctx, c->addr, psm, cid);
+                return;
+            }
+        }
         if (c->state == BTC_OPEN) c->state = BTC_CHANNELS;
         return;
     }
     case L2CAP_DISCONN_RSP: {
         if (n < 4) return;
         BtChan *ch = chan_by_lcid(c, le16(d + 2));
-        if (ch) ch->state = CH_CLOSED;
+        if (ch) {
+            uint16_t psm = ch->psm, cid = ch->lcid;
+            int ext = is_ext(c, ch);
+            ch->state = CH_CLOSED;
+            if (ext && h->ops.l2cap_closed) h->ops.l2cap_closed(h->ops.ctx, c->addr, psm, cid);
+        }
         return;
     }
     case L2CAP_ECHO_REQ:
@@ -367,6 +429,10 @@ static void l2cap_rx(BtHost *h, BtConn *c, uint16_t cid, const uint8_t *d, size_
     }
     BtChan *ch = chan_by_lcid(c, cid);
     if (!ch || ch->state != CH_OPEN || n < 1) return;
+    if (is_ext(c, ch)) {
+        if (h->ops.l2cap_data) h->ops.l2cap_data(h->ops.ctx, c->addr, ch->psm, ch->lcid, d, n);
+        return;
+    }
     if (ch == &c->intr) {
         if (d[0] == HID_DATA_INPUT && n >= 2 && h->ops.hid_input) h->ops.hid_input(h->ops.ctx, c->addr, d + 1, n - 1);
     } else if (d[0] == HID_CONTROL_UNPLUG) {
@@ -521,7 +587,14 @@ void bthost_event(BtHost *h, const HciEvent *ev) {
         }
         accept_pending(h, c, &c->ctrl);
         accept_pending(h, c, &c->intr);
-        if (c->initiator && c->ctrl.state == CH_CLOSED) open_chan(h, c, &c->ctrl, L2CAP_PSM_HID_CTRL);
+        if (c->initiator && c->first_psm == L2CAP_PSM_HID_CTRL && c->ctrl.state == CH_CLOSED)
+            open_chan(h, c, &c->ctrl, L2CAP_PSM_HID_CTRL);
+        else if (c->initiator && c->first_psm && c->first_psm != L2CAP_PSM_HID_CTRL) {
+            BtChan *ch = free_ext(c);
+            int have = 0;
+            for (int i = 0; i < BTH_EXT_CHANS; i++) if (c->ext[i].state != CH_CLOSED && c->ext[i].psm == c->first_psm) have = 1;
+            if (ch && !have) open_chan(h, c, ch, c->first_psm);
+        }
         return;
     case HCI_EV_LINK_KEY_REQUEST: {
         if (n < 6) return;
@@ -572,6 +645,11 @@ void bthost_event(BtHost *h, const HciEvent *ev) {
         if (n < 10) return;
         report(h, p, BTH_EV_PASSKEY, (uint32_t)p[6] | ((uint32_t)p[7] << 8) | ((uint32_t)p[8] << 16) | ((uint32_t)p[9] << 24));
         return;
+    case HCI_EV_NUM_COMPLETED_PKTS:
+        if (n < 1) return;
+        for (size_t i = 0; i < p[0] && 1 + i * 4 + 4 <= n; i++) h->acl_credits += le16(p + 1 + i * 4 + 2);
+        if (h->acl_credits > h->acl_total) h->acl_credits = h->acl_total;
+        return;
     case HCI_EV_MODE_CHANGE:
         if (n < 6 || p[0] != 0) return;
         c = by_handle(h, le16(p + 1) & 0x0FFF);
@@ -590,4 +668,50 @@ void bthost_event(BtHost *h, const HciEvent *ev) {
     default:
         return;
     }
+}
+
+// ---------------------------------------------------------------- other-profile channels
+
+int bthost_l2cap_connect(BtHost *h, const uint8_t addr[6], uint16_t psm) {
+    BtConn *c = by_addr(h, addr);
+    if (!c || !c->handle || (!c->encrypted && psm != L2CAP_PSM_SDP)) return -1;
+    BtChan *ch = free_ext(c);
+    if (!ch) return -1;
+    open_chan(h, c, ch, psm);
+    return ch->lcid;
+}
+
+int bthost_l2cap_send(BtHost *h, const uint8_t addr[6], uint16_t cid, const uint8_t *d, size_t n) {
+    BtConn *c = by_addr(h, addr);
+    if (!c) return -1;
+    BtChan *ch = chan_by_lcid(c, cid);
+    if (!ch || ch->state != CH_OPEN || n > ch->rmtu) return -1;
+    int frags = (int)((4 + n + h->acl_mtu - 1) / h->acl_mtu);
+    if (h->acl_credits < frags) return -2;
+    return send_l2cap(h, c, ch->rcid, d, n);
+}
+
+int bthost_l2cap_close(BtHost *h, const uint8_t addr[6], uint16_t cid) {
+    BtConn *c = by_addr(h, addr);
+    if (!c) return -1;
+    BtChan *ch = chan_by_lcid(c, cid);
+    if (!ch) return -1;
+    uint8_t d[4];
+    put16(d, ch->rcid);
+    put16(d + 2, ch->lcid);
+    send_sig(h, c, L2CAP_DISCONN_REQ, next_id(h), d, 4);
+    uint16_t psm = ch->psm;
+    ch->state = CH_CLOSED;
+    if (is_ext(c, ch) && h->ops.l2cap_closed) h->ops.l2cap_closed(h->ops.ctx, c->addr, psm, cid);
+    return 0;
+}
+
+uint16_t bthost_l2cap_mtu(const BtHost *h, const uint8_t addr[6], uint16_t cid) {
+    for (int i = 0; i < BTH_MAX_CONN; i++) {
+        const BtConn *c = &h->c[i];
+        if (c->state == BTC_FREE || memcmp(c->addr, addr, 6)) continue;
+        for (int k = 0; k < BTH_EXT_CHANS; k++)
+            if (c->ext[k].state == CH_OPEN && c->ext[k].lcid == cid) return c->ext[k].rmtu;
+    }
+    return 0;
 }

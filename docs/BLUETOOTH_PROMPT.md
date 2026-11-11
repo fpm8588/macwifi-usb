@@ -166,6 +166,19 @@ audio.
 - [ ] HID over GATT (BLE keyboards/mice) and classic HID (L2CAP PSM 0x11/0x13) to CGEvent.
 - [ ] Checkpoint: type and point with a Bluetooth keyboard/mouse through the dongle.
 
+### B5a: A2DP stream with a test chime (built 2026-11-11, adapter test pending)
+- [x] `Shared/sbc.c` encoder (8 subbands, all modes, loudness/SNR), round-trip test with a spec decoder (66-69 dB
+      SNR, unity gain with synthesis window D = -8 C).
+- [x] `Shared/avdtp.c`: initiator (discover, capabilities, SBC choice 44.1k stereo 16/8 loudness bitpool <= 53,
+      configure, open, media channel, start, suspend/resume) and acceptor; `Shared/sdp.c`: A2DP source + AVRCP
+      records. `test_av`: 55 checks + fuzzing.
+- [x] bthost: channels for other PSMs (SDP before encryption; AVDTP, AVCTP after), remote MTU, ACL fragmentation,
+      Number Of Completed Packets credits (`bthost_l2cap_send` returns -2 when full: audio drops, never queues).
+- [x] Service: audio-class devices connect with AVDTP as the first profile; incoming devices may drive AVDTP
+      (we start it after 1.5 s if they don't); RTP + SBC packets paced by the sample clock; a chime on start;
+      suspend after 5 s of silence; "Play Test Sound"; no scans while streaming.
+- [ ] Hardware: pair AirPods (case button), hear the chime; reconnect after the case closes/opens; sleep/wake.
+
 ### B5: audio
 - [ ] BR/EDR connections, SSP pairing, SDP, AVDTP, SBC encoder (tested against reference vectors), A2DP source,
       AVRCP volume/play-pause.

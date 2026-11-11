@@ -59,7 +59,17 @@ static void f_hid(void *ctx, const uint8_t a[6], const uint8_t *r, size_t n) {
     memcpy(last_report, r, last_report_n);
 }
 
-static const BtHostOps kOps = {NULL, f_cmd, f_acl, f_key_load, f_key_store, f_key_forget, f_accept, f_event, f_hid};
+static int ext_open, ext_closed, ext_bytes;
+static uint16_t ext_psm, ext_cid;
+static int f_l2_accept(void *ctx, const uint8_t a[6], uint16_t psm) { (void)ctx; (void)a; return psm == L2CAP_PSM_SDP || psm == L2CAP_PSM_AVDTP; }
+static void f_l2_open(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid) { (void)ctx; (void)a; ext_open++; ext_psm = psm; ext_cid = cid; }
+static void f_l2_data(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid, const uint8_t *d, size_t n) {
+    (void)ctx; (void)a; (void)psm; (void)cid; (void)d; ext_bytes += (int)n;
+}
+static void f_l2_closed(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid) { (void)ctx; (void)a; (void)psm; (void)cid; ext_closed++; }
+
+static const BtHostOps kOps = {NULL, f_cmd, f_acl, f_key_load, f_key_store, f_key_forget, f_accept, f_event, f_hid,
+                               f_l2_accept, f_l2_open, f_l2_data, f_l2_closed};
 static const uint8_t ADDR[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
 
 static void reset_capture(void) { ncmds = 0; nacls = 0; nev = 0; }
@@ -359,6 +369,104 @@ static void test_reject_and_failures(void) {
     CHECK(bthost_state(&h2, ADDR) == BTC_FREE);
 }
 
+// An audio device: profile channel AVDTP, a big media packet split into ACL fragments, buffer credits, SDP before
+// encryption.
+static void test_profile_channels(void) {
+    BtHost h;
+    bthost_init(&h, &kOps);
+    bthost_set_acl(&h, 300, 4);
+    reset_capture();
+    have_key = 1;
+    ext_open = ext_closed = ext_bytes = 0;
+    CHECK(bthost_connect_profile(&h, ADDR, 1, 0, L2CAP_PSM_AVDTP) == 0);
+    cs(&h, HCI_OP_CREATE_CONN, 0);
+    uint8_t ccmp[11] = {0, 0x21, 0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x01, 0x00};
+    feed(&h, HCI_EV_CONN_COMPLETE, ccmp, 11);
+    cs(&h, HCI_OP_AUTH_REQUESTED, 0);
+    // SDP from the device before encryption: accepted at once
+    uint8_t sreq[4] = {0x01, 0x00, 0x70, 0x00};
+    dev_sig(&h, 0x21, L2CAP_CONN_REQ, 0x51, sreq, 4);
+    uint8_t id = 0;
+    const uint8_t *rsp = host_sig(L2CAP_CONN_RSP, &id, NULL);
+    CHECK(rsp && id == 0x51 && u16(rsp + 4) == 0);
+    uint16_t lsdp = rsp ? u16(rsp) : 0;
+    const uint8_t *cq = host_sig(L2CAP_CONF_REQ, &id, NULL);
+    uint8_t c1[6] = {(uint8_t)lsdp, (uint8_t)(lsdp >> 8), 0, 0, 0, 0};
+    dev_sig(&h, 0x21, L2CAP_CONF_RSP, id, c1, 6);
+    uint8_t c2[4] = {(uint8_t)lsdp, (uint8_t)(lsdp >> 8), 0, 0};
+    dev_sig(&h, 0x21, L2CAP_CONF_REQ, 0x52, c2, 4);
+    CHECK(cq && ext_open == 1 && ext_psm == L2CAP_PSM_SDP && ext_cid == lsdp);
+    CHECK(bthost_state(&h, ADDR) == BTC_OPEN);
+    uint8_t q[5] = {0x06, 0, 1, 0, 0};
+    dev_l2cap(&h, 0x21, lsdp, q, 5);
+    CHECK(ext_bytes == 5);
+    // A PSM nobody takes is refused
+    uint8_t xreq[4] = {0x23, 0x10, 0x71, 0x00};
+    dev_sig(&h, 0x21, L2CAP_CONN_REQ, 0x53, xreq, 4);
+    rsp = host_sig(L2CAP_CONN_RSP, &id, NULL);
+    CHECK(rsp && id == 0x53 && u16(rsp + 4) == 0x0002);
+    feed(&h, HCI_EV_LINK_KEY_REQUEST, ADDR, 6);
+    cc(&h, HCI_OP_LINK_KEY_REPLY);
+    uint8_t ac[3] = {0, 0x21, 0};
+    feed(&h, HCI_EV_AUTH_COMPLETE, ac, 3);
+    cs(&h, HCI_OP_SET_CONN_ENCRYPT, 0);
+    uint8_t ec[4] = {0, 0x21, 0, 1};
+    feed(&h, HCI_EV_ENCRYPT_CHANGE, ec, 4);
+    // We open AVDTP (the profile channel); the device answers with an MTU of 895
+    const uint8_t *req = host_sig(L2CAP_CONN_REQ, &id, NULL);
+    CHECK(req && u16(req) == L2CAP_PSM_AVDTP);
+    uint16_t lav = req ? u16(req + 2) : 0;
+    uint8_t r1[8] = {0x80, 0x00, (uint8_t)lav, (uint8_t)(lav >> 8), 0, 0, 0, 0};
+    dev_sig(&h, 0x21, L2CAP_CONN_RSP, id, r1, 8);
+    cq = host_sig(L2CAP_CONF_REQ, &id, NULL);
+    uint8_t r2[6] = {(uint8_t)lav, (uint8_t)(lav >> 8), 0, 0, 0, 0};
+    dev_sig(&h, 0x21, L2CAP_CONF_RSP, id, r2, 6);
+    uint8_t r3[8] = {(uint8_t)lav, (uint8_t)(lav >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03};   // MTU 895
+    dev_sig(&h, 0x21, L2CAP_CONF_REQ, 0x54, r3, 8);
+    CHECK(ext_open == 2 && ext_psm == L2CAP_PSM_AVDTP && ext_cid == lav);
+    CHECK(bthost_l2cap_mtu(&h, ADDR, lav) == 895);
+    // A second channel to the same PSM (AVDTP media), opened by us
+    int lmedia = bthost_l2cap_connect(&h, ADDR, L2CAP_PSM_AVDTP);
+    CHECK(lmedia > 0 && lmedia != lav);
+    req = host_sig(L2CAP_CONN_REQ, &id, NULL);
+    uint8_t m1[8] = {0x81, 0x00, (uint8_t)lmedia, (uint8_t)(lmedia >> 8), 0, 0, 0, 0};
+    dev_sig(&h, 0x21, L2CAP_CONN_RSP, id, m1, 8);
+    cq = host_sig(L2CAP_CONF_REQ, &id, NULL);
+    uint8_t m2[6] = {(uint8_t)lmedia, (uint8_t)(lmedia >> 8), 0, 0, 0, 0};
+    dev_sig(&h, 0x21, L2CAP_CONF_RSP, id, m2, 6);
+    uint8_t m3[8] = {(uint8_t)lmedia, (uint8_t)(lmedia >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03};
+    dev_sig(&h, 0x21, L2CAP_CONF_REQ, 0x55, m3, 8);
+    CHECK(ext_open == 3 && ext_cid == (uint16_t)lmedia);
+    // 800 bytes: 804 with the L2CAP header = 3 ACL packets of <= 300 (credits 4)
+    uint8_t big[900];
+    for (int i = 0; i < 900; i++) big[i] = (uint8_t)i;
+    uint8_t nocp0[5] = {1, 0x21, 0x00, 40, 0};                                  // signaling packets completed
+    feed(&h, HCI_EV_NUM_COMPLETED_PKTS, nocp0, 5);
+    CHECK(h.acl_credits == 4);
+    int before = nacls;
+    CHECK(bthost_l2cap_send(&h, ADDR, (uint16_t)lmedia, big, 800) == 0);
+    CHECK(nacls == before + 3);
+    CHECK(acls[before].n == 304 && (acls[before].p[1] >> 4) == 0x2 && u16(acls[before].p + 4) == 800 &&
+          u16(acls[before].p + 6) == 0x0081);
+    CHECK((acls[before + 1].p[1] >> 4) == 0x1 && (acls[before + 2].p[1] >> 4) == 0x1 && acls[before + 2].n == 4 + 204);
+    CHECK(memcmp(acls[before + 1].p + 4, big + 296, 300) == 0);
+    CHECK(bthost_l2cap_send(&h, ADDR, (uint16_t)lmedia, big, 800) == -2);       // 1 credit left
+    CHECK(bthost_l2cap_send(&h, ADDR, (uint16_t)lmedia, big, 896) == -1);       // over the MTU
+    uint8_t nocp[5] = {1, 0x21, 0x00, 3, 0};
+    feed(&h, HCI_EV_NUM_COMPLETED_PKTS, nocp, 5);
+    CHECK(bthost_l2cap_send(&h, ADDR, (uint16_t)lmedia, big, 800) == 0);
+    uint8_t nocp2[5] = {1, 0x21, 0x00, 50, 0};
+    feed(&h, HCI_EV_NUM_COMPLETED_PKTS, nocp2, 5);
+    CHECK(h.acl_credits == 4);                                                  // capped at the controller's total
+    // We close the media channel; the device closes signaling
+    CHECK(bthost_l2cap_close(&h, ADDR, (uint16_t)lmedia) == 0 && ext_closed == 1);
+    CHECK(host_sig(L2CAP_DISCONN_REQ, NULL, NULL) != NULL);
+    uint8_t dr[4] = {(uint8_t)lav, (uint8_t)(lav >> 8), 0x80, 0x00};
+    dev_sig(&h, 0x21, L2CAP_DISCONN_REQ, 0x56, dr, 4);
+    CHECK(ext_closed == 2);
+    CHECK(bthost_l2cap_send(&h, ADDR, lav, big, 10) == -1);
+}
+
 static void test_cmd_flow(void) {
     BtHost h;
     bthost_init(&h, &kOps);
@@ -459,6 +567,7 @@ int main(void) {
     test_pair_keyboard();
     test_reconnect_incoming();
     test_reject_and_failures();
+    test_profile_channels();
     test_cmd_flow();
     test_hidboot();
     test_fuzz();

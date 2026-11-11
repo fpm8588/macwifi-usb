@@ -18,6 +18,15 @@ supplicant), `Sources/Shared/dhcp.[ch]`, `Sources/Shared/bridge.[ch]`, `Sources/
 `fwload`, `up`, `scan`, `connect` and `join`), `Tests/*` (including the stand-in macOS headers in `Tests/macstubs`),
 `build.sh`, `scripts/*`.
 
+## Bluetooth host (GPL-2.0)
+
+`Sources/Shared/hci.[ch]`, `bthost.[ch]`, `hidboot.[ch]`, `sbc.[ch]`, `avdtp.[ch]`, `sdp.[ch]` and
+`Sources/macwifictl/bt_usb.[ch]` were written for this project from the Bluetooth Core Specification v5.4, the HID
+Profile, AVDTP 1.3, A2DP 1.3, the USB HID 1.11 / HID Usage Tables 1.4 documents and Apple's documented key codes.
+The 80 SBC prototype-filter coefficients in `sbc.c` are the table of the A2DP specification (Appendix B); the values
+were taken from BlueZ's SBC implementation (`alsa/sbc.c`, Copyright (C) 2004-2006 Marcel Holtmann, (C) 2004-2005
+Henryk Ploetz, LGPL-2.1-or-later), where they are reproduced from that specification. No other BlueZ code was used.
+
 ## AIC8800 Linux driver (GPL-2.0-only)
 
 Hardware facts in `Sources/Shared/aic8800.h` (USB IDs, message ids and layouts, framing, addresses, firmware

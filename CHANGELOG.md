@@ -5,6 +5,12 @@
 **New**
 - Bluetooth, phase B1: `macwifictl bt` opens the adapter's own Bluetooth controller from user space (no kext),
   identifies it and lists nearby Bluetooth LE and classic devices. Plan: `docs/BLUETOOTH_PROMPT.md`.
+- Bluetooth audio, first step (phase B5a): AirPods and other headphones connect as an A2DP audio sink. New
+  from-scratch pieces: an SBC encoder (checked against a spec decoder: 66-69 dB SNR at bitpool 53), AVDTP
+  signaling as initiator and acceptor, an SDP server advertising an A2DP source and AVRCP, L2CAP channels for
+  other profiles with ACL fragmentation and controller buffer accounting. A short chime plays when audio is up;
+  "Play Test Sound" in the device's menu plays it again. macOS audio output comes next (B5b, a Core Audio device).
+- Bluetooth mouse: no sniff mode, higher-priority input path, no Wi-Fi scan when the menu opens.
 - Bluetooth keyboards and mice (phases B3/B4, classic Bluetooth): click a device in the Bluetooth tab to
   connect. Pairing uses Secure Simple Pairing (keyboards show a 6-digit code to type), the HID control and
   interrupt channels open in boot protocol, and the menu app turns key presses, pointer movement, clicks and the

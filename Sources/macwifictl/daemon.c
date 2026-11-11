@@ -305,7 +305,7 @@ typedef struct {
     double t;
 } BtDevStatus;
 
-enum { BT_ACT_CONNECT = 1, BT_ACT_DISCONNECT, BT_ACT_FORGET };
+enum { BT_ACT_CONNECT = 1, BT_ACT_DISCONNECT, BT_ACT_FORGET, BT_ACT_SOUND };
 
 static struct {
     BtPaired paired[BT_PAIRED_MAX];
@@ -550,6 +550,9 @@ static int bh_accept(void *ctx, const uint8_t a[6], uint32_t cod) {
     pthread_mutex_unlock(&gBt.mu);
     return p != NULL;              // only paired devices may connect to us
 }
+static int audio_is(const uint8_t a[6]);
+static void audio_reset(void);
+
 static void bh_event(void *ctx, const uint8_t a[6], BtHostEvent ev, uint32_t v) {
     (void)ctx;
     if (ev == BTH_EV_MODE) {                          // only logged: sniff mode explains a laggy mouse
@@ -595,6 +598,7 @@ static void bh_event(void *ctx, const uint8_t a[6], BtHostEvent ev, uint32_t v) 
     if (ev == BTH_EV_DISCONNECTED || ev == BTH_EV_FAILED || ev == BTH_EV_UNPLUGGED) {
         int slot = hid_slot(a, 0);
         if (slot >= 0) hid_release_all(slot);      // never leave a key or button held down
+        if (audio_is(a)) audio_reset();
     }
 }
 static void bh_hid_input(void *ctx, const uint8_t a[6], const uint8_t *r, size_t n) {
@@ -639,8 +643,199 @@ static void bh_hid_input(void *ctx, const uint8_t a[6], const uint8_t *r, size_t
     }
 }
 
+// ---- audio (A2DP source, phase B5): one stream at a time
+
+typedef struct {
+    int active;                 // a device with an AVDTP signaling channel
+    uint8_t addr[6];
+    uint16_t sig_cid, media_cid;
+    Avdtp av;
+    int we_started;             // we opened the signaling channel (we drive AVDTP)
+    int streaming;
+    SbcEncoder enc;
+    SbcConfig cfg;
+    double next_due, rate;
+    uint32_t ts;
+    uint16_t seq;
+    double tone_until, idle_since, avdtp_kick;
+    double phase;
+    unsigned long packets, dropped;
+} BtAudio;
+static BtAudio gAudio;
+
+static int audio_is(const uint8_t a[6]) { return gAudio.active && !memcmp(gAudio.addr, a, 6); }
+
+static int av_send(void *ctx, const uint8_t *d, size_t n) {
+    (void)ctx;
+    if (!gAudio.sig_cid) return -1;
+    int r = bthost_l2cap_send(&gHost, gAudio.addr, gAudio.sig_cid, d, n);
+    if (r == -2) {                                      // buffers full of media: drain a little, then try once more
+        uint8_t ev[HCI_MAX_EVENT];
+        size_t m = 0;
+        if (gBtLink && bt_next_event(gBtLink, ev, &m, 20) == 1) {
+            HciEvent e;
+            if (hci_event(ev, m, &e) == 0) bthost_event(&gHost, &e);
+        }
+        r = bthost_l2cap_send(&gHost, gAudio.addr, gAudio.sig_cid, d, n);
+    }
+    return r;
+}
+static void av_open_media(void *ctx) {
+    (void)ctx;
+    int cid = bthost_l2cap_connect(&gHost, gAudio.addr, L2CAP_PSM_AVDTP);
+    if (cid < 0) { printf("[macwifid] Bluetooth audio: couldn't open the media channel\n"); fflush(stdout); }
+}
+static void av_streaming(void *ctx, int on, const SbcConfig *cfg) {
+    (void)ctx;
+    if (on) {
+        gAudio.cfg = *cfg;
+        if (sbc_init(&gAudio.enc, cfg) != 0) { printf("[macwifid] Bluetooth audio: bad SBC settings\n"); return; }
+        static const double fs[4] = {16000, 32000, 44100, 48000};
+        gAudio.rate = fs[cfg->fs & 3];
+        gAudio.streaming = 1;
+        gAudio.next_due = now_s();
+        gAudio.idle_since = now_s();
+        if (gAudio.tone_until < now_s()) gAudio.tone_until = now_s() + 1.2;   // a short chime: it works
+        printf("[macwifid] Bluetooth audio: streaming SBC %.1f kHz, %s, %d blocks, bitpool %d (%zu-byte frames)\n",
+               gAudio.rate / 1000, cfg->mode == SBC_MODE_MONO ? "mono" : cfg->mode == SBC_MODE_JOINT ? "joint stereo"
+                                   : cfg->mode == SBC_MODE_DUAL ? "dual channel" : "stereo",
+               cfg->blocks, cfg->bitpool, sbc_frame_length(cfg));
+    } else if (gAudio.streaming) {
+        gAudio.streaming = 0;
+        printf("[macwifid] Bluetooth audio: stream paused (%lu packets sent, %lu dropped)\n", gAudio.packets, gAudio.dropped);
+    }
+    fflush(stdout);
+}
+static void av_failed(void *ctx, const char *why) {
+    (void)ctx;
+    printf("[macwifid] Bluetooth audio: %s\n", why);
+    fflush(stdout);
+    pthread_mutex_lock(&gBt.mu);
+    BtDevStatus *s = bs_get(gAudio.addr, 1);
+    snprintf(s->state, sizeof s->state, "failed");
+    snprintf(s->why, sizeof s->why, "%s", why);
+    s->t = now_s();
+    pthread_mutex_unlock(&gBt.mu);
+}
+static const AvdtpOps kAvOps = {NULL, av_send, av_open_media, av_streaming, av_failed};
+
+static void audio_reset(void) {
+    if (gAudio.streaming) av_streaming(NULL, 0, &gAudio.cfg);
+    memset(&gAudio, 0, sizeof gAudio);
+}
+
+// One media packet: RTP header (12 bytes, payload type 96), the SBC payload header (number of frames), frames.
+// Paced by the sample clock; when the controller's buffers are full the packet is dropped, never queued (late audio
+// is worse than a gap). Silence after the chime; after 5 s of nothing to play the stream is suspended.
+static void audio_pump(void) {
+    if (!gAudio.streaming || !gAudio.media_cid) return;
+    double t = now_s();
+    if (t < gAudio.next_due) return;
+    if (t - gAudio.next_due > 0.25) gAudio.next_due = t;          // we stalled (e.g. a scan): don't burst
+    size_t flen = sbc_frame_length(&gAudio.cfg);
+    int spf = sbc_frame_samples(&gAudio.cfg);
+    uint16_t mtu = bthost_l2cap_mtu(&gHost, gAudio.addr, gAudio.media_cid);
+    int frames = (int)((mtu > 13 ? mtu - 13 : 0) / flen);
+    if (frames > 15) frames = 15;
+    if (frames < 1) return;
+    int nch = gAudio.enc.channels;
+    int16_t pcm[16 * 8 * 2];
+    uint8_t pkt[13 + 15 * 520];
+    size_t o = 13;
+    int playing = t < gAudio.tone_until;
+    for (int f = 0; f < frames; f++) {
+        for (int i = 0; i < spf; i++) {
+            double v = 0;
+            if (playing) {            // two soft tones (E5 then A5) with a fade, like a connect chime
+                double el = 1.2 - (gAudio.tone_until - t);
+                double fr = el < 0.45 ? 659.25 : 880.0;
+                double env = el < 0.45 ? (el / 0.45) : (1.2 - el) / 0.75;
+                if (env < 0) env = 0;
+                v = 0.25 * env * sin(gAudio.phase);
+                gAudio.phase += 2 * M_PI * fr / gAudio.rate;
+                if (gAudio.phase > 2 * M_PI) gAudio.phase -= 2 * M_PI;
+            }
+            int16_t s = (int16_t)(v * 32767);
+            for (int c = 0; c < nch; c++) pcm[i * nch + c] = s;
+        }
+        if (!sbc_encode(&gAudio.enc, pcm, pkt + o, sizeof pkt - o)) return;
+        o += flen;
+    }
+    pkt[0] = 0x80;                                   // RTP version 2
+    pkt[1] = 0x60;                                   // payload type 96 (dynamic)
+    pkt[2] = (uint8_t)(gAudio.seq >> 8);
+    pkt[3] = (uint8_t)gAudio.seq;
+    pkt[4] = (uint8_t)(gAudio.ts >> 24);
+    pkt[5] = (uint8_t)(gAudio.ts >> 16);
+    pkt[6] = (uint8_t)(gAudio.ts >> 8);
+    pkt[7] = (uint8_t)gAudio.ts;
+    pkt[8] = 0; pkt[9] = 0; pkt[10] = 0; pkt[11] = 1; // SSRC
+    pkt[12] = (uint8_t)frames;                       // SBC payload header: not fragmented, frame count
+    gAudio.seq++;
+    gAudio.ts += (uint32_t)(frames * spf);
+    gAudio.next_due += frames * spf / gAudio.rate;
+    if (bthost_l2cap_send(&gHost, gAudio.addr, gAudio.media_cid, pkt, o) == 0) gAudio.packets++;
+    else gAudio.dropped++;
+    if (playing) gAudio.idle_since = t;
+    else if (t - gAudio.idle_since > 5) avdtp_suspend(&gAudio.av);   // nothing to play: let the earbuds rest
+}
+
+static int bh_l2_accept(void *ctx, const uint8_t a[6], uint16_t psm) {
+    (void)ctx;
+    if (psm == L2CAP_PSM_SDP || psm == L2CAP_PSM_AVCTP) return 1;
+    if (psm == L2CAP_PSM_AVDTP) return !gAudio.active || audio_is(a);   // one audio device at a time
+    return 0;
+}
+static void bh_l2_open(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid) {
+    (void)ctx;
+    if (psm != L2CAP_PSM_AVDTP) return;
+    if (!gAudio.active) {                               // the first AVDTP channel is signaling
+        memset(&gAudio, 0, sizeof gAudio);
+        gAudio.active = 1;
+        memcpy(gAudio.addr, a, 6);
+        gAudio.sig_cid = cid;
+        avdtp_init(&gAudio.av, &kAvOps);
+        BtConnState cs = bthost_state(&gHost, a);
+        (void)cs;
+        for (int i = 0; i < BTH_MAX_CONN; i++)
+            if (gHost.c[i].state != BTC_FREE && !memcmp(gHost.c[i].addr, a, 6) && gHost.c[i].initiator) gAudio.we_started = 1;
+        if (gAudio.we_started) avdtp_start(&gAudio.av);
+        else gAudio.avdtp_kick = now_s() + 1.5;         // give the device a moment to drive it; then we do
+        printf("[macwifid] Bluetooth audio: signaling channel open\n");
+    } else if (audio_is(a) && !gAudio.media_cid) {      // the second is the media transport
+        gAudio.media_cid = cid;
+        printf("[macwifid] Bluetooth audio: media channel open (MTU %u)\n", bthost_l2cap_mtu(&gHost, a, cid));
+        avdtp_media_open(&gAudio.av, 1);
+    }
+    fflush(stdout);
+}
+static void bh_l2_data(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid, const uint8_t *d, size_t n) {
+    (void)ctx;
+    if (psm == L2CAP_PSM_SDP) {
+        uint8_t rsp[512];
+        size_t m = sdp_server_handle(d, n, rsp, sizeof rsp);
+        if (m) bthost_l2cap_send(&gHost, a, cid, rsp, m);
+        return;
+    }
+    if (psm == L2CAP_PSM_AVDTP && audio_is(a) && cid == gAudio.sig_cid) {
+        gAudio.avdtp_kick = 0;                          // the device is driving AVDTP
+        avdtp_rx(&gAudio.av, d, n);
+    }
+    // AVCTP (remote control): accepted so the device is happy; commands aren't acted on yet.
+}
+static void bh_l2_closed(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid) {
+    (void)ctx;
+    if (psm != L2CAP_PSM_AVDTP || !audio_is(a)) return;
+    if (cid == gAudio.media_cid) {
+        gAudio.media_cid = 0;
+        avdtp_media_open(&gAudio.av, 0);
+    } else if (cid == gAudio.sig_cid) {
+        audio_reset();
+    }
+}
+
 static const BtHostOps kBtOps = {NULL, bh_send_cmd, bh_send_acl, bh_key_load, bh_key_store, bh_key_forget,
-                                 bh_accept, bh_event, bh_hid_input};
+                                 bh_accept, bh_event, bh_hid_input, bh_l2_accept, bh_l2_open, bh_l2_data, bh_l2_closed};
 
 static void bt_acl_in(void *ctx, const uint8_t *pkt, size_t n) {
     (void)ctx;
@@ -738,6 +933,7 @@ static void bt_down(BtLink **b, const char *why) {
         // HCI Reset drops every link at once (fast, for sleep); the devices notice and reconnect later.
         bt_call(*b, HCI_OP_RESET, NULL, 0, NULL, 0, NULL, 800, NULL, NULL);
         bt_set_acl_handler(*b, NULL, NULL);
+        audio_reset();
         gBtLink = NULL;
         bthost_reset(&gHost);
         for (int i = 0; i < BTH_MAX_CONN; i++) hid_release_all(i);
@@ -794,6 +990,13 @@ static BtLink *bt_up(void) {
     uint8_t scan = 0x02;                                 // page scan only
     bt_call(b, HCI_OP_WRITE_SCAN_ENABLE, &scan, 1, NULL, 0, NULL, 2000, bt_d_event, &run);
     bthost_init(&gHost, &kBtOps);
+    uint8_t bs[16];
+    size_t bsl = 0;
+    if (bt_call(b, HCI_OP_READ_BUFFER_SIZE, NULL, 0, bs, sizeof bs, &bsl, 2000, bt_d_event, &run) == 0 && bsl >= 7) {
+        uint16_t acl_len = (uint16_t)(bs[0] | (bs[1] << 8)), acl_num = (uint16_t)(bs[3] | (bs[4] << 8));
+        bthost_set_acl(&gHost, acl_len, acl_num);
+        printf("[macwifid] Bluetooth ACL buffers: %u x %u bytes\n", acl_num, acl_len);
+    }
     gBtLink = b;
     bt_set_acl_handler(b, bt_acl_in, NULL);
     pthread_mutex_lock(&gBt.mu);
@@ -959,14 +1162,26 @@ static void *bt_thread(void *arg) {
             if (act[i].op == BT_ACT_CONNECT) {
                 uint8_t psrm = 1;
                 uint16_t co = 0;
+                int audio = 0;
                 pthread_mutex_lock(&gBt.mu);
                 for (int k = 0; k < gBt.ndev; k++)
                     if (gBt.dev[k].kind == HCI_DEV_CLASSIC && !memcmp(gBt.dev[k].addr, act[i].addr, 6)) {
                         psrm = gBt.dev[k].psrm;
                         co = gBt.dev[k].clock_offset;
+                        if (((gBt.dev[k].cod >> 8) & 0x1F) == 4) audio = 1;           // major class Audio/Video
                     }
+                const BtPaired *pp = bp_find(act[i].addr);
+                if (pp && (((pp->cod >> 8) & 0x1F) == 4 || !strcmp(pp->type, "Audio"))) audio = 1;
                 pthread_mutex_unlock(&gBt.mu);
-                if (bthost_connect(&gHost, act[i].addr, psrm, co) != 0) {
+                if (audio && gAudio.active && !audio_is(act[i].addr)) {
+                    pthread_mutex_lock(&gBt.mu);
+                    BtDevStatus *s = bs_get(act[i].addr, 1);
+                    snprintf(s->state, sizeof s->state, "failed");
+                    snprintf(s->why, sizeof s->why, "another audio device is connected");
+                    pthread_mutex_unlock(&gBt.mu);
+                    continue;
+                }
+                if (bthost_connect_profile(&gHost, act[i].addr, psrm, co, audio ? L2CAP_PSM_AVDTP : L2CAP_PSM_HID_CTRL) != 0) {
                     pthread_mutex_lock(&gBt.mu);
                     BtDevStatus *s = bs_get(act[i].addr, 1);
                     if (bthost_state(&gHost, act[i].addr) == BTC_FREE) {
@@ -974,6 +1189,14 @@ static void *bt_thread(void *arg) {
                         snprintf(s->why, sizeof s->why, "too many Bluetooth connections");
                     }
                     pthread_mutex_unlock(&gBt.mu);
+                }
+            } else if (act[i].op == BT_ACT_SOUND) {
+                if (audio_is(act[i].addr)) {
+                    gAudio.tone_until = now_s() + 1.2;
+                    gAudio.phase = 0;
+                    if (!gAudio.streaming) {
+                        if (avdtp_resume(&gAudio.av) != 0 && gAudio.av.state == AV_IDLE) avdtp_start(&gAudio.av);
+                    }
                 }
             } else {
                 bthost_disconnect(&gHost, act[i].addr);
@@ -987,14 +1210,25 @@ static void *bt_thread(void *arg) {
             }
         }
         bthost_poll(&gHost, now_s());
+        if (gAudio.active && gAudio.avdtp_kick > 0 && now_s() >= gAudio.avdtp_kick) {
+            gAudio.avdtp_kick = 0;
+            if (gAudio.av.state == AV_IDLE) avdtp_start(&gAudio.av);   // the device didn't set the stream up itself
+        }
+        audio_pump();
         pthread_mutex_lock(&gBt.mu);
-        int scan = gBt.scan_req && !bt_busy_connecting();   // an inquiry would slow paging down
+        // an inquiry would slow paging down and starve the audio stream
+        int scan = gBt.scan_req && !bt_busy_connecting() && !gAudio.streaming;
         if (scan) gBt.scan_req = 0;
         pthread_mutex_unlock(&gBt.mu);
         if (scan && bt_scan_once(d, b) != 0) { bt_down(&b, "lost the adapter"); next_try = now_s() + 2; continue; }
         uint8_t ev[HCI_MAX_EVENT];
         size_t n = 0;
-        int r = bt_next_event(b, ev, &n, 100);   // idle: handle events (connections, input), notice unplugging
+        int wait_ms = 100;
+        if (gAudio.streaming) {                   // wake up in time for the next audio packet
+            double dt = (gAudio.next_due - now_s()) * 1000;
+            wait_ms = dt < 1 ? 1 : dt > 20 ? 20 : (int)dt;
+        }
+        int r = bt_next_event(b, ev, &n, wait_ms);   // handle events (connections, input), notice unplugging
         if (r < 0) { bt_down(&b, "lost the adapter"); next_try = now_s() + 2; continue; }
         HciEvent e;
         if (r == 1 && hci_event(ev, n, &e) == 0) bt_d_event(NULL, &e);
@@ -1032,6 +1266,7 @@ static void reply_bt(JsonOut *j) {
         jo_int(j, "age", (long long)(t - gBt.seen[i]));
         jo_bool(j, "paired", pp != NULL);
         jo_str(j, "state", s ? s->state : "");
+        if (audio_is(v->addr)) jo_str(j, "audio", gAudio.streaming ? "playing" : gAudio.media_cid ? "ready" : "setting up");
         if (s && s->has_passkey) jo_int(j, "passkey", s->passkey);
         if (s && !strcmp(s->state, "failed")) jo_str(j, "why", s->why);
         jo_end_obj(j);
@@ -1055,6 +1290,7 @@ static void reply_bt(JsonOut *j) {
         jo_int(j, "age", -1);
         jo_bool(j, "paired", 1);
         jo_str(j, "state", s ? s->state : "");
+        if (audio_is(pp->addr)) jo_str(j, "audio", gAudio.streaming ? "playing" : gAudio.media_cid ? "ready" : "setting up");
         if (s && s->has_passkey) jo_int(j, "passkey", s->passkey);
         if (s && !strcmp(s->state, "failed")) jo_str(j, "why", s->why);
         jo_end_obj(j);
@@ -1191,7 +1427,8 @@ static void serve_client(Daemon *d, int fd) {
             }
             jo_bool(&j, "ok", 1);
             reply_bt(&j);
-        } else if (!strcmp(cmd, "bt_connect") || !strcmp(cmd, "bt_disconnect") || !strcmp(cmd, "bt_forget")) {
+        } else if (!strcmp(cmd, "bt_connect") || !strcmp(cmd, "bt_disconnect") || !strcmp(cmd, "bt_forget") ||
+                   !strcmp(cmd, "bt_test_sound")) {
             size_t il = 0;
             const char *id = json_str(&o, "id", &il);
             uint8_t a[6];
@@ -1200,7 +1437,7 @@ static void serve_client(Daemon *d, int fd) {
                 jo_str(&j, "error", "bad device id");
             } else {
                 int op = !strcmp(cmd, "bt_connect") ? BT_ACT_CONNECT : !strcmp(cmd, "bt_disconnect") ? BT_ACT_DISCONNECT
-                                                                                                 : BT_ACT_FORGET;
+                       : !strcmp(cmd, "bt_forget") ? BT_ACT_FORGET : BT_ACT_SOUND;
                 pthread_mutex_lock(&gBt.mu);
                 int le_only = 0;
                 for (int k = 0; k < gBt.ndev; k++)

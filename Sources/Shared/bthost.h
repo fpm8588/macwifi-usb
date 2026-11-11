@@ -55,8 +55,12 @@
 
 // L2CAP [Vol 3 Part A 4]
 #define L2CAP_CID_SIGNALING   0x0001
+#define L2CAP_PSM_SDP         0x0001
 #define L2CAP_PSM_HID_CTRL    0x0011
 #define L2CAP_PSM_HID_INTR    0x0013
+#define L2CAP_PSM_AVCTP       0x0017
+#define L2CAP_PSM_AVDTP       0x0019
+#define L2CAP_DEFAULT_MTU     672
 #define L2CAP_CMD_REJECT      0x01
 #define L2CAP_CONN_REQ        0x02
 #define L2CAP_CONN_RSP        0x03
@@ -93,7 +97,10 @@ typedef struct {
     uint8_t cfg_out_ok;      // our Configuration Request was accepted
     uint8_t cfg_in_ok;       // we accepted theirs
     uint8_t rsp_id;          // incoming connection answered "pending": the request's identifier
+    uint16_t rmtu;           // the largest SDU the other side accepts (its MTU option; 672 by default)
 } BtChan;
+
+#define BTH_EXT_CHANS 4      // channels for other profiles (SDP, AVDTP signaling + media, AVCTP)
 
 typedef struct {
     uint8_t state;           // BtConnState
@@ -101,7 +108,9 @@ typedef struct {
     uint16_t handle;
     uint8_t initiator, encrypted, have_key_rq, protocol_sent;
     uint32_t cod;
+    uint16_t first_psm;      // as initiator: the profile channel opened once encrypted (HID control or AVDTP)
     BtChan ctrl, intr;
+    BtChan ext[BTH_EXT_CHANS];
     uint8_t rx[1024];        // L2CAP reassembly
     size_t rx_have, rx_need;
 } BtConn;
@@ -131,6 +140,12 @@ typedef struct {
     void (*event)(void *ctx, const uint8_t addr[6], BtHostEvent ev, uint32_t value);
     // An input report from the HID interrupt channel (report ID first, then the data).
     void (*hid_input)(void *ctx, const uint8_t addr[6], const uint8_t *report, size_t n);
+    // Other profiles. accept: whether to take an incoming channel to `psm` (1 = yes). open / data / closed: a
+    // channel `cid` (our channel id) to `psm` became usable, carried data, went away.
+    int (*l2cap_accept)(void *ctx, const uint8_t addr[6], uint16_t psm);
+    void (*l2cap_open)(void *ctx, const uint8_t addr[6], uint16_t psm, uint16_t cid);
+    void (*l2cap_data)(void *ctx, const uint8_t addr[6], uint16_t psm, uint16_t cid, const uint8_t *d, size_t n);
+    void (*l2cap_closed)(void *ctx, const uint8_t addr[6], uint16_t psm, uint16_t cid);
 } BtHostOps;
 
 #define BTH_CMDQ 24
@@ -144,6 +159,9 @@ typedef struct {
     int qh, qn, credits;
     double last_send;
     unsigned long dropped_cmds;
+    // ACL data flow control (Read Buffer Size, Number Of Completed Packets)
+    uint16_t acl_mtu;
+    int acl_total, acl_credits;
 } BtHost;
 
 void bthost_init(BtHost *h, const BtHostOps *ops);
@@ -157,9 +175,22 @@ void bthost_acl(BtHost *h, const uint8_t *pkt, size_t n);
 // hasn't reported free command slots for a while.
 void bthost_poll(BtHost *h, double now);
 
-// Connects to a classic device (from an inquiry result: page scan mode and clock offset speed up paging).
-// 0, or -1 if already connecting/connected or no free slot.
+// Connects to a classic device (from an inquiry result: page scan mode and clock offset speed up paging) and,
+// once the link is encrypted, opens the HID channels. 0, or -1 if already connecting/connected or no free slot.
 int bthost_connect(BtHost *h, const uint8_t addr[6], uint8_t psrm, uint16_t clock_offset);
+// The same for another profile: opens a channel to `first_psm` (e.g. AVDTP) when encrypted.
+int bthost_connect_profile(BtHost *h, const uint8_t addr[6], uint8_t psrm, uint16_t clock_offset, uint16_t first_psm);
+
+// The controller's ACL buffers (Read Buffer Size): fragment size and how many packets it can hold.
+void bthost_set_acl(BtHost *h, uint16_t mtu, int count);
+// Other-profile channels on an encrypted connection. connect returns our channel id (the open callback follows), or
+// -1. send: 0, -1 on error (no such channel, bigger than the other side's MTU), -2 when the controller's buffers
+// are full (try later; audio drops the packet). close: 0 or -1.
+int bthost_l2cap_connect(BtHost *h, const uint8_t addr[6], uint16_t psm);
+int bthost_l2cap_send(BtHost *h, const uint8_t addr[6], uint16_t cid, const uint8_t *d, size_t n);
+int bthost_l2cap_close(BtHost *h, const uint8_t addr[6], uint16_t cid);
+// The other side's MTU for a channel (0 if none).
+uint16_t bthost_l2cap_mtu(const BtHost *h, const uint8_t addr[6], uint16_t cid);
 int bthost_disconnect(BtHost *h, const uint8_t addr[6]);
 void bthost_disconnect_all(BtHost *h);
 // State of the connection to addr (BTC_FREE if none).
