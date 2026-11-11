@@ -16,6 +16,12 @@ BtLink *bt_open(io_service_t svc, int debug, char *err, size_t errcap);
 void bt_close(BtLink *b);
 
 int bt_send_cmd(BtLink *b, uint16_t opcode, const void *params, size_t plen);
+
+// ACL data: incoming packets (whole, 4-byte header included) go to the handler from inside bt_next_event /
+// bt_call, on the thread that calls those. bt_send_acl sends one whole packet (any thread).
+typedef void (*BtAclFn)(void *ctx, const uint8_t *pkt, size_t n);
+void bt_set_acl_handler(BtLink *b, BtAclFn fn, void *ctx);
+int bt_send_acl(BtLink *b, const uint8_t *pkt, size_t n);
 // Next whole event (2 + len bytes) into out (HCI_MAX_EVENT bytes). 1 = event, 0 = timeout, -1 = USB error.
 int bt_next_event(BtLink *b, uint8_t *out, size_t *n, int timeout_ms);
 

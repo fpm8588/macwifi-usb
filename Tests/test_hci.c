@@ -18,6 +18,14 @@ static void test_cmd(void) {
     uint8_t en[2] = {1, 1};
     CHECK(hci_cmd(b, sizeof b, HCI_OP_LE_SET_SCAN_ENABLE, en, 2) == 5 && b[0] == 0x0C && b[1] == 0x20 && b[2] == 2 &&
           b[3] == 1 && b[4] == 1);
+    // Event mask: the events we depend on are enabled (bit = code - 1), nothing past LE Meta
+    CHECK((HCI_EVENT_MASK_SCAN >> (HCI_EV_EXT_INQUIRY_RESULT - 1)) & 1);
+    CHECK((HCI_EVENT_MASK_SCAN >> (HCI_EV_INQUIRY_RESULT_RSSI - 1)) & 1);
+    CHECK((HCI_EVENT_MASK_SCAN >> (HCI_EV_LE_META - 1)) & 1);
+    CHECK((HCI_EVENT_MASK_SCAN >> (HCI_EV_REMOTE_NAME_COMPLETE - 1)) & 1);
+    CHECK((HCI_EVENT_MASK_SCAN >> (0x31 - 1)) & 1 && (HCI_EVENT_MASK_SCAN >> (0x33 - 1)) & 1 &&
+          (HCI_EVENT_MASK_SCAN >> (0x36 - 1)) & 1 && (HCI_EVENT_MASK_SCAN >> (0x3B - 1)) & 1);
+    CHECK((HCI_EVENT_MASK_SCAN >> 62) == 0);
     CHECK(HCI_OP_READ_LOCAL_VERSION == 0x1001 && HCI_OP_READ_BD_ADDR == 0x1009 && HCI_OP_INQUIRY == 0x0401);
     CHECK(hci_cmd(b, 4, HCI_OP_LE_SET_SCAN_ENABLE, en, 2) == 0);                  // no room
     CHECK(hci_cmd(b, sizeof b, HCI_OP_RESET, b, 256) == 0);                       // too long

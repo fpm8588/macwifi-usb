@@ -41,12 +41,25 @@
 #define HCI_LE_ADV_REPORT              0x02   // LE Meta subevent 7.7.65.2
 #define HCI_LE_EXT_ADV_REPORT          0x0D   // 7.7.65.13
 
-// Set_Event_Mask bits [7.3.1]: the default (bits 0-44) plus Inquiry Result with RSSI (33, already in the
-// default), LE Meta (61) and Extended Inquiry Result (62).
-#define HCI_EVENT_MASK_SCAN            0x60001FFFFFFFFFFFull
+// Set_Event_Mask [7.3.1]: bit n enables the event with code n + 1. The default mask (bits 0-44) covers events up
+// to 0x2D. Added: Extended Inquiry Result 0x2F (bit 46: without it, devices that answer inquiries with EIR, which
+// is most modern ones, are never reported), Encryption Key Refresh Complete 0x30, IO Capability Request/Response
+// 0x31/0x32, User Confirmation Request 0x33, User Passkey Request 0x34, Simple Pairing Complete 0x36, Link
+// Supervision Timeout Changed 0x38, User Passkey Notification 0x3B, Keypress Notification 0x3C, Remote Host
+// Supported Features 0x3D, LE Meta 0x3E.
+#define HCI_EVBIT(code)                (1ull << ((code) - 1))
+#define HCI_EVENT_MASK_SCAN                                                                                          \
+    (0x00001FFFFFFFFFFFull | HCI_EVBIT(0x2F) | HCI_EVBIT(0x30) | HCI_EVBIT(0x31) | HCI_EVBIT(0x32) |                  \
+     HCI_EVBIT(0x33) | HCI_EVBIT(0x34) | HCI_EVBIT(0x36) | HCI_EVBIT(0x38) | HCI_EVBIT(0x3B) | HCI_EVBIT(0x3C) |    \
+     HCI_EVBIT(0x3D) | HCI_EVBIT(0x3E))
 // LE_Set_Event_Mask [7.8.1]: the default 0x1F (connection complete, advertising report, ...).
 #define HCI_LE_EVENT_MASK_DEFAULT      0x000000000000001Full
 #define HCI_GIAC_LAP                   0x9E8B33u   // General inquiry access code [Assigned Numbers 2.2]
+
+// HCI packet types [Vol 4 Part A 2] (used here to tag what came from which USB endpoint)
+#define HCI_PKT_CMD   0x01
+#define HCI_PKT_ACL   0x02
+#define HCI_PKT_EVENT 0x04
 
 // HCI over USB [Vol 4 Part B 2.2]: commands use a class control request to the interface.
 #define HCI_USB_CMD_REQTYPE            0x20
