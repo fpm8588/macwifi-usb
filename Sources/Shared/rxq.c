@@ -47,6 +47,7 @@ static void append(RxQ *q, Item *it) {
     if (q->tail) q->tail->next = it;
     else q->head = it;
     q->tail = it;
+    if (it->err) { pthread_cond_signal(&q->cv); return; }   // the end marker isn't a queued packet
     q->items++;
     q->bytes += it->n;
     if (q->items > q->max_depth) q->max_depth = q->items;
@@ -72,6 +73,12 @@ int rxq_push(RxQ *q, const uint8_t *data, size_t n) {
     it->err = 0;
     memcpy(it->data, data, n);
     pthread_mutex_lock(&q->mu);
+    if (q->items >= q->max_items || q->bytes + n > q->max_bytes) {   // filled up while we allocated
+        q->dropped++;
+        pthread_mutex_unlock(&q->mu);
+        free(it);
+        return -1;
+    }
     q->pushed++;
     append(q, it);
     pthread_mutex_unlock(&q->mu);
