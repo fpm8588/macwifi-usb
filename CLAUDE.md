@@ -1,6 +1,8 @@
 # macwifi-usb: notes for Claude Code
 
 Read `docs/PROMPT.md` (plan, constraints, phase checklists) and `docs/RESEARCH.md` before changing anything.
+Bluetooth and band work follows `docs/BLUETOOTH_PROMPT.md`; after that, speed and feature parity follow
+`docs/PERFORMANCE_PROMPT.md`.
 Short version:
 
 - Target: UGREEN AX900 = AICsemi AIC8800D80 (`a69c:5723` driver-CD mode → Wi-Fi mode after eject). The user

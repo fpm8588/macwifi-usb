@@ -96,8 +96,8 @@ The adapter came back as a69c:8d81 (AIC8800D80/D81 running firmware) 4.8 s after
 | 2 | 0xff/0xff/0xff vendor | **0x01 OUT bulk (data), 0x81 IN bulk, 0x02 OUT bulk (messages)** | Wi-Fi (Linux `aic8800_fdrv`) |
 
 Matches Linux #58 (interfaces 0-1 to `btusb`, interface 2 to `aic8800_fdrv`) and `kAicIds` (8d81 sends
-messages on the second bulk OUT). Bluetooth is out of scope: macOS does not use third-party USB Bluetooth
-controllers.
+messages on the second bulk OUT). macOS does not use third-party USB Bluetooth controllers, so Bluetooth is
+done in user space (2026-11-11 plan: `docs/BLUETOOTH_PROMPT.md`).
 
 ## 2026-11-07: Phase 2b passed
 

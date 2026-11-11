@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+**New**
+- Bluetooth, phase B1: `macwifictl bt` opens the adapter's own Bluetooth controller from user space (no kext),
+  identifies it and lists nearby Bluetooth LE and classic devices. Plan: `docs/BLUETOOTH_PROMPT.md`.
+
 ## 0.6.0 (first public beta)
 
 The first release meant for other people: install a package, pick a network from the menu bar, done.

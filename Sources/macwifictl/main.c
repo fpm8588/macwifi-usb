@@ -35,6 +35,8 @@
 #include "aic_fwload.h"
 #include "aic_data.h"
 #include "aic_msg.h"
+#include "bt_usb.h"
+#include "hci.h"
 #include "bridge.h"
 #include "captive.h"
 #include "dhcp.h"
@@ -2306,6 +2308,154 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
 
 #include "daemon.c"   // macwifid (shares this file's static helpers)
 
+// ---------------------------------------------------------------- Bluetooth (phase B1)
+
+typedef struct { HciSeen seen; int inquiry_done; } BtScan;
+
+static void bt_on_device(void *ctx, const HciDevice *d) { hci_seen_add(&((BtScan *)ctx)->seen, d); }
+
+static void bt_on_event(void *ctx, const HciEvent *ev) {
+    BtScan *s = ctx;
+    if (ev->code == HCI_EV_INQUIRY_COMPLETE) s->inquiry_done = 1;
+    else if (ev->code == HCI_EV_HW_ERROR) printf("Bluetooth controller reported a hardware error (0x%02x).\n", ev->len ? ev->p[0] : 0);
+    else hci_scan_event(ev, bt_on_device, s);
+}
+
+static int bt_by_rssi(const void *a, const void *b) {
+    const HciDevice *x = a, *y = b;
+    int rx = x->rssi == 127 ? -200 : x->rssi, ry = y->rssi == 127 ? -200 : y->rssi;
+    return ry - rx;
+}
+
+static int bt_step(const char *what, int st) {
+    if (st == 0) return 0;
+    if (st == -2) fprintf(stderr, "%s: the controller didn't answer.\n", what);
+    else if (st == -1) fprintf(stderr, "%s: USB error.\n", what);
+    else fprintf(stderr, "%s: controller error 0x%02x.\n", what, st);
+    return 1;
+}
+
+static int cmd_bt(int argc, char **argv) {
+    const char *sec = opt(argc, argv, "--seconds");
+    int seconds = sec ? atoi(sec) : 10;
+    if (seconds < 1) seconds = 1;
+    if (seconds > 120) seconds = 120;
+    int show_addr = 0;
+    for (int i = 2; i < argc; i++) if (!strcmp(argv[i], "--addresses")) show_addr = 1;
+
+    const AicId *id = NULL;
+    io_service_t svc = find_adapter(AIC_MODE_WIFI, &id);
+    if (!svc) {
+        io_service_t cd = find_adapter(AIC_MODE_DRIVER_CD, NULL);
+        if (cd) IOObjectRelease(cd);
+        fprintf(stderr, cd ? "The adapter is in driver-CD mode. Start the service (or run `macwifictl fwload`) first.\n"
+                           : "No AIC8800 adapter found. Run `macwifictl list --all`.\n");
+        return 3;
+    }
+    printf("Adapter %s (%s), %s.\n", id ? id->name : "?", daemon_running() ? "service running" : "service not running",
+           "opening its Bluetooth interface");
+    char err[160];
+    BtLink *b = bt_open(svc, gDebug, err, sizeof err);
+    IOObjectRelease(svc);
+    if (!b) { fprintf(stderr, "Bluetooth: %s.\n", err); return 1; }
+
+    BtScan scan;
+    memset(&scan, 0, sizeof scan);
+    uint8_t ret[260];
+    size_t rl = 0;
+    int rc = 1;
+    if (bt_step("HCI Reset", bt_call(b, HCI_OP_RESET, NULL, 0, NULL, 0, NULL, 3000, bt_on_event, &scan))) {
+        fprintf(stderr, "If the service isn't running, the chip has no firmware yet: start it, or run "
+                        "`sudo build/macwifictl fwload` first.\n");
+        goto out;
+    }
+    printf("HCI Reset: ok\n");
+    if (bt_step("Read Local Version", bt_call(b, HCI_OP_READ_LOCAL_VERSION, NULL, 0, ret, sizeof ret, &rl, 2000, bt_on_event, &scan)))
+        goto out;
+    if (rl >= 8) {
+        printf("Controller: Bluetooth %s (HCI rev 0x%04x), LMP %s subversion 0x%04x, manufacturer 0x%04x\n",
+               hci_version_name(ret[0]), ret[1] | (ret[2] << 8), hci_version_name(ret[3]), ret[6] | (ret[7] << 8),
+               ret[4] | (ret[5] << 8));
+    }
+    if (bt_step("Read BD_ADDR", bt_call(b, HCI_OP_READ_BD_ADDR, NULL, 0, ret, sizeof ret, &rl, 2000, bt_on_event, &scan)))
+        goto out;
+    if (rl >= 6) {
+        char a[18];
+        hci_addr_str(ret, a);
+        printf("Controller address: %s\n", show_addr ? a : "read ok (add --addresses to show it)");
+    }
+    if (bt_call(b, HCI_OP_READ_LOCAL_NAME, NULL, 0, ret, sizeof ret, &rl, 2000, bt_on_event, &scan) == 0 && rl) {
+        ret[rl < sizeof ret ? rl : sizeof ret - 1] = 0;
+        printf("Controller name: \"%s\"\n", (char *)ret);
+    }
+    if (bt_call(b, HCI_OP_READ_BUFFER_SIZE, NULL, 0, ret, sizeof ret, &rl, 2000, bt_on_event, &scan) == 0 && rl >= 7)
+        printf("ACL buffers: %u x %u bytes; SCO: %u x %u\n", ret[3] | (ret[4] << 8), ret[0] | (ret[1] << 8),
+               ret[5] | (ret[6] << 8), ret[2]);
+
+    // Scan: LE (active) and classic inquiry together.
+    uint8_t mask[8];
+    uint64_t m = HCI_EVENT_MASK_SCAN;
+    for (int i = 0; i < 8; i++) mask[i] = (uint8_t)(m >> (8 * i));
+    if (bt_step("Set Event Mask", bt_call(b, HCI_OP_SET_EVENT_MASK, mask, 8, NULL, 0, NULL, 2000, bt_on_event, &scan))) goto out;
+    uint8_t mode = 2;                                                      // inquiry results with RSSI or EIR
+    bt_call(b, HCI_OP_WRITE_INQUIRY_MODE, &mode, 1, NULL, 0, NULL, 2000, bt_on_event, &scan);
+    const uint8_t sp[7] = {1, 0x60, 0x00, 0x30, 0x00, 0, 0};              // active, 60 ms interval, 30 ms window
+    int le = bt_call(b, HCI_OP_LE_SET_SCAN_PARAMS, sp, 7, NULL, 0, NULL, 2000, bt_on_event, &scan) == 0;
+    const uint8_t on[2] = {1, 1};
+    if (le) le = bt_call(b, HCI_OP_LE_SET_SCAN_ENABLE, on, 2, NULL, 0, NULL, 2000, bt_on_event, &scan) == 0;
+    if (!le) printf("LE scan: the controller refused it; classic inquiry only.\n");
+    uint8_t inq[5] = {(uint8_t)HCI_GIAC_LAP, (uint8_t)(HCI_GIAC_LAP >> 8), (uint8_t)(HCI_GIAC_LAP >> 16), 0, 0};
+    int len128 = (int)(seconds / 1.28);
+    inq[3] = (uint8_t)(len128 < 1 ? 1 : len128 > 0x30 ? 0x30 : len128);
+    int classic = bt_call(b, HCI_OP_INQUIRY, inq, 5, NULL, 0, NULL, 2000, bt_on_event, &scan) == 0;
+    if (!classic) printf("Classic inquiry: the controller refused it; LE only.\n");
+    if (!le && !classic) goto out;
+    printf("Scanning for %d s (%s%s%s)...\n", seconds, le ? "Bluetooth LE" : "", le && classic ? " + " : "",
+           classic ? "classic" : "");
+    fflush(stdout);
+    double end = now_s() + seconds;
+    uint8_t ev[HCI_MAX_EVENT];
+    size_t n = 0;
+    while (now_s() < end) {
+        int r = bt_next_event(b, ev, &n, 250);
+        if (r < 0) { fprintf(stderr, "Bluetooth: lost the event stream (adapter unplugged?).\n"); goto out; }
+        HciEvent e;
+        if (r == 1 && hci_event(ev, n, &e) == 0) bt_on_event(&scan, &e);
+        if (scan.inquiry_done && classic && end - now_s() > 2) {              // keep inquiring for the whole scan
+            scan.inquiry_done = 0;
+            bt_call(b, HCI_OP_INQUIRY, inq, 5, NULL, 0, NULL, 2000, bt_on_event, &scan);
+        }
+    }
+    const uint8_t off[2] = {0, 0};
+    if (le) bt_call(b, HCI_OP_LE_SET_SCAN_ENABLE, off, 2, NULL, 0, NULL, 2000, bt_on_event, &scan);
+    if (classic && !scan.inquiry_done) bt_call(b, HCI_OP_INQUIRY_CANCEL, NULL, 0, NULL, 0, NULL, 2000, bt_on_event, &scan);
+
+    qsort(scan.seen.dev, (size_t)scan.seen.n, sizeof scan.seen.dev[0], bt_by_rssi);
+    int nle = 0, ncl = 0, named = 0;
+    for (int i = 0; i < scan.seen.n; i++) {
+        const HciDevice *d = &scan.seen.dev[i];
+        if (d->kind == HCI_DEV_LE) nle++; else ncl++;
+        if (d->name[0]) named++;
+    }
+    printf("Found %d device(s): %d Bluetooth LE, %d classic, %d with a name%s.\n", scan.seen.n, nle, ncl, named,
+           scan.seen.overflow ? " (list full)" : "");
+    for (int i = 0; i < scan.seen.n; i++) {
+        const HciDevice *d = &scan.seen.dev[i];
+        const char *kind = d->kind == HCI_DEV_CLASSIC ? hci_cod_kind(d->cod) : hci_appearance_kind(d->appearance);
+        char a[18] = "";
+        if (show_addr) hci_addr_str(d->addr, a);
+        char rs[8];
+        if (d->rssi == 127) snprintf(rs, sizeof rs, "  ?"); else snprintf(rs, sizeof rs, "%4d", d->rssi);
+        printf("  %-7s %s dBm  %-14s %-32.32s %s\n", d->kind == HCI_DEV_LE ? "LE" : "Classic", rs, kind ? kind : "",
+               d->name[0] ? d->name : "(no name)", a);
+    }
+    printf("Bluetooth phase B1: PASS.\n");
+    rc = 0;
+out:
+    bt_close(b);
+    return rc;
+}
+
 static void usage(void) {
     fprintf(stderr, "usage: macwifictl list [--all] | modeswitch | info | identify | memr <addr> | memw <addr> <val>\n"
                     "       fwload [--profile v5|legacy] [--fw DIR] | up [--profile v5|legacy] [--fw DIR] |\n"
@@ -2313,6 +2463,7 @@ static void usage(void) {
                     "       connect SSID [--seconds N] [--profile v5|legacy] [--fw DIR] |\n"
                     "       join SSID [--seconds N] [--profile v5|legacy] [--fw DIR] | cleanup   (both with sudo)\n"
                     "       status | networks | disconnect | ctl '<json>'   (talk to macwifid)\n"
+                    "       bt [--seconds N] [--addresses]   (Bluetooth: identify the controller, scan nearby devices)\n"
                     "Supported: AICsemi AIC8800 family, e.g. UGREEN AX900 (CM762). MACWIFI_DEBUG=1 dumps USB traffic.\n");
 }
 
@@ -2330,6 +2481,7 @@ int main(int argc, char **argv) {
                         "`macwifictl status`, or uninstall the service first.\n");
         return 2;
     }
+    if (!strcmp(c, "bt")) return cmd_bt(argc, argv);
     if (!strcmp(c, "list")) return cmd_list(argc > 2 && !strcmp(argv[2], "--all"));
     if (!strcmp(c, "info")) return cmd_info();
     if (!strcmp(c, "modeswitch")) return cmd_modeswitch();

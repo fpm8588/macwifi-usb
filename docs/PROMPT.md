@@ -254,6 +254,8 @@ TROUBLESHOOTING, PROTOCOL, SECURITY, CONTRIBUTING, CHANGELOG).
 
 ## Phase 6: later
 
+Bluetooth and band control: `docs/BLUETOOTH_PROMPT.md`. Speed and feature parity: `docs/PERFORMANCE_PROMPT.md`.
+
 WPA3-SAE (check for firmware SAE offload first), hidden networks, roaming between APs of one network,
 5 GHz DFS channels, regulatory country from the userconfig/eFuse, power save, throughput tuning (TX
 aggregation of USB transfers as the Linux driver does).
