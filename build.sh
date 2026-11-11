@@ -49,6 +49,12 @@ run_tests() {
     "$B/test_json"
     $cc "${CFLAGS[@]}" Tests/test_rxq.c "$S/rxq.c" -lpthread -o "$B/test_rxq"
     "$B/test_rxq"
+    # The app is built with the Command Line Tools only; on newer SDKs these SwiftUI attributes are macros whose
+    # plugins ship only with Xcode (users saw "plugin for module 'SwiftUIMacros' not found"). CI's older toolchain
+    # wouldn't notice, so check the source.
+    if grep -nE '^[^/]*(@State|@Observable|@Bindable|@Entry|#Preview)\b' App/MacWifi/*.swift; then
+        echo "App/MacWifi uses a SwiftUI macro; keep that state in Model (@Published) instead"; exit 1
+    fi
     $cc "${CFLAGS[@]}" Tests/test_hci.c "$S/hci.c" -o "$B/test_hci"
     "$B/test_hci"
     $cc "${CFLAGS[@]}" Tests/test_reorder.c "$S/reorder.c" -o "$B/test_reorder"

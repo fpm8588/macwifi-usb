@@ -132,6 +132,9 @@ final class Model: ObservableObject {
     @Published var joining: String?
     @Published var bt: BtReply?
     @Published var tab = 0                 // 0 Wi-Fi, 1 Bluetooth
+    // Kept here rather than in @State: on newer SDKs @State is a macro whose plugin ships only with Xcode, and this
+    // app is built with the Command Line Tools alone. Don't use @State/@Observable/other macros in this file.
+    @Published var btShowUnnamed = false
 
     private var timer: Timer?
     private var portalShownFor: String?    // open the sign-in window by itself once per connection
@@ -488,12 +491,11 @@ struct BtDeviceRow: View {
 
 struct BluetoothPane: View {
     @EnvironmentObject var model: Model
-    @State private var showUnnamed = false
 
     var body: some View {
         let named = model.btDevices.filter { !$0.name.isEmpty }
         let unnamed = model.btDevices.filter { $0.name.isEmpty }
-        let rows = showUnnamed ? named + unnamed : named
+        let rows = model.btShowUnnamed ? named + unnamed : named
         VStack(alignment: .leading, spacing: 8) {
             Text(model.btStatusLine)
                 .font(.callout)
@@ -522,7 +524,7 @@ struct BluetoothPane: View {
                 .frame(height: CGFloat(min(max(rows.count, 4), 9)) * (NetworkRow.height + 4))
             }
             if model.btPower && !unnamed.isEmpty {
-                Toggle("Show \(unnamed.count) unnamed device\(unnamed.count == 1 ? "" : "s")", isOn: $showUnnamed)
+                Toggle("Show \(unnamed.count) unnamed device\(unnamed.count == 1 ? "" : "s")", isOn: $model.btShowUnnamed)
                     .toggleStyle(.checkbox)
                     .font(.caption)
             }
