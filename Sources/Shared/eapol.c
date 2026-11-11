@@ -33,6 +33,7 @@ int eapol_parse_key(const uint8_t *p, size_t n, EapolKey *k) {
 // Builds an EAPOL-Key frame from the supplicant, MIC included when `kck` is given.
 static size_t build_key(uint8_t *out, size_t cap, uint16_t key_info, const uint8_t replay[8], const uint8_t *nonce,
                         const uint8_t *key_data, size_t kdl, const uint8_t *kck) {
+    int ver = key_info & EAPOL_KEY_INFO_VERSION_MASK;
     size_t len = EAPOL_KEY_HDR_LEN + kdl;
     if (!out || len > cap || kdl > 0xffff) return 0;
     memset(out, 0, len);
@@ -46,16 +47,17 @@ static size_t build_key(uint8_t *out, size_t cap, uint16_t key_info, const uint8
     if (nonce) memcpy(out + 17, nonce, 32);
     put_be16(out + 97, (uint16_t)kdl);
     if (kdl) memcpy(out + EAPOL_KEY_HDR_LEN, key_data, kdl);
-    if (kck && wpa_eapol_mic(kck, 2, out, len, out + 81) != 0) return 0;
+    if (kck && wpa_eapol_mic(kck, ver, out, len, out + 81) != 0) return 0;
     return len;
 }
 
 static int mic_ok(const uint8_t kck[16], const uint8_t *frame, const EapolKey *k) {
+    int ver = k->key_info & EAPOL_KEY_INFO_VERSION_MASK;
     uint8_t tmp[2048], mic[16];
     if (k->frame_len > sizeof tmp) return 0;
     memcpy(tmp, frame, k->frame_len);
     memset(tmp + 81, 0, 16);
-    if (wpa_eapol_mic(kck, 2, tmp, k->frame_len, mic) != 0) return 0;
+    if (wpa_eapol_mic(kck, ver, tmp, k->frame_len, mic) != 0) return 0;
     uint8_t diff = 0;
     for (int i = 0; i < 16; i++) diff |= (uint8_t)(mic[i] ^ k->mic[i]);
     return diff == 0;
@@ -77,7 +79,8 @@ static int handle_key_data(WpaSupplicant *s, const EapolKey *k, int want_gtk, co
         d = plain;
         n -= 8;
     }
-    int got_gtk = 0, got_rsn = 0;
+    int got_gtk = 0, got_rsn = 0, got_igtk = 0;
+    s->new_igtk = 0;
     size_t p = 0;
     while (p + 2 <= n) {
         uint8_t id = d[p], len = d[p + 1];
@@ -97,12 +100,21 @@ static int handle_key_data(WpaSupplicant *s, const EapolKey *k, int want_gtk, co
                 s->gtk_len = (size_t)len - 6;
                 memcpy(s->gtk, v + 6, s->gtk_len);
                 got_gtk = 1;
+            } else if (v[0] == 0x00 && v[1] == 0x0F && v[2] == 0xAC && v[3] == 9) {   // IGTK KDE: id(2) IPN(6) key
+                if (len != 4 + 2 + 6 + 16) { *err = "IGTK KDE has a bad length"; return -1; }
+                s->igtk_idx = v[4] | (v[5] << 8);
+                if (s->igtk_idx != 4 && s->igtk_idx != 5) { *err = "IGTK KDE has a bad key index"; return -1; }
+                memcpy(s->igtk_ipn, v + 6, 6);
+                memcpy(s->igtk, v + 12, 16);
+                s->have_igtk = 1;
+                got_igtk = 1;
             }
         }
         p += 2 + (size_t)len;
     }
     if (want_gtk && !got_gtk) { *err = "no GTK in the key data"; return -1; }
     (void)got_rsn;
+    s->new_igtk = got_igtk;
     return 0;
 }
 
@@ -115,7 +127,9 @@ int wpa_supp_rx(WpaSupplicant *s, const uint8_t *eapol, size_t len, const uint8_
     EapolKey k;
     if (eapol_parse_key(eapol, len, &k) != 0) return 0;              // not an RSN EAPOL-Key frame: ignore
     if (!(k.key_info & EAPOL_KEY_INFO_ACK) || (k.key_info & EAPOL_KEY_INFO_REQUEST)) return 0;   // not from an AP
-    if ((k.key_info & EAPOL_KEY_INFO_VERSION_MASK) != 2) { *err = "unsupported key descriptor version"; return -1; }
+    // Key descriptor version: 2 (HMAC-SHA1 MIC) for WPA2-PSK; 0 (AKM-defined: AES-CMAC MIC, SHA-256 KDF) for SAE.
+    const uint16_t ver = s->akm_sae ? 0 : 2;
+    if ((k.key_info & EAPOL_KEY_INFO_VERSION_MASK) != ver) { *err = "unsupported key descriptor version"; return -1; }
     if (!replay_newer(s, k.replay)) { *err = "replayed EAPOL-Key frame"; return -1; }
     int pairwise = (k.key_info & EAPOL_KEY_INFO_PAIRWISE) != 0;
 
@@ -123,9 +137,11 @@ int wpa_supp_rx(WpaSupplicant *s, const uint8_t *eapol, size_t len, const uint8_
         // Message 1: ANonce. Derive the PTK and answer with message 2 (SNonce + our RSN element).
         memcpy(s->anonce, k.nonce, 32);
         memcpy(s->snonce, snonce, 32);
-        if (wpa_derive_ptk(s->pmk, s->aa, s->spa, s->anonce, s->snonce, s->ptk) != 0) { *err = "PTK derivation failed"; return -1; }
+        int dr = s->akm_sae ? wpa_derive_ptk_sha256(s->pmk, s->aa, s->spa, s->anonce, s->snonce, s->ptk)
+                            : wpa_derive_ptk(s->pmk, s->aa, s->spa, s->anonce, s->snonce, s->ptk);
+        if (dr != 0) { *err = "PTK derivation failed"; return -1; }
         s->have_ptk = 1;
-        size_t n = build_key(reply, cap, 2 | EAPOL_KEY_INFO_PAIRWISE | EAPOL_KEY_INFO_MIC, k.replay, s->snonce,
+        size_t n = build_key(reply, cap, ver | EAPOL_KEY_INFO_PAIRWISE | EAPOL_KEY_INFO_MIC, k.replay, s->snonce,
                              s->rsn_ie, s->rsn_ie_len, WPA_KCK(s->ptk));
         if (!n) { *err = "reply buffer too small"; return -1; }
         *reply_len = n;
@@ -144,12 +160,13 @@ int wpa_supp_rx(WpaSupplicant *s, const uint8_t *eapol, size_t len, const uint8_
         s->have_replay = 1;
         if (handle_key_data(s, &k, 1, err) != 0) return -1;
         uint8_t zero[32] = {0};
-        size_t n = build_key(reply, cap, 2 | EAPOL_KEY_INFO_PAIRWISE | EAPOL_KEY_INFO_MIC | EAPOL_KEY_INFO_SECURE,
+        if (s->akm_sae && !s->new_igtk) { *err = "no IGTK in message 3 (management frame protection is required)"; return -1; }
+        size_t n = build_key(reply, cap, ver | EAPOL_KEY_INFO_PAIRWISE | EAPOL_KEY_INFO_MIC | EAPOL_KEY_INFO_SECURE,
                              k.replay, zero, NULL, 0, WPA_KCK(s->ptk));
         if (!n) { *err = "reply buffer too small"; return -1; }
         *reply_len = n;
         s->ptk_done = 1;
-        return WPA_EV_SEND | WPA_EV_INSTALL_PTK | WPA_EV_INSTALL_GTK | WPA_EV_DONE;
+        return WPA_EV_SEND | WPA_EV_INSTALL_PTK | WPA_EV_INSTALL_GTK | WPA_EV_DONE | (s->new_igtk ? WPA_EV_INSTALL_IGTK : 0);
     }
 
     // Group key handshake message 1 (GTK rekey).
@@ -163,11 +180,11 @@ int wpa_supp_rx(WpaSupplicant *s, const uint8_t *eapol, size_t len, const uint8_
     memcpy(s->replay, k.replay, 8);
     s->have_replay = 1;
     if (handle_key_data(s, &k, 1, err) != 0) return -1;
-    size_t n = build_key(reply, cap, 2 | EAPOL_KEY_INFO_MIC | EAPOL_KEY_INFO_SECURE, k.replay, NULL, NULL, 0,
+    size_t n = build_key(reply, cap, ver | EAPOL_KEY_INFO_MIC | EAPOL_KEY_INFO_SECURE, k.replay, NULL, NULL, 0,
                          WPA_KCK(s->ptk));
     if (!n) { *err = "reply buffer too small"; return -1; }
     *reply_len = n;
-    return WPA_EV_SEND | WPA_EV_INSTALL_GTK;
+    return WPA_EV_SEND | WPA_EV_INSTALL_GTK | (s->new_igtk ? WPA_EV_INSTALL_IGTK : 0);
 }
 
 size_t wpa_build_rsn_ie(uint8_t *out, size_t cap) {
@@ -178,6 +195,22 @@ size_t wpa_build_rsn_ie(uint8_t *out, size_t cap) {
         0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04,   // 1 pairwise cipher: CCMP
         0x01, 0x00, 0x00, 0x0F, 0xAC, 0x02,   // 1 AKM: PSK
         0x00, 0x00,                     // RSN capabilities: no PMF
+    };
+    if (!out || cap < sizeof ie) return 0;
+    memcpy(out, ie, sizeof ie);
+    return sizeof ie;
+}
+
+size_t wpa_build_rsn_ie_sae(uint8_t *out, size_t cap) {
+    static const uint8_t ie[28] = {
+        0x30, 26,
+        0x01, 0x00,                     // version 1
+        0x00, 0x0F, 0xAC, 0x04,         // group cipher CCMP
+        0x01, 0x00, 0x00, 0x0F, 0xAC, 0x04,   // 1 pairwise cipher: CCMP
+        0x01, 0x00, 0x00, 0x0F, 0xAC, 0x08,   // 1 AKM: SAE
+        0xC0, 0x00,                     // RSN capabilities: management frame protection capable and required
+        0x00, 0x00,                     // no PMKIDs
+        0x00, 0x0F, 0xAC, 0x06,         // group management cipher BIP-CMAC-128
     };
     if (!out || cap < sizeof ie) return 0;
     memcpy(out, ie, sizeof ie);

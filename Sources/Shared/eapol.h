@@ -64,6 +64,11 @@ typedef struct {
     uint8_t gtk[32];
     size_t gtk_len;
     int gtk_idx;
+    // WPA3-Personal: set akm_sae (PMK from SAE; SHA-256 key derivation, AES-CMAC MICs, key descriptor version 0).
+    // The IGTK protects broadcast management frames (BIP); it arrives with the GTK.
+    int akm_sae;
+    uint8_t igtk[16], igtk_ipn[6];
+    int igtk_idx, have_igtk, new_igtk;
 } WpaSupplicant;
 
 enum {
@@ -71,6 +76,7 @@ enum {
     WPA_EV_INSTALL_PTK = 2,   // install WPA_TK(s->ptk) as the pairwise key (after sending the reply)
     WPA_EV_INSTALL_GTK = 4,   // install s->gtk (s->gtk_len bytes) as group key s->gtk_idx
     WPA_EV_DONE        = 8,   // 4-way handshake complete: open the control port
+    WPA_EV_INSTALL_IGTK = 16, // install s->igtk as integrity group key s->igtk_idx (4 or 5), cipher BIP-CMAC-128
 };
 
 // Handles one EAPOL frame from the AP. `snonce` is 32 random bytes, used when message 1 arrives. Returns a bitmask
@@ -81,6 +87,8 @@ int wpa_supp_rx(WpaSupplicant *s, const uint8_t *eapol, size_t len, const uint8_
 
 // Builds the RSN element a WPA2-PSK station sends: CCMP group and pairwise ciphers, AKM PSK, no PMF.
 size_t wpa_build_rsn_ie(uint8_t *out, size_t cap);
+// The RSN element of a WPA3-Personal station: CCMP, AKM SAE, PMF capable and required, BIP-CMAC-128 (28 bytes).
+size_t wpa_build_rsn_ie_sae(uint8_t *out, size_t cap);
 
 #ifdef __cplusplus
 }

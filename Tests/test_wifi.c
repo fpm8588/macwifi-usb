@@ -97,6 +97,7 @@ static void test_bss(void) {
     CHECK(b.security == WIFI_SEC_WPA2_PSK && b.rsn_ccmp);
     CHECK(b.bssid[0] == 0x10 && b.bssid[5] == 0x15 && b.beacon_interval == 100);
     CHECK(b.rsn_group_ccmp && b.rsn_akm_psk && !b.rsn_pmf_capable && !b.rsn_pmf_required);
+    CHECK(!b.rsn_akm_sae && b.rsn_mgmt_bip_cmac && !b.sae_h2e_only);
     CHECK(b.rsn_ie_len >= 2 && b.rsn_ie[0] == 48 && b.rsn_ie[1] == b.rsn_ie_len - 2 &&
           memcmp(b.rsn_ie, f + n - b.rsn_ie_len, b.rsn_ie_len) == 0);   // the raw element, for the msg 3 check
     f[n - 2] = 0x80;                                        // RSN capabilities: MFPC

@@ -141,3 +141,24 @@ int aic_data_parse_tx_cfm(const uint8_t *pkt, size_t pkt_len, uint32_t *status, 
     *idx = (uint32_t)pkt[8] | ((uint32_t)pkt[9] << 8) | ((uint32_t)pkt[10] << 16) | ((uint32_t)pkt[11] << 24);
     return 0;
 }
+
+size_t aic_data_build_mgmt_tx(uint8_t *out, size_t cap, const uint8_t *frame, size_t flen, uint8_t vif_idx) {
+    if (!out || !frame || flen < 24) return 0;
+    size_t len = AIC_TX_HDR_LEN + AIC_HOSTDESC_LEN + flen;
+    if (len > 0x0fff) return 0;
+    size_t xfer = len + ((len % 512) == 0 ? 1 : 0);
+    if (xfer > cap) return 0;
+    memset(out, 0, xfer);
+    put16(out, (uint16_t)len);
+    out[1] &= 0x0f;
+    out[2] = AIC_USB_TYPE_DATA_TX;
+    uint8_t *d = out + AIC_TX_HDR_LEN;
+    put16(d + 0, (uint16_t)flen);               // packet_len
+    d[22] = 3;                                  // ac: RWNX_HWQ_VO (the vif's "unknown station" queue)
+    d[23] = 0xFF;                               // tid
+    d[24] = vif_idx;
+    d[25] = 0xFF;                               // staid
+    put16(d + 26, 0x0008);                      // flags: TXU_CNTRL_MGMT
+    memcpy(d + AIC_HOSTDESC_LEN, frame, flen);
+    return xfer;
+}

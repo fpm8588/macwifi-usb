@@ -29,11 +29,11 @@ int kn_parse(KnownList *k, const char *t, size_t len) {
         size_t e = i;
         while (e < len && t[e] != '\n') e++;
         // fields
-        const char *f[3];
-        size_t fl[3];
+        const char *f[4];
+        size_t fl[4];
         int nf = 0;
         size_t p = i;
-        while (p < e && nf < 3) {
+        while (p < e && nf < 4) {
             while (p < e && t[p] == ' ') p++;
             if (p >= e) break;
             size_t q = p;
@@ -45,7 +45,7 @@ int kn_parse(KnownList *k, const char *t, size_t len) {
         }
         KnownNet n;
         memset(&n, 0, sizeof n);
-        int ok = nf == 3;
+        int ok = nf == 3 || nf == 4;
         if (ok) {
             int sl = unhex(f[0], fl[0], n.ssid, sizeof n.ssid);
             ok = sl >= 1;
@@ -56,6 +56,11 @@ int kn_parse(KnownList *k, const char *t, size_t len) {
             else ok = (n.has_pmk = unhex(f[1], fl[1], n.pmk, sizeof n.pmk) == 32);
         }
         if (ok) ok = fl[2] == 1 && (f[2][0] == '0' || f[2][0] == '1');
+        if (ok && nf == 4) {
+            int pl = unhex(f[3], fl[3], (uint8_t *)n.pass, sizeof n.pass - 1);
+            ok = pl >= 8 && pl <= 63 && !memchr(n.pass, 0, (size_t)pl);
+            n.pass_len = (uint8_t)(ok ? pl : 0);
+        }
         if (ok) {
             n.autojoin = f[2][0] == '1';
             if (!kn_find(k, n.ssid, n.ssid_len)) k->n[k->count++] = n;
@@ -71,7 +76,7 @@ size_t kn_format(const KnownList *k, char *out, size_t cap) {
     size_t o = 0;
     for (int i = 0; i < k->count; i++) {
         const KnownNet *n = &k->n[i];
-        size_t need = (size_t)n->ssid_len * 2 + 1 + (n->has_pmk ? 64 : 1) + 3;
+        size_t need = (size_t)n->ssid_len * 2 + 1 + (n->has_pmk ? 64 : 1) + 3 + (n->pass_len ? 1 + 2 * (size_t)n->pass_len : 0);
         if (o + need + 1 > cap) return 0;
         for (int b = 0; b < n->ssid_len; b++) { out[o++] = hx[n->ssid[b] >> 4]; out[o++] = hx[n->ssid[b] & 15]; }
         out[o++] = ' ';
@@ -79,6 +84,10 @@ size_t kn_format(const KnownList *k, char *out, size_t cap) {
         else out[o++] = '-';
         out[o++] = ' ';
         out[o++] = n->autojoin ? '1' : '0';
+        if (n->pass_len) {
+            out[o++] = ' ';
+            for (int b = 0; b < n->pass_len; b++) { out[o++] = hx[(uint8_t)n->pass[b] >> 4]; out[o++] = hx[n->pass[b] & 15]; }
+        }
         out[o++] = '\n';
     }
     if (o < cap) out[o] = 0;
@@ -106,6 +115,16 @@ int kn_put(KnownList *k, const uint8_t *ssid, size_t ssid_len, const uint8_t *pm
     return 0;
 }
 
+int kn_set_pass(KnownNet *n, const char *pass, size_t len) {
+    memset(n->pass, 0, sizeof n->pass);
+    n->pass_len = 0;
+    if (!len) return 0;
+    if (len < 8 || len > 63 || memchr(pass, 0, len)) return -1;
+    memcpy(n->pass, pass, len);
+    n->pass_len = (uint8_t)len;
+    return 0;
+}
+
 int kn_remove(KnownList *k, const uint8_t *ssid, size_t ssid_len) {
     KnownNet *n = kn_find(k, ssid, ssid_len);
     if (!n) return 0;
@@ -129,6 +148,7 @@ int kn_choose(const KnownList *k, const KnSeen *seen, int n) {
         if (!s->usable || !s->ssid_len) continue;
         const KnownNet *kn = kn_find((KnownList *)k, s->ssid, s->ssid_len);
         if (!kn || !kn->autojoin || kn->has_pmk != (s->secured != 0)) continue;
+        if (s->sae_only && !kn->pass_len) continue;         // WPA3-only: a PMK alone can't join
         if (best < 0 || s->rssi > seen[best].rssi) best = i;
     }
     return best;

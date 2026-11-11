@@ -552,3 +552,27 @@ int aic_fmac_parse_disconnect_ind(const uint8_t *p, size_t n, uint16_t *reason, 
     *vif_idx = p[2];
     return 0;
 }
+
+size_t aic_fmac_connect_params_sae(uint8_t out[AIC_SZ_SM_CONNECT_REQ], const uint8_t *ssid, size_t ssid_len,
+                                   const uint8_t bssid[6], uint16_t freq, uint8_t band, uint8_t vif_idx,
+                                   const uint8_t *ie, size_t ie_len) {
+    if (!ie_len || !aic_fmac_connect_params(out, ssid, ssid_len, bssid, freq, band, vif_idx, ie, ie_len)) return 0;
+    put32(out + 48, 0x19u);                     // CONTROL_PORT_HOST | WPA_WPA2_IN_USE | MFP_IN_USE
+    out[59] = 3;                                // auth_type WLAN_AUTH_SAE
+    return AIC_SZ_SM_CONNECT_REQ;
+}
+
+size_t aic_fmac_ext_auth_rsp_params(uint8_t out[AIC_SZ_EXT_AUTH_RSP], uint8_t vif_idx, uint16_t status) {
+    memset(out, 0, AIC_SZ_EXT_AUTH_RSP);
+    out[0] = vif_idx;
+    put16(out + 2, status);
+    return AIC_SZ_EXT_AUTH_RSP;
+}
+
+int aic_fmac_parse_ext_auth_ind(const uint8_t *p, size_t n, uint8_t *vif_idx, uint8_t bssid[6], uint32_t *akm) {
+    if (!p || n < AIC_SZ_EXT_AUTH_IND) return -1;
+    *vif_idx = p[0];
+    memcpy(bssid, p + 34, 6);
+    *akm = (uint32_t)p[40] | ((uint32_t)p[41] << 8) | ((uint32_t)p[42] << 16) | ((uint32_t)p[43] << 24);
+    return 0;
+}

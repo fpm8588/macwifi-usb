@@ -23,8 +23,9 @@ uses it like any other connection.
 
 ## What works
 
-- WPA2-Personal (including the WPA2 side of WPA2/WPA3 "transition" networks) and open networks, 2.4 and 5 GHz,
-  802.11n/ac/ax access points
+- WPA3-Personal (SAE) with management frame protection, WPA2-Personal, WPA2/WPA3 "transition" networks (WPA3 is
+  used; WPA2 is the fallback) and open networks, 2.4 and 5 GHz, 802.11n/ac/ax access points. WPA3 is new and has
+  only been run against a simulated access point so far.
 - Captive portals (hotel, café, airport "sign in to continue" pages): detected over the adapter, and the menu
   opens the sign-in page, like macOS does for its own Wi-Fi
 - A menu bar app: networks with signal strength, lock and band; join; disconnect; forget; Wi-Fi on/off
@@ -34,8 +35,8 @@ uses it like any other connection.
   IPv6 is enabled too but hasn't been tested yet); it's placed after your other connections, so wired Ethernet
   or the built-in Wi-Fi still win when they're connected
 
-Not yet: WPA3-only networks (SAE), networks that require management frame protection (PMF), WPA2/WPA3-Enterprise,
-WEP, hidden networks, 6 GHz, roaming between access points of one network while connected, picking your regulatory
+Not yet: WPA3 networks that insist on "hash-to-element" (H2E-only, mostly 6 GHz), WPA2 networks that require
+management frame protection, WPA2/WPA3-Enterprise, WEP, hidden networks, 6 GHz, roaming between access points of one network while connected, picking your regulatory
 country (a worldwide channel set is used: channels 1–14 at 2.4 GHz and 36–165 at 5 GHz; access points on DFS
 radar channels 52–144 are scanned but joining them hasn't been tested). See [CHANGELOG.md](CHANGELOG.md).
 
@@ -120,9 +121,11 @@ interface. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the control so
 
 ## Privacy and security
 
-- Your Wi-Fi password goes from the menu (or the terminal) straight to the service, which derives the WPA2 key
-  (PMK) from it and **never stores or logs the password itself**. Remembered networks are kept as name + PMK in
-  a file only root can read (`/Library/Application Support/macwifi/networks`).
+- Your Wi-Fi password goes from the menu (or the terminal) straight to the service and is **never logged**.
+  Remembered networks are kept in a file only root can read (`/Library/Application Support/macwifi/networks`):
+  for WPA2-only networks as the derived key (PMK), not the password; for networks that offer WPA3 the password
+  itself is kept too, because WPA3 runs a fresh password exchange at every sign-in (every WPA3 device has to
+  keep it; macOS keeps its own in the keychain).
 - The service runs as root (it has to, to create a network interface); the menu talks to it over a socket only
   administrators can open.
 - Nothing is sent anywhere except your normal network traffic and, at install time, the firmware download.

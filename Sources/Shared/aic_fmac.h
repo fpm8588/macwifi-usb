@@ -54,6 +54,9 @@ enum {
     AIC_SM_CONNECT_IND            = 0x1802,
     AIC_SM_DISCONNECT_REQ         = 0x1803, AIC_SM_DISCONNECT_CFM         = 0x1804,
     AIC_SM_DISCONNECT_IND         = 0x1805,
+    AIC_SM_EXTERNAL_AUTH_REQUIRED_IND     = 0x1806,   // "do the SAE exchange yourself" (lmac_msg.h enum sm_msg_tag)
+    AIC_SM_EXTERNAL_AUTH_REQUIRED_RSP     = 0x1807,
+    AIC_SM_EXTERNAL_AUTH_REQUIRED_RSP_CFM = 0x180C,
 };
 #define AIC_TASK_MM_ID 0
 #define AIC_USB_TYPE_CFG_PRINT 0x13   // firmware log text (aicwf_usb.h); payload starts at packet + 4
@@ -152,6 +155,21 @@ size_t aic_fmac_key_add_params(uint8_t out[AIC_SZ_KEY_ADD_REQ], uint8_t vif_idx,
                                const uint8_t *key, uint8_t key_len, uint8_t key_idx, uint8_t cipher);
 size_t aic_fmac_ctrl_port_params(uint8_t out[AIC_SZ_CTRL_PORT_REQ], uint8_t sta_idx, int open);
 size_t aic_fmac_disconnect_params(uint8_t out[AIC_SZ_SM_DISCONNECT_REQ], uint16_t reason, uint8_t vif_idx);
+
+// WPA3-Personal: like aic_fmac_connect_params, but as rwnx_send_sm_connect_req builds it for an SAE connect from
+// wpa_supplicant: auth_type WLAN_AUTH_SAE (3) and flags CONTROL_PORT_HOST | WPA_WPA2_IN_USE | MFP_IN_USE (0x19).
+// The firmware then asks the host to run SAE (SM_EXTERNAL_AUTH_REQUIRED_IND: struct sm_external_auth_required_ind
+// = vif u8, ssid at 1, bssid at 34, akm u32 at 40; 44 bytes) and waits for SM_EXTERNAL_AUTH_REQUIRED_RSP
+// (vif u8, status u16 at 2; 4 bytes) before it associates.
+#define AIC_SZ_EXT_AUTH_IND 44
+#define AIC_SZ_EXT_AUTH_RSP 4
+size_t aic_fmac_connect_params_sae(uint8_t out[AIC_SZ_SM_CONNECT_REQ], const uint8_t *ssid, size_t ssid_len,
+                                   const uint8_t bssid[6], uint16_t freq, uint8_t band, uint8_t vif_idx,
+                                   const uint8_t *ie, size_t ie_len);
+size_t aic_fmac_ext_auth_rsp_params(uint8_t out[AIC_SZ_EXT_AUTH_RSP], uint8_t vif_idx, uint16_t status);
+// Returns 0 with the BSSID and AKM (as the firmware sends it), -1 if too short.
+int aic_fmac_parse_ext_auth_ind(const uint8_t *p, size_t n, uint8_t *vif_idx, uint8_t bssid[6], uint32_t *akm);
+#define AIC_MAC_CIPHER_BIP_CMAC_128 5
 
 typedef struct {
     uint16_t status_code;       // 802.11 status code; 0 = success

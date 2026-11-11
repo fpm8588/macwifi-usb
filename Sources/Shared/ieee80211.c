@@ -49,6 +49,7 @@ static int parse_rsn(const uint8_t *p, size_t n, WifiBss *b) {
             if (off + 4 > n) return -1;
             if (!(p[off] == 0x00 && p[off + 1] == 0x0F && p[off + 2] == 0xAC)) continue;
             if (p[off + 3] == 2) b->rsn_akm_psk = true;
+            if (p[off + 3] == 8) b->rsn_akm_sae = true;
             switch (p[off + 3]) {
                 case 2: case 4: case 6: psk = true; break;      // PSK, FT-PSK, PSK-SHA256
                 case 8: case 9: sae = true; break;              // SAE, FT-SAE
@@ -57,9 +58,16 @@ static int parse_rsn(const uint8_t *p, size_t n, WifiBss *b) {
             }
         }
     }
+    b->rsn_mgmt_bip_cmac = true;                          // the default group management cipher when PMF is on
     if (off + 2 <= n) {
         b->rsn_pmf_required = (le16(p + off) & 0x0040) != 0;
         b->rsn_pmf_capable = (le16(p + off) & 0x0080) != 0;
+        off += 2;
+        if (off + 2 <= n) {                               // PMKID list, then the group management cipher
+            off += 2 + (size_t)le16(p + off) * 16;
+            if (off + 4 <= n)
+                b->rsn_mgmt_bip_cmac = p[off] == 0x00 && p[off + 1] == 0x0F && p[off + 2] == 0xAC && p[off + 3] == 6;
+        }
     }
     b->rsn_ccmp = ccmp;
     if (sae && psk) b->security = WIFI_SEC_WPA2_WPA3;
@@ -94,6 +102,9 @@ int wifi_parse_bss(const uint8_t *f, size_t len, WifiBss *b) {
                 memcpy(b->ssid, p, n);
                 b->ssid[n] = '\0';
                 b->ssid_len = n;
+                break;
+            case 1: case 50:                            // (Extended) Supported Rates: membership selectors
+                for (uint8_t i = 0; i < n; i++) if (p[i] == (0x80 | 123)) b->sae_h2e_only = true;
                 break;
             case 3:                                     // DS Parameter Set
                 if (n >= 1) { b->channel = p[0]; have_ds = true; }

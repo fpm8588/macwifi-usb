@@ -116,6 +116,14 @@ static void test_known(void) {
     KnownNet *h = kn_find(&r, (const uint8_t *)"Home", 4);
     CHECK(h && h->has_pmk && !memcmp(h->pmk, pmk, 32) && h->autojoin);
     CHECK(kn_find(&r, (const uint8_t *)"Guest", 5) && !kn_find(&r, (const uint8_t *)"Guest", 5)->has_pmk);
+    // a stored password (WPA3) survives the round trip; bad ones are refused
+    CHECK(kn_set_pass(h, "correct horse", 13) == 0 && kn_set_pass(&r.n[0], "short", 5) == -1);
+    n = kn_format(&r, buf, sizeof buf);
+    KnownList r2;
+    CHECK(n > 0 && kn_parse(&r2, buf, n) == 2 && kn_find(&r2, (const uint8_t *)"Home", 4)->pass_len == 13 &&
+          !memcmp(kn_find(&r2, (const uint8_t *)"Home", 4)->pass, "correct horse", 13) &&
+          kn_find(&r2, (const uint8_t *)"Guest", 5)->pass_len == 0 && !strstr(buf, "correct"));
+    kn_set_pass(h, NULL, 0);
     // replace keeps one entry, moves it first
     CHECK(kn_put(&r, (const uint8_t *)"Home", 4, NULL) == 0 && r.count == 2 && !r.n[0].has_pmk);
     CHECK(kn_remove(&r, (const uint8_t *)"Home", 4) == 1 && r.count == 1 && kn_remove(&r, (const uint8_t *)"Home", 4) == 0);
@@ -136,11 +144,11 @@ static void test_known(void) {
     kn_put(&k, (const uint8_t *)"Off", 3, pmk);
     k.n[0].autojoin = 0;                                     // "Off"
     KnSeen seen[] = {
-        {(const uint8_t *)"Other", 5, -30, 1, 1},
-        {(const uint8_t *)"Home", 4, -70, 1, 1},
-        {(const uint8_t *)"Cafe", 4, -50, 1, 0},
-        {(const uint8_t *)"Off", 3, -20, 1, 1},
-        {(const uint8_t *)"Home", 4, -60, 0, 1},             // a Home AP we can't use (e.g. PMF required)
+        {(const uint8_t *)"Other", 5, -30, 1, 1, 0},
+        {(const uint8_t *)"Home", 4, -70, 1, 1, 0},
+        {(const uint8_t *)"Cafe", 4, -50, 1, 0, 0},
+        {(const uint8_t *)"Off", 3, -20, 1, 1, 0},
+        {(const uint8_t *)"Home", 4, -60, 0, 1, 0},             // a Home AP we can't use (e.g. PMF required)
     };
     CHECK(kn_choose(&k, seen, 5) == 2);                      // Cafe: strongest known+usable
     seen[2].secured = 1;                                     // Cafe now secured but stored as open: skip
@@ -148,6 +156,10 @@ static void test_known(void) {
     seen[1].usable = 0;
     CHECK(kn_choose(&k, seen, 5) == -1);
     CHECK(kn_choose(&k, seen, 0) == -1);
+    seen[1].usable = 1; seen[1].sae_only = 1;                // Home went WPA3-only: needs the password
+    CHECK(kn_choose(&k, seen, 5) == -1);
+    kn_set_pass(kn_find(&k, (const uint8_t *)"Home", 4), "home-password", 13);
+    CHECK(kn_choose(&k, seen, 5) == 1);
 
     // fuzz the parser
     srand(9);

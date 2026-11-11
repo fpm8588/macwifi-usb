@@ -56,6 +56,9 @@ typedef struct {
     bool     rsn_pmf_capable;   // MFPC bit set
     bool     rsn_group_ccmp;    // group cipher is CCMP (00-0F-AC:4)
     bool     rsn_akm_psk;       // plain WPA2-PSK (AKM 00-0F-AC:2) offered; what `connect` uses
+    bool     rsn_akm_sae;       // WPA3-Personal SAE (AKM 00-0F-AC:8) offered
+    bool     rsn_mgmt_bip_cmac; // group management cipher is BIP-CMAC-128 (stated or by default)
+    bool     sae_h2e_only;      // BSS membership selector 123: SAE hash-to-element only
     bool     ht, vht, he;
     uint8_t  rsn_ie[2 + 255];   // the RSN element as sent (id, length, body); rsn_ie_len 0 if absent
     uint16_t rsn_ie_len;

@@ -228,6 +228,25 @@ TROUBLESHOOTING, PROTOCOL, SECURITY, CONTRIBUTING, CHANGELOG).
    → **Checkpoint: install the package, join from the menu, unplug/replug, sleep the Mac and wake it; the
    connection comes back by itself.**
 
+## WPA3-Personal (added 2026-11-11, simulated; adapter test pending)
+
+- Firmware side, from the Linux driver: `SM_CONNECT_REQ` with `auth_type` WLAN_AUTH_SAE (3) and flags
+  `CONTROL_PORT_HOST | WPA_WPA2_IN_USE | MFP_IN_USE` (0x19) → `SM_EXTERNAL_AUTH_REQUIRED_IND` (0x1806; vif, ssid
+  at 1, bssid at 34, akm at 40) → host runs SAE → `SM_EXTERNAL_AUTH_REQUIRED_RSP` (0x1807; vif, status at 2),
+  cfm 0x180C → association → 4-way handshake. Authentication frames: TX as `rwnx_start_mgmt_xmit` (hostdesc
+  flags `TXU_CNTRL_MGMT`, staid 0xFF, tid 0xFF, hardware queue VO, whole 802.11 frame as payload); RX on the data
+  path with `flags_is_80211_mpdu`. IGTK: `MM_KEY_ADD_REQ` cipher `MAC_CIPHER_BIP_CMAC_128` (5), key index 4/5,
+  sta 0xFF.
+- Host side (original code): `p256.c` (Montgomery arithmetic, Jacobian points, fixed-length scalar
+  multiplication; checked against OpenSSL), `sae.c` (group 19, hunting-and-pecking with 40 fixed rounds,
+  anti-clogging tokens, confirm verification; IEEE 802.11-2020 Annex J.10 vector), `wpa.c` (KDF-SHA256, AES-CMAC),
+  `eapol.c` (key descriptor version 0, IGTK KDE, RSN element with AKM 8 + PMF + BIP).
+- Policy: WPA3 when the AP offers it and the password is known, WPA2 fallback on transition networks when SAE
+  fails for a non-password reason; password stored (root-only) only for networks that offer WPA3.
+- Not done: hash-to-element (H2E; H2E-only APs are shown as unsupported), PMKSA caching, SAE-PK, other groups.
+- To learn on the adapter: does the firmware send the IND and forward Authentication frames as assumed; does it
+  take the BIP key (a refusal is logged and tolerated).
+
 ## Phase 6: later
 
 WPA3-SAE (check for firmware SAE offload first), hidden networks, roaming between APs of one network,

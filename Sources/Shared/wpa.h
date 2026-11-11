@@ -28,6 +28,17 @@ int mw_hmac_sha1(const uint8_t *key, size_t klen, const uint8_t *msg, size_t mle
 int mw_pbkdf2_sha1(const char *pass, size_t plen, const uint8_t *salt, size_t slen, unsigned rounds,
                    uint8_t *out, size_t outlen);
 int mw_aes128_block(int encrypt, const uint8_t key[16], const uint8_t in[16], uint8_t out[16]);
+int mw_hmac_sha256(const uint8_t *key, size_t klen, const uint8_t *msg, size_t mlen, uint8_t out[32]);
+
+// ---- WPA3-Personal (AKM 8, SAE) key hierarchy: SHA-256 based (IEEE 802.11-2020 §12.7.1.6.2, §12.7.3)
+// KDF-SHA256-<bits>: HMAC-SHA256(key, i (LE16) || label || context || bits (LE16)), i = 1, 2, ...
+int wpa_kdf_sha256(const uint8_t *key, size_t klen, const char *label, const uint8_t *ctx, size_t clen,
+                   uint8_t *out, size_t bits);
+// PTK for SHA-256 AKMs: KDF-SHA256-384(PMK, "Pairwise key expansion", addresses and nonces as for wpa_derive_ptk).
+int wpa_derive_ptk_sha256(const uint8_t pmk[WPA_PMK_LEN], const uint8_t aa[6], const uint8_t spa[6],
+                          const uint8_t anonce[32], const uint8_t snonce[32], uint8_t ptk[WPA_PTK_LEN]);
+// AES-128-CMAC (RFC 4493): the EAPOL-Key MIC of key descriptor version 0 with AKM 8, and BIP.
+int wpa_aes_cmac(const uint8_t key[16], const uint8_t *msg, size_t len, uint8_t mac[16]);
 
 // ---- WPA2
 // passphrase must be 8..63 printable ASCII characters; ssid 1..32 bytes. Returns 0 or -1.
@@ -43,7 +54,8 @@ int wpa_derive_ptk(const uint8_t pmk[WPA_PMK_LEN], const uint8_t aa[6], const ui
                    uint8_t ptk[WPA_PTK_LEN]);
 
 // EAPOL-Key MIC over the whole EAPOL frame (802.1X header onward) with the MIC field zeroed.
-// key_desc_version 2 = HMAC-SHA1-128 (WPA2-PSK/CCMP). Others (1 = TKIP/MD5, 3 = AES-CMAC) return -1.
+// key_desc_version 2 = HMAC-SHA1-128 (WPA2-PSK/CCMP); 0 = AKM-defined, here AES-128-CMAC (SAE). 1 (TKIP/MD5)
+// returns -1.
 int wpa_eapol_mic(const uint8_t kck[16], int key_desc_version, const uint8_t *eapol, size_t len,
                   uint8_t mic[WPA_MIC_LEN]);
 

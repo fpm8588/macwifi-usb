@@ -4,6 +4,7 @@
 // key only after message 4 has been sent), the control port, the DHCP probe and the failure paths.
 // Original code (MIT).
 
+#include "sae.h"
 #define main macwifictl_main
 #include "../Sources/macwifictl/main.c"
 #undef main
@@ -22,8 +23,11 @@ char *readpassphrase(const char *prompt, char *buf, unsigned long bufsiz, int fl
 // ---------------------------------------------------------------- the simulated network
 static const uint8_t kMac[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55};
 static const uint8_t kBssid[6] = {0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01};
-static const uint8_t kApRsn[26] = {0x30, 24, 1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4,
-                                   2, 0, 0x00, 0x0F, 0xAC, 2, 0x00, 0x0F, 0xAC, 8, 0x80, 0x00};   // PSK + SAE, MFPC
+static const uint8_t kIgtk[16] = {0x40, 0x41, 0x42, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49, 0x4a, 0x4b, 0x4c, 0x4d, 0x4e, 0x4f};
+enum { AP_WPA2 = 0, AP_TRANSITION, AP_WPA3 };   // what the simulated access point offers
+static size_t ap_rsn(uint8_t *out);
+static uint8_t gApRsn[40];
+static size_t gApRsnLen;
 static const uint8_t kGtk[16] = {0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f};
 #define AP_IDX 2
 
@@ -34,6 +38,13 @@ typedef struct {
     int pmf_required;
     int open;                   // no RSN, no privacy: open network
     int own_only_when_assoc, associated;
+    int mode;                   // AP_WPA2 (default), AP_TRANSITION, AP_WPA3
+    int sae_reject, sae_token, fw_no_ext_auth;   // AP refuses SAE (status 77) / asks for a token / firmware never asks
+    int sae_session;            // this association's PMK came from SAE
+    Sae ap_sae;
+    uint8_t ap_confirm[SAE_MAX_FRAME];
+    size_t ap_confirm_len;
+    int sae_commits, sae_ok, sae_bad, sae_token_ok, igtk_ok, ext_auth_rsp, sae_frames_bad;
     // what happened
     int scans, connects, msg2_ok, msg2_bad, msg4_ok, ptk_ok, gtk_ok, ptk_before_msg4, port_open, dhcp_seen;
     int discs, data_bad, eapol_sta_ok, eapol_cfm_req, dhcp_sta_ok, key_dumped, connect_req_ok;
@@ -142,12 +153,13 @@ static size_t ap_eapol(uint8_t *out, unsigned key_info, const uint8_t *kd, size_
     size_t len = 99 + dl;
     memset(out, 0, len);
     out[0] = 2; out[1] = 3; put_be16(out + 2, (unsigned)(len - 4));
+    if (S.sae_session) key_info &= ~7u;                    // key descriptor version 0 with AKM SAE
     out[4] = 2; put_be16(out + 5, key_info); put_be16(out + 7, 16);
     out[16] = (uint8_t)++S.replay;
     memcpy(out + 17, S.anonce, 32);
     put_be16(out + 97, (unsigned)dl);
     memcpy(out + 99, data, dl);
-    if (with_mic) wpa_eapol_mic(WPA_KCK(S.ptk), 2, out, len, out + 81);
+    if (with_mic) wpa_eapol_mic(WPA_KCK(S.ptk), S.sae_session ? 0 : 2, out, len, out + 81);
     return len;
 }
 
@@ -165,7 +177,7 @@ static int mic_ok(const uint8_t *f, size_t n) {
     if (n > sizeof t || n < 97) return 0;
     memcpy(t, f, n);
     memset(t + 81, 0, 16);
-    wpa_eapol_mic(WPA_KCK(S.ptk), 2, t, n, mic);
+    wpa_eapol_mic(WPA_KCK(S.ptk), S.sae_session ? 0 : 2, t, n, mic);
     return memcmp(mic, f + 81, 16) == 0;
 }
 
@@ -189,9 +201,9 @@ static void beacon_result_for(const char *ssid, const uint8_t *bssid) {
     f[n++] = 0; f[n++] = (uint8_t)sl; memcpy(f + n, ssid, sl); n += sl;
     f[n++] = 3; f[n++] = 1; f[n++] = 1;                     // channel 1
     if (!S.open) {
-        memcpy(f + n, kApRsn, sizeof kApRsn);
-        if (S.pmf_required) f[n + sizeof kApRsn - 2] = 0xC0;
-        n += sizeof kApRsn;
+        gApRsnLen = ap_rsn(gApRsn);
+        memcpy(f + n, gApRsn, gApRsnLen);
+        n += gApRsnLen;
     }
     uint8_t p[300] = {0};
     p[0] = (uint8_t)n; p[1] = (uint8_t)(n >> 8);
@@ -199,6 +211,107 @@ static void beacon_result_for(const char *ssid, const uint8_t *bssid) {
     p[9] = (uint8_t)-40;
     memcpy(p + 12, f, n);
     in_msg(AIC_SCANU_RESULT_IND, p, (uint16_t)(12 + n));
+}
+
+// The AP's RSN element for its mode: WPA2 (PSK, no PMF unless pmf_required), transition (PSK + SAE, PMF capable),
+// WPA3 (SAE, PMF required, BIP-CMAC-128 stated).
+static size_t ap_rsn(uint8_t *o) {
+    size_t n = 0;
+    static const uint8_t head[12] = {1, 0, 0x00, 0x0F, 0xAC, 4, 1, 0, 0x00, 0x0F, 0xAC, 4};
+    o[n++] = 0x30; o[n++] = 0;
+    memcpy(o + n, head, 12); n += 12;
+    int psk = S.mode != AP_WPA3, sae = S.mode != AP_WPA2;
+    o[n++] = (uint8_t)(psk + sae); o[n++] = 0;
+    if (psk) { o[n++] = 0x00; o[n++] = 0x0F; o[n++] = 0xAC; o[n++] = 2; }
+    if (sae) { o[n++] = 0x00; o[n++] = 0x0F; o[n++] = 0xAC; o[n++] = 8; }
+    o[n++] = S.mode == AP_WPA3 || S.pmf_required ? 0xC0 : S.mode == AP_TRANSITION ? 0x80 : 0x00;
+    o[n++] = 0;
+    if (S.mode == AP_WPA3) { o[n++] = 0; o[n++] = 0; o[n++] = 0x00; o[n++] = 0x0F; o[n++] = 0xAC; o[n++] = 6; }
+    o[1] = (uint8_t)(n - 2);
+    return n;
+}
+
+// A management frame for the station, as the firmware forwards it: RX header flagged "802.11 MPDU", the frame as is.
+static void in_auth(const uint8_t *body, size_t n) {
+    uint8_t b[60 + 24 + SAE_MAX_FRAME] = {0};
+    uint8_t *f = b + 60;
+    f[0] = 0xB0;
+    memcpy(f + 4, kMac, 6); memcpy(f + 10, kBssid, 6); memcpy(f + 16, kBssid, 6);
+    memcpy(f + 24, body, n);
+    size_t fl = 24 + n;
+    b[0] = (uint8_t)fl; b[1] = (uint8_t)(fl >> 8);
+    b[17] = (uint8_t)-42;
+    b[48] = 0x02;                                            // is_80211_mpdu
+    b[49] = 0; b[50] = 0xff; b[51] = 0xff;
+    q_push_data(b, 60 + fl);
+}
+
+static void sim_rng(uint8_t *o, size_t n) { for (size_t i = 0; i < n; i++) o[i] = (uint8_t)rand(); }
+
+// The access point's side of SAE (the same sae.c, playing the other role).
+static void ap_on_auth(const uint8_t *body, size_t n) {
+    uint8_t reply[SAE_MAX_FRAME];
+    size_t rl = 0;
+    const char *err = NULL;
+    int wp = 0;
+    if (n < 6 || body[0] != 3) { S.sae_frames_bad++; return; }
+    if (body[2] == 1) {                                       // commit
+        if (S.ap_sae.state != SAE_IDLE) return;               // a retransmission
+        S.sae_commits++;
+        if (S.sae_reject) {
+            uint8_t rej[8] = {3, 0, 1, 0, 77, 0, 19, 0};
+            in_auth(rej, sizeof rej);
+            return;
+        }
+        uint8_t commit[SAE_MAX_FRAME];
+        memcpy(commit, body, n);
+        if (S.sae_token) {
+            if (n == 6 + 2 + 96) {                             // no token yet: ask for one
+                uint8_t req[8 + 16] = {3, 0, 1, 0, 76, 0, 19, 0};
+                memset(req + 8, 0x5A, 16);
+                in_auth(req, sizeof req);
+                S.sae_commits--;
+                return;
+            }
+            int ok = n == 6 + 2 + 16 + 96;
+            for (int i = 0; ok && i < 16; i++) ok = body[8 + i] == 0x5A;
+            if (!ok) { S.sae_frames_bad++; return; }
+            S.sae_token_ok = 1;
+            memmove(commit + 8, commit + 24, 96);
+            n -= 16;
+        }
+        if (sae_start(&S.ap_sae, kBssid, kMac, (const uint8_t *)S.ap_pass, strlen(S.ap_pass), sim_rng)) return;
+        size_t cl = sae_build_commit(&S.ap_sae, reply, sizeof reply);
+        in_auth(reply, cl);
+        if (sae_rx(&S.ap_sae, commit, n, S.ap_confirm, sizeof S.ap_confirm, &S.ap_confirm_len, &err, &wp) != SAE_EV_SEND)
+            S.sae_frames_bad++;
+    } else if (body[2] == 2) {                                // confirm
+        if (S.ap_sae.state != SAE_CONFIRMED) return;
+        if (sae_rx(&S.ap_sae, body, n, reply, sizeof reply, &rl, &err, &wp) == SAE_EV_DONE) {
+            S.sae_ok++;
+            in_auth(S.ap_confirm, S.ap_confirm_len);
+        } else {
+            S.sae_bad++;
+            uint8_t rej[6] = {3, 0, 2, 0, 1, 0};              // rejected (a real AP may also just stay silent)
+            in_auth(rej, sizeof rej);
+        }
+    }
+}
+
+// The firmware's part after authentication: association result, then the AP starts the 4-way handshake.
+static void sim_associate(void) {
+    uint8_t r[900] = {0};
+    r[0] = (uint8_t)S.assoc_status; r[1] = (uint8_t)(S.assoc_status >> 8);
+    memcpy(r + 2, kBssid, 6);
+    r[10] = AP_IDX; r[12] = 1; r[820] = 1; r[824] = 0x6c; r[825] = 0x09;
+    in_msg(AIC_SM_CONNECT_IND, r, 852);
+    if (S.assoc_status) return;
+    S.associated = 1;
+    if (S.open) { S.port_open = 1; return; }               // no handshake, no control port
+    for (int i = 0; i < 32; i++) S.anonce[i] = (uint8_t)(0x80 + i);
+    uint8_t e[200];
+    size_t n = ap_eapol(e, 0x008A, NULL, 0, 0, 0);          // message 1
+    ap_send_eapol(e, n, 0);
 }
 
 static void on_msg(uint16_t id, const uint8_t *p, uint16_t plen) {
@@ -213,30 +326,52 @@ static void on_msg(uint16_t id, const uint8_t *p, uint16_t plen) {
             break;
         case AIC_SM_CONNECT_REQ: {
             S.connects++;
-            uint8_t rsn[22];
+            uint8_t rsn[22], rsn3[28];
             wpa_build_rsn_ie(rsn, sizeof rsn);
+            wpa_build_rsn_ie_sae(rsn3, sizeof rsn3);
+            int want_sae = plen == 320 && p[59] == 3;
             S.connect_req_ok = plen == 320 && p[0] == strlen(S.ssid) && !memcmp(p + 1, S.ssid, p[0]) &&
                                !memcmp(p + 34, kBssid, 6) && p[40] == 0x6c && p[41] == 0x09 && p[42] == 0 &&
                                p[52] == 0x88 && p[53] == 0x8E && p[60] == 1 && p[61] == 0 &&
                                (S.open ? p[48] == 0 && p[54] == 0 && p[64] == 0
-                                       : p[48] == 9 && p[54] == 22 && !memcmp(p + 64, rsn, 22));
+                                : want_sae ? p[48] == 0x19 && p[54] == 28 && !memcmp(p + 64, rsn3, 28)
+                                           : p[48] == 9 && p[54] == 22 && p[59] == 0 && !memcmp(p + 64, rsn, 22));
             in_msg(AIC_SM_CONNECT_CFM, r, 4);
-            r[0] = (uint8_t)S.assoc_status; r[1] = (uint8_t)(S.assoc_status >> 8);
-            memcpy(r + 2, kBssid, 6);
-            r[10] = AP_IDX; r[12] = 1; r[820] = 1; r[824] = 0x6c; r[825] = 0x09;
-            in_msg(AIC_SM_CONNECT_IND, r, 852);
-            if (S.assoc_status) break;
-            S.associated = 1;
-            if (S.open) { S.port_open = 1; break; }        // no handshake, no control port
-            for (int i = 0; i < 32; i++) S.anonce[i] = (uint8_t)(0x80 + i);
-            uint8_t e[200];
-            size_t n = ap_eapol(e, 0x008A, NULL, 0, 0, 0);   // message 1
-            ap_send_eapol(e, n, 0);
+            S.sae_session = 0;
+            sae_wipe(&S.ap_sae);
+            if (want_sae) {                                // hand authentication to the host
+                if (S.fw_no_ext_auth) break;
+                uint8_t ind[AIC_SZ_EXT_AUTH_IND] = {0};
+                ind[1] = (uint8_t)strlen(S.ssid);
+                memcpy(ind + 2, S.ssid, ind[1]);
+                memcpy(ind + 34, kBssid, 6);
+                ind[40] = 0x08; ind[41] = 0xAC; ind[42] = 0x0F; ind[43] = 0x00;
+                in_msg(AIC_SM_EXTERNAL_AUTH_REQUIRED_IND, ind, sizeof ind);
+                break;
+            }
+            sim_associate();
+            break;
+        }
+        case AIC_SM_EXTERNAL_AUTH_REQUIRED_RSP: {
+            S.ext_auth_rsp++;
+            in_msg(AIC_SM_EXTERNAL_AUTH_REQUIRED_RSP_CFM, r, 4);
+            uint16_t st = plen == 4 ? (uint16_t)(p[2] | (p[3] << 8)) : 1;
+            if (st == 0 && S.ap_sae.state == SAE_ACCEPTED) {
+                S.sae_session = 1;
+                memcpy(S.pmk, S.ap_sae.pmk, 32);
+                sim_associate();
+            } else {                                       // authentication failed: the connect attempt ends
+                uint8_t ci[852] = {1, 0};
+                memcpy(ci + 2, kBssid, 6);
+                in_msg(AIC_SM_CONNECT_IND, ci, 852);
+            }
             break;
         }
         case AIC_MM_KEY_ADD_REQ: {
             S.key_dumped = 0;
-            if (plen == 44 && p[43] == 1) {
+            if (plen == 44 && p[40] == AIC_MAC_CIPHER_BIP_CMAC_128) {
+                S.igtk_ok = p[0] == 4 && p[1] == 0xFF && p[4] == 16 && !memcmp(p + 8, kIgtk, 16) && p[43] == 0;
+            } else if (plen == 44 && p[43] == 1) {
                 S.ptk_ok = p[1] == AP_IDX && p[4] == 16 && !memcmp(p + 8, WPA_TK(S.ptk), 16) && p[40] == 2;
                 if (!S.msg4_ok) S.ptk_before_msg4 = 1;
             } else if (plen == 44) {
@@ -291,7 +426,18 @@ static void on_data(const uint8_t *b, size_t n) {
     uint16_t et = (uint16_t)((b[24] << 8) | b[25]);
     const uint8_t *payload = b + 32;
     size_t pl = n - 32;
-    if (total > n || plen > pl || memcmp(b + 18, kMac, 6) != 0) { S.data_bad++; return; }
+    if (total > n || plen > pl) { S.data_bad++; return; }
+    if (b[30] & 0x08) {                                     // TXU_CNTRL_MGMT: a raw 802.11 management frame
+        if (b[29] != 0xFF || b[27] != 0xFF || b[26] != 3 || b[28] != 0 || sda != 0 || et != 0 || plen < 30 ||
+            payload[0] != 0xB0 || memcmp(payload + 4, kBssid, 6) || memcmp(payload + 10, kMac, 6) ||
+            memcmp(payload + 16, kBssid, 6)) {
+            S.sae_frames_bad++;
+            return;
+        }
+        ap_on_auth(payload + 24, (size_t)plen - 24);
+        return;
+    }
+    if (memcmp(b + 18, kMac, 6) != 0) { S.data_bad++; return; }
     if (et == 0x888E) {
         if (memcmp(b + 12, kBssid, 6) != 0 || b[29] != AP_IDX || b[28] != 0) { S.data_bad++; return; }
         S.eapol_sta_ok = 1;
@@ -300,11 +446,16 @@ static void on_data(const uint8_t *b, size_t n) {
         in_tx_cfm(0x9, sda & 0xffff);
         EapolKey k;
         if (eapol_parse_key(payload, plen, &k) != 0) { S.data_bad++; return; }
-        if (k.key_info == 0x010A) {                        // message 2
+        const uint16_t v = S.sae_session ? 0 : 2;
+        if (k.key_info == (0x0108 | v)) {                  // message 2
             uint8_t spa_nonce[32];
             memcpy(spa_nonce, k.nonce, 32);
-            wpa_pmk_from_passphrase(S.ap_pass, (const uint8_t *)S.ssid, strlen(S.ssid), S.pmk);
-            wpa_derive_ptk(S.pmk, kBssid, kMac, S.anonce, spa_nonce, S.ptk);
+            if (S.sae_session) {
+                wpa_derive_ptk_sha256(S.pmk, kBssid, kMac, S.anonce, spa_nonce, S.ptk);
+            } else {
+                wpa_pmk_from_passphrase(S.ap_pass, (const uint8_t *)S.ssid, strlen(S.ssid), S.pmk);
+                wpa_derive_ptk(S.pmk, kBssid, kMac, S.anonce, spa_nonce, S.ptk);
+            }
             if (!mic_ok(payload, k.frame_len)) {
                 S.msg2_bad++;
                 S.associated = 0;
@@ -313,15 +464,21 @@ static void on_data(const uint8_t *b, size_t n) {
                 return;
             }
             S.msg2_ok++;
-            uint8_t kd[100], e[300];
+            uint8_t kd[160], e[400];
             size_t kdl = 0;
-            memcpy(kd, kApRsn, sizeof kApRsn); kdl = sizeof kApRsn;
+            memcpy(kd, gApRsn, gApRsnLen); kdl = gApRsnLen;
             kd[kdl++] = 0xDD; kd[kdl++] = 22; kd[kdl++] = 0x00; kd[kdl++] = 0x0F; kd[kdl++] = 0xAC; kd[kdl++] = 1;
             kd[kdl++] = 1; kd[kdl++] = 0;
             memcpy(kd + kdl, kGtk, 16); kdl += 16;
+            if (S.sae_session) {                           // IGTK KDE: key id 4, IPN, key
+                kd[kdl++] = 0xDD; kd[kdl++] = 28; kd[kdl++] = 0x00; kd[kdl++] = 0x0F; kd[kdl++] = 0xAC; kd[kdl++] = 9;
+                kd[kdl++] = 4; kd[kdl++] = 0;
+                memset(kd + kdl, 0, 6); kdl += 6;
+                memcpy(kd + kdl, kIgtk, 16); kdl += 16;
+            }
             size_t en = ap_eapol(e, 0x13CA, kd, kdl, 1, 1);  // message 3
             ap_send_eapol(e, en, 0);
-        } else if (k.key_info == 0x030A) {                 // message 4
+        } else if (k.key_info == (0x0308 | v)) {           // message 4
             if (mic_ok(payload, k.frame_len)) S.msg4_ok++;
         }
         return;
@@ -710,6 +867,61 @@ static void test_daemon(void) {
     gStop = 0;
 }
 
+static void test_daemon_wpa3(void) {
+    printf("---- macwifid with WPA3\n");
+    reset("ExampleNet", "correct horse battery");
+    S.mode = AP_WPA3;
+    snprintf(gDir, sizeof gDir, "/tmp/mw-sim3-%d", (int)getpid());
+    snprintf(gSock, sizeof gSock, "/tmp/mw-sim3-%d.sock", (int)getpid());
+    mkdir(gDir, 0700);
+    // a remembered entry from before WPA3 support: the WPA2 key only. It can't join a WPA3-only network.
+    char path[128], line[200];
+    snprintf(path, sizeof path, "%s/networks", gDir);
+    int n = snprintf(line, sizeof line, "4578616d706c654e6574 %064d 1\n", 0);
+    CHECK(write_private(path, line, (size_t)n) == 0);
+    gStop = 0;
+    gAdapterPresent = 1;
+    gUnplugged = 0;
+    gSimCaptive = CAPTIVE_NONE;
+    pthread_t th;
+    pthread_create(&th, NULL, daemon_thread, NULL);
+    char r[8192];
+    CHECK(wait_for("\"state\":\"idle\"", 5));
+    usleep(1500000);
+    CHECK(S_get(&S.connects) == 0);                           // no auto-join attempt without the password
+    CHECK(ask("{\"cmd\":\"scan\"}", r, sizeof r) == 0 && strstr(r, "\"security\":\"wpa3\"") && strstr(r, "\"usable\":true"));
+    CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\"}", r, sizeof r) == 0 && strstr(r, "\"ok\":false") &&
+          strstr(r, "enter its password again"));
+    CHECK(ask("{\"cmd\":\"known\"}", r, sizeof r) == 0 && strstr(r, "ExampleNet"));   // still remembered, still auto-join
+    // wrong, then right password
+    CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\",\"password\":\"incorrect horse battery\"}", r, sizeof r) == 0 &&
+          strstr(r, "\"ok\":false") && strstr(r, "wrong password"));
+    CHECK(ask("{\"cmd\":\"join\",\"ssid\":\"ExampleNet\",\"password\":\"correct horse battery\"}", r, sizeof r) == 0 &&
+          strstr(r, "\"ok\":true"));
+    CHECK(wait_for("\"security\":\"wpa3\"", 3) && wait_for("\"ip\":\"192.0.2.77\"", 5));
+    CHECK(S_get(&S.sae_ok) == 1 && S_get(&S.igtk_ok) && S_get(&S.sae_frames_bad) == 0);
+    // the password is stored for WPA3 (hex, root-only file), never in the clear
+    struct stat st;
+    size_t fl = 0;
+    char *ft = read_small(path, &fl);
+    CHECK(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600 && ft && !strstr(ft, "horse") &&
+          strstr(ft, " 1 636f727265637420686f7273652062617474657279\n") && fl == 20 + 1 + 64 + 3 + 1 + 42);
+    free(ft);
+    // the AP drops us: the remembered password signs in again by itself, with a fresh SAE exchange
+    uint8_t dr[6] = {4, 0, 0, 0, 0, 0};
+    in_msg(AIC_SM_DISCONNECT_IND, dr, 6);
+    double t0 = now_s();
+    while (S_get(&S.sae_ok) < 2 && now_s() - t0 < 10) usleep(50000);
+    CHECK(S_get(&S.sae_ok) == 2 && wait_for("\"state\":\"connected\"", 10));
+    gStop = 1;
+    pthread_join(th, NULL);
+    unlink(path);
+    snprintf(path, sizeof path, "%s/power", gDir);
+    unlink(path);
+    rmdir(gDir);
+    gStop = 0;
+}
+
 int main(void) {
     setvbuf(stdout, NULL, _IONBF, 0);
 
@@ -779,6 +991,64 @@ int main(void) {
     rc = sim_run("ExampleNet", 1);
     CHECK(rc == 2 && S.connects == 0);
 
+    printf("---- WPA3-only network\n");
+    reset("ExampleNet", "correct horse battery");
+    S.mode = AP_WPA3;
+    gPass = "correct horse battery";
+    rc = sim_run("ExampleNet", 1);
+    CHECK(rc == 0 && S.connects == 1 && S.connect_req_ok);
+    CHECK(S.sae_commits == 1 && S.sae_ok == 1 && S.sae_bad == 0 && S.sae_frames_bad == 0 && S.ext_auth_rsp == 1);
+    CHECK(S.sae_session && S.msg2_ok == 1 && S.msg4_ok == 1 && S.ptk_ok && S.gtk_ok && S.igtk_ok && !S.ptk_before_msg4);
+    CHECK(S.port_open && S.dhcp_seen >= 1 && S.discs == 1 && S.data_bad == 0);
+
+    printf("---- WPA3: wrong password\n");
+    reset("ExampleNet", "correct horse battery");
+    S.mode = AP_WPA3;
+    gPass = "incorrect horse battery";
+    rc = sim_run("ExampleNet", 1);
+    CHECK(rc == 1 && S.sae_bad == 1 && S.sae_ok == 0 && !S.associated && S.msg2_ok == 0 && !S.ptk_ok && S.dhcp_seen == 0);
+    CHECK(S.ext_auth_rsp == 1 && S.connects == 1);          // told the firmware it failed; no WPA2 retry
+
+    printf("---- WPA2/WPA3 transition network: WPA3 is used (with an anti-clogging token)\n");
+    reset("ExampleNet", "correct horse battery");
+    S.mode = AP_TRANSITION;
+    S.sae_token = 1;
+    gPass = "correct horse battery";
+    rc = sim_run("ExampleNet", 1);
+    CHECK(rc == 0 && S.sae_ok == 1 && S.sae_token_ok && S.sae_session && S.igtk_ok && S.connects == 1 && S.sae_frames_bad == 0);
+
+    printf("---- transition network where WPA3 fails: falls back to WPA2\n");
+    reset("ExampleNet", "correct horse battery");
+    S.mode = AP_TRANSITION;
+    S.sae_reject = 1;
+    rc = sim_run("ExampleNet", 1);
+    CHECK(rc == 0 && S.connects == 2 && S.sae_ok == 0 && !S.sae_session && S.msg2_ok == 1 && S.ptk_ok && S.port_open);
+
+    printf("---- transition network with MACWIFI_NO_WPA3=1: WPA2 only\n");
+    reset("ExampleNet", "correct horse battery");
+    S.mode = AP_TRANSITION;
+    setenv("MACWIFI_NO_WPA3", "1", 1);
+    rc = sim_run("ExampleNet", 1);
+    unsetenv("MACWIFI_NO_WPA3");
+    CHECK(rc == 0 && S.connects == 1 && S.sae_commits == 0 && S.msg2_ok == 1 && S.connect_req_ok);
+
+    printf("---- WPA2 with required PMF, and WPA3 hash-to-element only: not offered\n");
+    {
+        WifiBss b;
+        memset(&b, 0, sizeof b);
+        int sec;
+        const char *why;
+        b.security = WIFI_SEC_WPA3_SAE;
+        b.rsn_akm_sae = b.rsn_pmf_capable = b.rsn_pmf_required = b.rsn_mgmt_bip_cmac = b.rsn_ccmp = b.rsn_group_ccmp = 1;
+        b.rsn_ie_len = 28;
+        CHECK(bss_usable(&b, &sec, &why) == 1 && bss_can_sae(&b) && !bss_can_psk(&b));
+        b.sae_h2e_only = 1;
+        CHECK(bss_usable(&b, &sec, &why) == 0 && strstr(why, "hash-to-element"));
+        b.sae_h2e_only = 0;
+        b.rsn_mgmt_bip_cmac = 0;                              // e.g. BIP-GMAC-256
+        CHECK(bss_usable(&b, &sec, &why) == 0);
+    }
+
     printf("---- open network\n");
     reset("GuestNet", "");
     S.open = 1;
@@ -805,6 +1075,7 @@ int main(void) {
     CHECK(S.discs == 1);
 
     test_daemon();
+    test_daemon_wpa3();
     CHECK(gRxStarted == 0);    // every reader that was started was stopped
 
     printf("sim_connect: %d checks, %d failures\n", checks, failures);

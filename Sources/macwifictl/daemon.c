@@ -57,7 +57,7 @@ typedef enum { DC_NONE, DC_SCAN, DC_JOIN, DC_DISCONNECT, DC_FORGET, DC_POWER } D
 typedef struct {
     uint8_t ssid[32];
     uint8_t ssid_len;
-    int rssi, freq, secured, usable, known;
+    int rssi, freq, secured, usable, known, sae, sae_only;
     const char *why;
     double seen;              // when a scan last saw it
 } NetView;
@@ -83,6 +83,7 @@ typedef struct {
     uint8_t ssid_len;
     int rssi, freq;
     char ip[64], error[200];
+    const char *sec;          // "wpa3", "wpa2" or "open" for the current connection
     int captive;              // CaptiveState of the current connection
     char portal[512];
     NetView nets[48];
@@ -161,7 +162,7 @@ static void d_load(Daemon *d) {
 }
 
 static void d_save_known(Daemon *d) {
-    char p[1024], buf[KN_MAX * 140];
+    char p[1024], buf[KN_MAX * 270];
     d_path(d, "networks", p, sizeof p);
     pthread_mutex_lock(&d->mu);
     size_t n = kn_format(&d->known, buf, sizeof buf);
@@ -187,6 +188,7 @@ static void reply_status(Daemon *d, JsonOut *j) {
         jo_int(j, "rssi", d->rssi);
         jo_int(j, "freq", d->freq);
         jo_str(j, "ip", d->ip);
+        if (d->state == DS_CONNECTED && d->sec) jo_str(j, "security", d->sec);
         jo_str(j, "captive", d->captive == CAPTIVE_PORTAL ? "yes" : d->captive == CAPTIVE_NONE ? "no" : "unknown");
         if (d->captive == CAPTIVE_PORTAL) jo_str(j, "portal", d->portal);
     }
@@ -204,6 +206,7 @@ static void reply_networks(Daemon *d, JsonOut *j) {
         jo_int(j, "rssi", v->rssi);
         jo_int(j, "freq", v->freq);
         jo_bool(j, "secured", v->secured);
+        jo_str(j, "security", !v->secured ? "open" : v->sae ? (v->sae_only ? "wpa3" : "wpa2/wpa3") : "wpa2");
         jo_bool(j, "usable", v->usable);
         jo_bool(j, "known", kn_find(&d->known, v->ssid, v->ssid_len) != NULL);   // as of now, not the scan
         if (!v->usable) jo_str(j, "why", v->why);
@@ -441,6 +444,8 @@ static void d_publish_scan(Daemon *d, const ScanList *sl) {
         v->rssi = e->rssi;
         v->freq = e->freq;
         v->secured = sec;
+        v->sae = bss_can_sae(&e->bss);
+        v->sae_only = v->sae && !bss_can_psk(&e->bss);
         v->usable = usable;
         v->why = why;
         v->known = kn_find(&d->known, v->ssid, v->ssid_len) != NULL;
@@ -506,6 +511,7 @@ typedef struct {
     ScanList sl;
     uint8_t mac[6];
     int up, connected, feth_open;
+    int sae_capable;          // the access point we last joined offers WPA3
 } Adapter;
 
 static Adapter gA;
@@ -558,8 +564,9 @@ static int d_scan(Daemon *d, Adapter *a, const uint8_t *ssid, size_t ssid_len) {
     return r;
 }
 
-// Joins `ssid` (PMK from `pmk` if secured; NULL pmk = open). Returns 0, or -1 with `err` set.
-static int d_join(Daemon *d, Adapter *a, const uint8_t *ssid, size_t ssid_len, const uint8_t *pmk, char *err, size_t errcap,
+// Joins `ssid` with what we know (cred: the WPA2 key and/or the password for WPA3; both NULL = open). Returns 0, or
+// -1 with `err` set.
+static int d_join(Daemon *d, Adapter *a, const uint8_t *ssid, size_t ssid_len, const JoinCred *cred, char *err, size_t errcap,
                   int *wrong_password) {
     *wrong_password = 0;
     if (a->connected || a->c.associated) d_disconnect(d, a);
@@ -583,20 +590,25 @@ static int d_join(Daemon *d, Adapter *a, const uint8_t *ssid, size_t ssid_len, c
     int secured;
     const char *why;
     bss_usable(&best->bss, &secured, &why);
-    if (secured && !pmk) {
+    if (secured && !cred->pmk && !cred->pass) {
         snprintf(err, errcap, "a password is needed");
         d_set_state(d, DS_IDLE);
         return -1;
     }
     memset(&a->ws, 0, sizeof a->ws);
-    if (secured) memcpy(a->ws.pmk, pmk, 32);
     pthread_mutex_lock(&d->mu);
     d->freq = best->freq;
     d->rssi = best->rssi;
     pthread_mutex_unlock(&d->mu);
-    JoinResult jr = conn_associate(&a->c, best, ssid, ssid_len, secured ? &a->ws : NULL, err, errcap);
+    a->sae_capable = secured && bss_can_sae(&best->bss);
+    int had_cred = secured && ((bss_can_sae(&best->bss) && cred->pass) || (bss_can_psk(&best->bss) && cred->pmk));
+    JoinResult jr = secured ? conn_join_secured(&a->c, best, ssid, ssid_len, &a->ws, cred, err, errcap)
+                            : conn_associate(&a->c, best, ssid, ssid_len, NULL, NULL, 0, err, errcap);
+    pthread_mutex_lock(&d->mu);
+    d->sec = !secured ? "open" : a->c.used_sae ? "wpa3" : "wpa2";
+    pthread_mutex_unlock(&d->mu);
     if (jr != JOIN_OK) {
-        *wrong_password = jr == JOIN_PASSWORD;
+        *wrong_password = jr == JOIN_PASSWORD && had_cred;   // not when we simply lacked the password for WPA3
         conn_leave(&a->c);
         secure_zero(&a->ws, sizeof a->ws);
         d_set_state(d, a->c.usb_error ? DS_ERROR : DS_IDLE);
@@ -670,20 +682,28 @@ static void d_handle(Daemon *d, Adapter *a, int *manual_off, double *next_autojo
             if (!a->up) { d_finish(d, 0, d->power ? "the adapter isn't ready" : "Wi-Fi is off"); break; }
             uint8_t pmk[32];
             int have_pmk = 0;
+            size_t pass_len = 0;
             if (has_pass) {
                 have_pmk = wpa_pmk_from_passphrase(pass, ssid, ssid_len, pmk) == 0;
+                pass_len = strlen(pass);
             } else {
                 pthread_mutex_lock(&d->mu);
                 KnownNet *k = kn_find(&d->known, ssid, ssid_len);
                 if (k && k->has_pmk) { memcpy(pmk, k->pmk, 32); have_pmk = 1; }
+                if (k && k->pass_len) { memcpy(pass, k->pass, k->pass_len); pass[k->pass_len] = 0; pass_len = k->pass_len; }
                 pthread_mutex_unlock(&d->mu);
             }
-            secure_zero(pass, sizeof pass);
             int wrong = 0;
-            int r = d_join(d, a, ssid, ssid_len, have_pmk ? pmk : NULL, err, sizeof err, &wrong);
+            JoinCred cred = {pass_len ? pass : NULL, pass_len, have_pmk ? pmk : NULL};
+            int r = d_join(d, a, ssid, ssid_len, &cred, err, sizeof err, &wrong);
             if (r == 0) {
                 pthread_mutex_lock(&d->mu);
-                if (has_pass || !kn_find(&d->known, ssid, ssid_len)) kn_put(&d->known, ssid, ssid_len, have_pmk ? pmk : NULL);
+                if (has_pass || !kn_find(&d->known, ssid, ssid_len)) {
+                    kn_put(&d->known, ssid, ssid_len, have_pmk ? pmk : NULL);
+                    // WPA3 needs the password itself at every sign-in, so for networks that offer WPA3 it is kept
+                    // (root-only file) next to the WPA2 key; for WPA2-only networks the key alone is enough
+                    if (has_pass && a->sae_capable) kn_set_pass(kn_find(&d->known, ssid, ssid_len), pass, pass_len);
+                }
                 pthread_mutex_unlock(&d->mu);
                 d_save_known(d);
                 *manual_off = 0;
@@ -698,6 +718,7 @@ static void d_handle(Daemon *d, Adapter *a, int *manual_off, double *next_autojo
                 }
             }
             secure_zero(pmk, sizeof pmk);
+            secure_zero(pass, sizeof pass);
             *next_autojoin = now_s() + 30;
             d_finish(d, r == 0, err);
             break;
@@ -891,11 +912,13 @@ static int daemon_main(const DaemonHooks *hooks) {
                     seen[ns].rssi = d->nets[i].rssi;
                     seen[ns].usable = d->nets[i].usable;
                     seen[ns].secured = d->nets[i].secured;
+                    seen[ns].sae_only = d->nets[i].sae_only;
                     ns++;
                 }
                 int pick = kn_choose(&d->known, seen, ns);
                 uint8_t ssid[32], pmk[32];
-                size_t sl = 0;
+                char kpass[64] = "";
+                size_t sl = 0, kpl = 0;
                 int has_pmk = 0;
                 if (pick >= 0) {
                     KnownNet *k = kn_find(&d->known, seen[pick].ssid, seen[pick].ssid_len);
@@ -903,13 +926,16 @@ static int daemon_main(const DaemonHooks *hooks) {
                     memcpy(ssid, seen[pick].ssid, sl);
                     has_pmk = k->has_pmk;
                     if (has_pmk) memcpy(pmk, k->pmk, 32);
+                    kpl = k->pass_len;
+                    memcpy(kpass, k->pass, sizeof kpass);
                 }
                 pthread_mutex_unlock(&d->mu);
                 if (pick >= 0) {
                     char err[200] = "";
                     int wrong = 0;
                     printf("[macwifid] auto-joining a remembered network\n");
-                    ok = d_join(d, a, ssid, sl, has_pmk ? pmk : NULL, err, sizeof err, &wrong) == 0;
+                    JoinCred cred = {kpl ? kpass : NULL, kpl, has_pmk ? pmk : NULL};
+                    ok = d_join(d, a, ssid, sl, &cred, err, sizeof err, &wrong) == 0;
                     if (!ok) d_set_error(d, err);
                     if (wrong) {
                         pthread_mutex_lock(&d->mu);
@@ -920,6 +946,7 @@ static int daemon_main(const DaemonHooks *hooks) {
                     }
                 }
                 secure_zero(pmk, sizeof pmk);
+                secure_zero(kpass, sizeof kpass);
             }
             autojoin_backoff = ok ? 5 : (autojoin_backoff < 60 ? autojoin_backoff * 2 : 60);
             next_autojoin = now_s() + (ok ? 5 : autojoin_backoff);

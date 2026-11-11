@@ -25,6 +25,11 @@ int mw_aes128_block(int encrypt, const uint8_t key[16], const uint8_t in[16], ui
     return (s == kCCSuccess && moved == 16) ? 0 : -1;
 }
 
+int mw_hmac_sha256(const uint8_t *key, size_t klen, const uint8_t *msg, size_t mlen, uint8_t out[32]) {
+    CCHmac(kCCHmacAlgSHA256, key, klen, msg, mlen, out);
+    return 0;
+}
+
 #else  // OpenSSL (Linux CI and local tests)
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
@@ -52,5 +57,10 @@ int mw_aes128_block(int encrypt, const uint8_t key[16], const uint8_t in[16], ui
     if (!ok || l1 + l2 != 16) return -1;
     for (int i = 0; i < 16; i++) out[i] = tmp[i];
     return 0;
+}
+
+int mw_hmac_sha256(const uint8_t *key, size_t klen, const uint8_t *msg, size_t mlen, uint8_t out[32]) {
+    unsigned int olen = 0;
+    return HMAC(EVP_sha256(), key, (int)klen, msg, mlen, out, &olen) && olen == 32 ? 0 : -1;
 }
 #endif

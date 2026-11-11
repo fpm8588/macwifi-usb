@@ -19,7 +19,7 @@ Try it: `macwifictl ctl '{"cmd":"status"}'`.
 ```
 ```json
 {"ok":true,"state":"connected","adapter":true,"power":true,"ssid":"Home","rssi":-44,"freq":5745,
- "ip":"192.168.1.20","captive":"no","error":"","version":"0.6.0"}
+ "ip":"192.168.1.20","security":"wpa3","captive":"no","error":"","version":"0.6.0"}
 ```
 
 `state` is one of `off`, `no_adapter`, `starting`, `idle`, `scanning`, `connecting`, `connected`, `asleep`,
@@ -36,7 +36,7 @@ address, then every 15 s while a portal is in the way and every 5 minutes otherw
 ```
 ```json
 {"ok":true,"age":0,"networks":[
-  {"ssid":"Home","rssi":-44,"freq":5745,"secured":true,"usable":true,"known":true},
+  {"ssid":"Home","rssi":-44,"freq":5745,"secured":true,"security":"wpa2/wpa3","usable":true,"known":true},
   {"ssid":"Office","rssi":-71,"freq":5180,"secured":true,"usable":false,"known":false,"why":"needs WPA3, enterprise or WEP (not supported yet)"}]}
 ```
 
@@ -52,7 +52,9 @@ scan last saw them. `age` is seconds since the last scan (-1: none yet).
 ```
 
 Without `password`: an open network, or a remembered one. The reply comes when the connection is up (or failed),
-up to about a minute. On success the network is remembered (as its PMK, never the password).
+up to about a minute. On success the network is remembered: as its WPA2 key (PMK), plus the password itself when
+the network offers WPA3 (which needs it at every sign-in). `security` in `status` says what the connection uses
+(`wpa3`, `wpa2`, `open`); in `networks` what the network offers (`wpa3`, `wpa2/wpa3`, `wpa2`, `open`).
 
 ### disconnect
 

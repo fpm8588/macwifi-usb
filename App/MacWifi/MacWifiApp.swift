@@ -2,7 +2,8 @@
 //
 // Talks to the background service over /var/run/macwifid.sock (one JSON request per connection; see
 // Sources/macwifictl/daemon.c). The socket is root:admin 0660, so this works for admin users. Passwords go
-// only to the service, which keeps a derived key (PMK), never the password.
+// only to the service, which keeps a derived key (PMK) for WPA2 networks and the password itself only for networks
+// that offer WPA3 (in a root-only file).
 
 import AppKit
 import SwiftUI
@@ -32,6 +33,7 @@ struct StatusReply: Decodable {
     let ip: String?
     let error: String?
     let version: String?
+    let security: String?  // "wpa3", "wpa2" or "open" while connected
     let captive: String?   // "yes" (sign-in page in the way), "no", "unknown"
     let portal: String?
 }
@@ -155,7 +157,8 @@ final class Model: ObservableObject {
         case "connected":
             let ip = status?.ip ?? ""
             if status?.captive == "yes" { return "Connected · sign-in needed" }
-            return ip.isEmpty ? "Connected, getting an address…" : "Connected · \(ip)"
+            let sec = ["wpa3": "WPA3 · ", "wpa2": "WPA2 · ", "open": "not encrypted · "][status?.security ?? ""] ?? ""
+            return ip.isEmpty ? "Connected, getting an address…" : "Connected · \(sec)\(ip)"
         case "asleep": return "Paused while the Mac sleeps."
         case "error": return status?.error?.isEmpty == false ? status!.error! : "The adapter needs attention."
         default: return ""
@@ -257,7 +260,7 @@ final class Model: ObservableObject {
     static func askPassword(for ssid: String) -> String? {
         let alert = NSAlert()
         alert.messageText = "Join “\(ssid)”"
-        alert.informativeText = "Enter the Wi-Fi password. macwifid keeps a key derived from it, not the password itself."
+        alert.informativeText = "Enter the Wi-Fi password. It's kept in a file only the system can read: as a derived key for WPA2 networks, and as the password itself for networks that offer WPA3 (WPA3 needs it at every sign-in)."
         alert.addButton(withTitle: "Join")
         alert.addButton(withTitle: "Cancel")
         let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 260, height: 24))

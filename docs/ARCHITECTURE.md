@@ -34,7 +34,12 @@ This is the map for anyone reading or changing the code. The research behind the
    and a station interface.
 4. **Scan / connect.** `SCANU_START` with results as messages; `SM_CONNECT_REQ` with our RSN element; the firmware
    authenticates and associates and reports `SM_CONNECT_IND` (station index of the AP).
-5. **WPA2-PSK** (`eapol.c`, our own supplicant): EAPOL frames arrive on the data path; messages 1→2, 3→4 (MIC,
+5. **WPA3 (SAE)**, when the access point offers it: the connect request says `auth_type` SAE, the firmware answers
+   `SM_EXTERNAL_AUTH_REQUIRED_IND`, and MacWifi runs the SAE exchange itself (`sae.c`): Authentication frames go
+   out through the management TX path (`TXU_CNTRL_MGMT`) and come back on the data path flagged as 802.11 MPDUs.
+   `SM_EXTERNAL_AUTH_REQUIRED_RSP` then lets the firmware associate; the PMK SAE produced feeds the 4-way
+   handshake (SHA-256 key derivation, AES-CMAC MICs), and the IGTK is installed for management frame protection.
+   **WPA2-PSK** (`eapol.c`, our own supplicant): EAPOL frames arrive on the data path; messages 1→2, 3→4 (MIC,
    replay counter, ANonce, RSN element checked against the beacon's, GTK unwrapped); after message 4's TX
    confirmation the pairwise and group keys go to the chip (`MM_KEY_ADD_REQ`) and the control port opens.
 6. **Bridge.** Frames from the chip (802.11, already decrypted) become Ethernet (`aic_data.c`), are put back in
@@ -56,7 +61,8 @@ This is the map for anyone reading or changing the code. The research behind the
 | `Sources/Shared/aic_fwload.[ch]` | Firmware loader: patch tables, profiles | GPL-2.0 (port) |
 | `Sources/Shared/aic_fmac.[ch]` | FullMAC messages: bring-up, scan, connect, keys | GPL-2.0 (port) |
 | `Sources/Shared/aic_data.[ch]` | TX descriptor, RX header, 802.11 → Ethernet, TX confirmations | GPL-2.0 (port) |
-| `Sources/Shared/eapol.[ch]`, `wpa.[ch]`, `crypto_backend.c` | WPA2-PSK supplicant and its crypto | MIT |
+| `Sources/Shared/eapol.[ch]`, `wpa.[ch]`, `crypto_backend.c` | 4-way handshake supplicant (WPA2 and WPA3 key hierarchies) and its crypto | MIT |
+| `Sources/Shared/sae.[ch]`, `p256.[ch]` | WPA3 sign-in (SAE, group 19) and the P-256 arithmetic under it | MIT |
 | `Sources/Shared/ieee80211.[ch]` | Beacon/probe-response parsing | MIT |
 | `Sources/Shared/reorder.[ch]` | A-MPDU receive reordering (64-frame window, 50 ms) | MIT |
 | `Sources/Shared/rxq.[ch]` | Thread-safe queue of USB IN transfers | MIT |

@@ -249,6 +249,23 @@ static void test_phase3b(void) {
     CHECK(aic_fmac_parse_connect_ind(ind, 826, &c) == -1);
     ind[14] = 0xff; ind[15] = 0x03;
     CHECK(aic_fmac_parse_connect_ind(ind, sizeof ind, &c) == -1);   // IE lengths beyond the 800-byte buffer
+    // WPA3: SAE connect request and the external-authentication messages (layouts checked against lmac_msg.h)
+    static const uint8_t rsn3[28] = {0x30,26,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,8,0xc0,0,0,0,0,0x0f,0xac,6};
+    CHECK(AIC_SM_EXTERNAL_AUTH_REQUIRED_IND == ((6 << 10) | 6) && AIC_SM_EXTERNAL_AUTH_REQUIRED_RSP == 0x1807 &&
+          AIC_SM_EXTERNAL_AUTH_REQUIRED_RSP_CFM == 0x180C);
+    CHECK(aic_fmac_connect_params_sae(p, (const uint8_t *)"ExampleNet", 10, bssid, 5180, 1, 0, rsn3, 28) == 320);
+    CHECK(p[48] == 0x19 && p[49] == 0 && p[54] == 28 && p[59] == 3 && p[60] == 1 && !memcmp(p + 64, rsn3, 28) && p[0] == 10);
+    CHECK(aic_fmac_connect_params_sae(p, (const uint8_t *)"x", 1, bssid, 2412, 0, 0, NULL, 0) == 0);
+    uint8_t er[AIC_SZ_EXT_AUTH_RSP];
+    CHECK(aic_fmac_ext_auth_rsp_params(er, 1, 0x0102) == 4 && er[0] == 1 && er[1] == 0 && er[2] == 2 && er[3] == 1);
+    uint8_t ei[AIC_SZ_EXT_AUTH_IND] = {0}, eb[6], ev = 9;
+    uint32_t akm = 0;
+    ei[0] = 2; memcpy(ei + 34, bssid, 6); ei[40] = 0x08; ei[41] = 0xAC; ei[42] = 0x0F;
+    CHECK(aic_fmac_parse_ext_auth_ind(ei, sizeof ei, &ev, eb, &akm) == 0 && ev == 2 && !memcmp(eb, bssid, 6) && akm == 0x000FAC08);
+    CHECK(aic_fmac_parse_ext_auth_ind(ei, 43, &ev, eb, &akm) == -1);
+    CHECK(aic_fmac_key_add_params(k, 0, 0xFF, 0, key, 16, 4, AIC_MAC_CIPHER_BIP_CMAC_128) == 44 && k[0] == 4 && k[1] == 0xFF &&
+          k[40] == 5 && k[43] == 0);
+
     uint16_t reason; uint8_t vif;
     uint8_t di[6] = {15, 0, 0, 0, 0, 0};
     CHECK(aic_fmac_parse_disconnect_ind(di, 6, &reason, &vif) == 0 && reason == 15 && vif == 0);

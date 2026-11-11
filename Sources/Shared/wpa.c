@@ -51,8 +51,73 @@ int wpa_derive_ptk(const uint8_t pmk[WPA_PMK_LEN], const uint8_t aa[6], const ui
     return r;
 }
 
+int wpa_kdf_sha256(const uint8_t *key, size_t klen, const char *label, const uint8_t *ctx, size_t clen,
+                   uint8_t *out, size_t bits) {
+    uint8_t msg[2 + 64 + 256 + 2], d[32];
+    size_t ll = strlen(label), bytes = (bits + 7) / 8;
+    if (ll > 64 || clen > 256 || bits > 0xffff) return -1;
+    for (size_t i = 1, done = 0; done < bytes; i++) {
+        size_t n = 0;
+        msg[n++] = (uint8_t)i;
+        msg[n++] = (uint8_t)(i >> 8);
+        memcpy(msg + n, label, ll); n += ll;
+        if (clen) memcpy(msg + n, ctx, clen);
+        n += clen;
+        msg[n++] = (uint8_t)bits;
+        msg[n++] = (uint8_t)(bits >> 8);
+        if (mw_hmac_sha256(key, klen, msg, n, d)) return -1;
+        size_t take = bytes - done < 32 ? bytes - done : 32;
+        memcpy(out + done, d, take);
+        done += take;
+    }
+    memset(msg, 0, sizeof msg);
+    memset(d, 0, sizeof d);
+    return 0;
+}
+
+int wpa_derive_ptk_sha256(const uint8_t pmk[WPA_PMK_LEN], const uint8_t aa[6], const uint8_t spa[6],
+                          const uint8_t anonce[32], const uint8_t snonce[32], uint8_t ptk[WPA_PTK_LEN]) {
+    uint8_t data[6 + 6 + 32 + 32];
+    memcpy(data, min_ptr(aa, spa, 6), 6);
+    memcpy(data + 6, max_ptr(aa, spa, 6), 6);
+    memcpy(data + 12, min_ptr(anonce, snonce, 32), 32);
+    memcpy(data + 44, max_ptr(anonce, snonce, 32), 32);
+    int r = wpa_kdf_sha256(pmk, WPA_PMK_LEN, "Pairwise key expansion", data, sizeof data, ptk, WPA_PTK_LEN * 8);
+    memset(data, 0, sizeof data);
+    return r;
+}
+
+// RFC 4493. Subkeys: K1 = L << 1 (xor 0x87 if the top bit of L was set), K2 = K1 << 1 likewise.
+static void cmac_dbl(uint8_t b[16]) {
+    uint8_t carry = b[0] >> 7;
+    for (int i = 0; i < 15; i++) b[i] = (uint8_t)((b[i] << 1) | (b[i + 1] >> 7));
+    b[15] = (uint8_t)(b[15] << 1);
+    b[15] ^= (uint8_t)(0x87 & (uint8_t)(0 - carry));
+}
+
+int wpa_aes_cmac(const uint8_t key[16], const uint8_t *msg, size_t len, uint8_t mac[16]) {
+    uint8_t k[16] = {0}, x[16] = {0}, y[16];
+    if (mw_aes128_block(1, key, k, k)) return -1;
+    cmac_dbl(k);                                           // K1
+    size_t blocks = len ? (len + 15) / 16 : 1;
+    int complete = len && len % 16 == 0;
+    for (size_t b = 0; b + 1 < blocks; b++) {
+        for (int i = 0; i < 16; i++) y[i] = x[i] ^ msg[b * 16 + i];
+        if (mw_aes128_block(1, key, y, x)) return -1;
+    }
+    uint8_t last[16] = {0};
+    size_t rem = len - (blocks - 1) * 16;
+    if (rem) memcpy(last, msg + (blocks - 1) * 16, rem);
+    if (!complete) { last[rem] = 0x80; cmac_dbl(k); }      // K2 for a padded last block
+    for (int i = 0; i < 16; i++) y[i] = x[i] ^ last[i] ^ k[i];
+    int r = mw_aes128_block(1, key, y, mac);
+    memset(k, 0, sizeof k);
+    return r;
+}
+
 int wpa_eapol_mic(const uint8_t kck[16], int key_desc_version, const uint8_t *eapol, size_t len,
                   uint8_t mic[WPA_MIC_LEN]) {
+    if (key_desc_version == 0) return wpa_aes_cmac(kck, eapol, len, mic);
     if (key_desc_version != 2) return -1;
     uint8_t d[20];
     if (mw_hmac_sha1(kck, 16, eapol, len, d)) return -1;

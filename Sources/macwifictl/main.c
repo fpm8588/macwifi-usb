@@ -48,6 +48,7 @@
 #include "reorder.h"
 #include "rx_async.h"
 #include "rxq.h"
+#include "sae.h"
 #include "knownnet.h"
 
 extern char **environ;
@@ -1173,6 +1174,14 @@ typedef struct {
     uint8_t mac[6], bssid[6], vif;
     int open_net;                     // no RSN: no handshake, the port opens at association
     uint8_t ap_rsn[2 + 255];          // the AP's RSN element, owned here (scans reuse their lists)
+    // WPA3 (SAE): the firmware hands authentication to us (SM_EXTERNAL_AUTH_REQUIRED_IND); Authentication frames
+    // go out through the management TX path and come back on the data path flagged as 802.11 MPDUs
+    Sae sae;
+    int sae_active, ext_auth, sae_done, sae_failed, sae_wrong, used_sae;
+    char sae_err[120];
+    uint8_t sae_tx[SAE_MAX_FRAME];
+    size_t sae_tx_len;
+    unsigned rx_mgmt;
     ScanList *scan;                   // set while a scan runs through pump()
     int usb_error;                    // the IN pipe failed (adapter unplugged or reset)
     int last_rssi;                    // from the RX header of the latest data frame
@@ -1287,6 +1296,53 @@ static void on_eth(void *ctx, const uint8_t *eth, size_t len) {
     else c->rx_other++;
 }
 
+// Sends an Authentication frame (body from sae.c) to the AP through the management TX path.
+static void conn_send_auth(Conn *c, const uint8_t *body, size_t n) {
+    uint8_t frame[24 + SAE_MAX_FRAME], out[64 + 24 + SAE_MAX_FRAME];
+    if (n > SAE_MAX_FRAME) return;
+    memset(frame, 0, 24);
+    frame[0] = 0xB0;                              // management, subtype authentication
+    memcpy(frame + 4, c->bssid, 6);
+    memcpy(frame + 10, c->mac, 6);
+    memcpy(frame + 16, c->bssid, 6);
+    memcpy(frame + 24, body, n);
+    size_t len = aic_data_build_mgmt_tx(out, sizeof out, frame, 24 + n, c->vif);
+    if (!len) return;
+    pthread_mutex_lock(&c->tx_lock);
+    if (link_send_data(c->l, out, len) == 0) c->tx++;
+    pthread_mutex_unlock(&c->tx_lock);
+}
+
+// A management frame from the air. Only SAE Authentication frames from our AP matter here.
+static void on_mgmt(Conn *c, const uint8_t *f, size_t len) {
+    c->rx_mgmt++;
+    if (len < 30 || f[0] != 0xB0 || !c->sae_active || c->sae_done || c->sae_failed) return;
+    if (memcmp(f + 10, c->bssid, 6) != 0 || memcmp(f + 4, c->mac, 6) != 0) return;
+    uint8_t reply[SAE_MAX_FRAME];
+    size_t rl = 0;
+    const char *err = NULL;
+    int wrong = 0;
+    SaeState before = c->sae.state;
+    int ev = sae_rx(&c->sae, f + 24, len - 24, reply, sizeof reply, &rl, &err, &wrong);
+    if (ev < 0) {
+        c->sae_failed = 1;
+        c->sae_wrong = wrong;
+        snprintf(c->sae_err, sizeof c->sae_err, "%s", err ? err : "SAE failed");
+        return;
+    }
+    if (ev & SAE_EV_SEND) {
+        memcpy(c->sae_tx, reply, rl);
+        c->sae_tx_len = rl;
+        conn_send_auth(c, reply, rl);
+        printf("  SAE: %s\n", c->sae.state == SAE_CONFIRMED && before == SAE_COMMITTED ? "commits exchanged, confirm sent"
+                                                                                   : "anti-clogging token requested, commit sent again");
+    }
+    if (ev & SAE_EV_DONE) {
+        c->sae_done = 1;
+        printf("  SAE: the access point's confirm verifies\n");
+    }
+}
+
 static void collect_unit(void *ctx, const uint8_t *eth, size_t len) {
     Conn *c = (Conn *)ctx;
     if (c->unit_len + 2 + len > sizeof c->unit) { c->unit_over = 1; return; }
@@ -1387,6 +1443,8 @@ static int pump(Conn *c, int timeout_ms, int (*done)(const Conn *)) {
                     } else {
                         c->associated = 1;
                     }
+                } else if (pk.id == AIC_SM_EXTERNAL_AUTH_REQUIRED_IND) {
+                    c->ext_auth = 1;
                 } else if (pk.id == AIC_SM_DISCONNECT_IND) {
                     uint8_t v = 0;
                     aic_fmac_parse_disconnect_ind(pk.params, pk.param_len, &c->disc_reason, &v);
@@ -1405,9 +1463,13 @@ static int pump(Conn *c, int timeout_ms, int (*done)(const Conn *)) {
             c->cur_decr = ri.decr_status;
             if (ri.need_reord) c->reord++;
             if (ri.rssi) c->last_rssi = ri.rssi;
+            const uint8_t *f = ri.frame;
+            if (ri.frame_len >= 24 && ((f[0] >> 2) & 3) == 0) {   // management frame (rwnx_rx_mgmt_any)
+                on_mgmt(c, f, ri.frame_len);
+                continue;
+            }
             // Block-ack session frames: QoS data, TID from the QoS control field, sequence number from the
             // sequence control field; put back in order before they go anywhere (as CONFIG_RX_REORDER does).
-            const uint8_t *f = ri.frame;
             if (ri.need_reord && ri.frame_len >= 26 && ((f[0] >> 2) & 3) == 2 && (f[0] & 0x80) && !(f[0] & 0x40)) {
                 uint16_t sn = (uint16_t)((f[22] | (f[23] << 8)) >> 4);
                 uint8_t tid = f[24] & 0x0f;
@@ -1435,6 +1497,8 @@ static int pump(Conn *c, int timeout_ms, int (*done)(const Conn *)) {
 static int w_got(const Conn *c) { return c->got || c->disconnected; }
 static int w_connect_cfm(const Conn *c) { return c->connect_cfm; }
 static int w_assoc(const Conn *c) { return c->associated || c->disconnected; }
+static int w_ext_auth(const Conn *c) { return c->ext_auth || c->associated || c->disconnected; }
+static int w_sae(const Conn *c) { return c->sae_done || c->sae_failed || c->disconnected; }
 static int w_pending(const Conn *c) { return c->pending || c->disconnected; }
 static int w_eapol_cfm(const Conn *c) { return c->last_eapol_cfm; }
 
@@ -1465,6 +1529,25 @@ static int install_key(Conn *c, int pairwise, const uint8_t *key, uint8_t len, u
     return 0;
 }
 
+// The integrity group key (IGTK, key index 4 or 5): the chip checks broadcast management frames (deauthentication,
+// disassociation) with it (BIP-CMAC-128), so they can't be forged. As rwnx_cfg80211_add_key with
+// WLAN_CIPHER_SUITE_AES_CMAC: a default key (sta 0xFF) with cipher MAC_CIPHER_BIP_CMAC_128.
+static int install_igtk(Conn *c, const uint8_t key[16], uint8_t idx) {
+    uint8_t p[AIC_SZ_KEY_ADD_REQ];
+    aic_fmac_key_add_params(p, c->vif, 0xFF, 0, key, 16, idx, AIC_MAC_CIPHER_BIP_CMAC_128);
+    gNoDump = 1;
+    int r = conn_call(c, AIC_MM_KEY_ADD_REQ, p, sizeof p, AIC_MM_KEY_ADD_CFM, 2000);
+    gNoDump = 0;
+    secure_zero(p, sizeof p);
+    if (r || c->plen < 1 || c->params[0] != 0) {
+        fprintf(stderr, "  (the firmware didn't take the management-frame integrity key, status %u; continuing without "
+                        "broadcast management frame checks)\n", r ? 0xffu : c->params[0]);
+        return -1;
+    }
+    printf("  Management integrity key installed (index %u, hardware slot %u)\n", idx, c->plen > 1 ? c->params[1] : 0);
+    return 0;
+}
+
 // Acts on what the supplicant reported (keys to install, control port to open). Returns 0, or -1 if the firmware
 // refused a step.
 static int handle_wpa_events(Conn *c, WpaSupplicant *ws) {
@@ -1482,6 +1565,7 @@ static int handle_wpa_events(Conn *c, WpaSupplicant *ws) {
     if ((ev & WPA_EV_INSTALL_GTK) && ws->gtk_len) {
         if (install_key(c, 0, ws->gtk, (uint8_t)ws->gtk_len, (uint8_t)ws->gtk_idx)) return -1;
     }
+    if ((ev & WPA_EV_INSTALL_IGTK) && ws->have_igtk) install_igtk(c, ws->igtk, (uint8_t)ws->igtk_idx);
     if ((ev & WPA_EV_DONE) && !c->port_open) {
         uint8_t cp[AIC_SZ_CTRL_PORT_REQ];
         aic_fmac_ctrl_port_params(cp, c->ind.ap_idx, 1);
@@ -1532,9 +1616,12 @@ static int hexval(char ch) {
 }
 
 // Asks for the passphrase on the terminal (never echoed, logged or stored) and derives the PMK.
-static int ask_pmk(const uint8_t *ssid, size_t ssid_len, uint8_t pmk[32]) {
+// `pass_out` (128 bytes) gets the passphrase for WPA3, or "" when a raw 64-digit key was typed (WPA2 only);
+// the caller wipes it.
+static int ask_pmk(const uint8_t *ssid, size_t ssid_len, uint8_t pmk[32], char *pass_out) {
     char pass[128];
     char prompt[96];
+    pass_out[0] = 0;
     snprintf(prompt, sizeof prompt, "Wi-Fi password for \"%.*s\" (not shown, not saved): ", (int)ssid_len,
              (const char *)ssid);
     if (!readpassphrase(prompt, pass, sizeof pass, RPP_REQUIRE_TTY)) {
@@ -1556,6 +1643,8 @@ static int ask_pmk(const uint8_t *ssid, size_t ssid_len, uint8_t pmk[32]) {
     } else if (wpa_pmk_from_passphrase(pass, ssid, ssid_len, pmk) != 0) {
         fprintf(stderr, "Key derivation failed.\n");
         rc = -1;
+    } else {
+        memcpy(pass_out, pass, n + 1);
     }
     secure_zero(pass, sizeof pass);
     return rc;
@@ -1567,16 +1656,28 @@ static void print_ip(const char *label, const uint8_t a[4]) {
 
 // ---------------------------------------------------------------- reusable steps (CLI connect/join and macwifid)
 
-// Can we join this BSS? WPA2-PSK with CCMP for both keys and no required PMF, or open (no privacy at all).
+// What we can join: open networks; WPA2-PSK with CCMP for both keys (and no required PMF); WPA3-Personal (SAE,
+// group 19, hunting-and-pecking) with CCMP and management frame protection (BIP-CMAC-128).
+static int bss_can_psk(const WifiBss *b) {
+    return b->security != WIFI_SEC_OPEN && b->rsn_akm_psk && !b->rsn_pmf_required && b->rsn_ccmp && b->rsn_group_ccmp &&
+           b->rsn_ie_len >= 2;
+}
+static int bss_can_sae(const WifiBss *b) {
+    return b->security != WIFI_SEC_OPEN && b->rsn_akm_sae && b->rsn_pmf_capable && b->rsn_mgmt_bip_cmac && b->rsn_ccmp &&
+           b->rsn_group_ccmp && b->rsn_ie_len >= 2 && !b->sae_h2e_only;
+}
 // `why` gets a short reason when not.
 static int bss_usable(const WifiBss *b, int *secured, const char **why) {
     *secured = b->security != WIFI_SEC_OPEN;
     if (b->security == WIFI_SEC_OPEN) { *why = "open"; return 1; }
-    if (!b->rsn_akm_psk) { *why = "needs WPA3, enterprise or WEP (not supported yet)"; return 0; }
-    if (b->rsn_pmf_required) { *why = "requires PMF (not supported yet)"; return 0; }
-    if (!b->rsn_ccmp || !b->rsn_group_ccmp || b->rsn_ie_len < 2) { *why = "needs CCMP for both keys"; return 0; }
-    *why = "usable";
-    return 1;
+    if (bss_can_sae(b)) { *why = bss_can_psk(b) ? "usable (WPA3, or WPA2)" : "usable (WPA3)"; return 1; }
+    if (bss_can_psk(b)) { *why = "usable"; return 1; }
+    if (b->rsn_akm_sae && b->sae_h2e_only) { *why = "WPA3 with hash-to-element only (not supported yet)"; return 0; }
+    if (b->rsn_akm_sae && !b->rsn_akm_psk) { *why = "WPA3 with settings that aren't supported yet"; return 0; }
+    if (!b->rsn_akm_psk) { *why = "needs enterprise sign-in or WEP (not supported)"; return 0; }
+    if (b->rsn_pmf_required) { *why = "WPA2 with required PMF (not supported yet)"; return 0; }
+    *why = "needs CCMP for both keys";
+    return 0;
 }
 
 static int ssid_is(const WifiBss *b, const uint8_t *ssid, size_t len) {
@@ -1636,24 +1737,100 @@ static void conn_reset_assoc(Conn *c) {
     c->port_open = 0;
     c->last_eapol_cfm = 0;
     c->open_net = 0;
+    c->sae_active = c->ext_auth = c->sae_done = c->sae_failed = c->sae_wrong = c->used_sae = 0;
+    c->sae_err[0] = 0;
+    sae_wipe(&c->sae);
     ro_reset(&c->ro);
     c->ro.timeout_s = 0.05;                 // REORDER_UPDATE_TIME: 50 ms
 }
 
 typedef enum { JOIN_OK = 0, JOIN_FW, JOIN_ASSOC, JOIN_PASSWORD, JOIN_TIMEOUT, JOIN_STOPPED } JoinResult;
 
-// Associates with `best` and (for WPA2) runs the 4-way handshake until the port is open. `ws` is NULL for an
-// open network, else set up with the PMK. Writes a one-line reason into `err` on failure.
+static void sae_rng(uint8_t *out, size_t n) { arc4random_buf(out, n); }
+
+// The SAE exchange, once the firmware has asked for it. On success the PMK is in ws->pmk and the firmware has been
+// told to go on (it associates next).
+static JoinResult run_sae(Conn *c, WpaSupplicant *ws, const char *pass, size_t pass_len, char *err, size_t errcap) {
+    double t0 = now_s();
+    pump(c, 8000, w_ext_auth);
+    if (!c->ext_auth) {
+        if (c->disconnected || (c->ind_buf[0] | c->ind_buf[1]))
+            snprintf(err, errcap, "the connection ended before WPA3 sign-in started (status %u, reason %u)",
+                     c->ind.status_code, c->disc_reason);
+        else
+            snprintf(err, errcap, "the firmware didn't ask for WPA3 (SAE) sign-in");
+        return gStop ? JOIN_STOPPED : JOIN_FW;
+    }
+    if (sae_start(&c->sae, c->mac, c->bssid, (const uint8_t *)pass, pass_len, sae_rng) != 0) {
+        snprintf(err, errcap, "couldn't prepare the WPA3 (SAE) exchange");
+        return JOIN_FW;
+    }
+    c->sae_active = 1;
+    c->sae_tx_len = sae_build_commit(&c->sae, c->sae_tx, sizeof c->sae_tx);
+    conn_send_auth(c, c->sae_tx, c->sae_tx_len);
+    printf("  SAE: commit sent\n");
+    fflush(stdout);
+    double last = now_s();
+    for (int tries = 1; !c->sae_done && !c->sae_failed && !c->disconnected && !gStop && now_s() - t0 < 12;) {
+        pump(c, 500, w_sae);
+        if (!c->sae_done && !c->sae_failed && now_s() - last >= 1.5 && tries < 4) {   // no answer: say it again
+            conn_send_auth(c, c->sae_tx, c->sae_tx_len);
+            last = now_s();
+            tries++;
+        }
+    }
+    int confirmed = c->sae.state == SAE_CONFIRMED;
+    uint8_t rsp[AIC_SZ_EXT_AUTH_RSP];
+    if (c->sae_done) {
+        memcpy(ws->pmk, c->sae.pmk, 32);
+        sae_wipe(&c->sae);
+        c->sae_active = 0;
+        aic_fmac_ext_auth_rsp_params(rsp, c->vif, 0);
+        if (send_msg(c->l, AIC_SM_EXTERNAL_AUTH_REQUIRED_RSP, rsp, sizeof rsp)) {
+            snprintf(err, errcap, "couldn't report the WPA3 sign-in to the firmware");
+            return JOIN_FW;
+        }
+        printf("  SAE finished in %.2f s\n", now_s() - t0);
+        return JOIN_OK;
+    }
+    sae_wipe(&c->sae);
+    c->sae_active = 0;
+    if (!c->disconnected && !c->usb_error) {       // tell the firmware it failed, and let it wind the attempt down
+        aic_fmac_ext_auth_rsp_params(rsp, c->vif, 1);   // WLAN_STATUS_UNSPECIFIED_FAILURE
+        send_msg(c->l, AIC_SM_EXTERNAL_AUTH_REQUIRED_RSP, rsp, sizeof rsp);
+        pump(c, 2000, w_assoc);
+    }
+    if (gStop) { snprintf(err, errcap, "stopped"); return JOIN_STOPPED; }
+    if (c->sae_failed) {
+        snprintf(err, errcap, "%s", c->sae_err);
+        return c->sae_wrong ? JOIN_PASSWORD : JOIN_ASSOC;
+    }
+    if (confirmed) {    // the AP took our commit but never confirmed: what a wrong password looks like from here
+        snprintf(err, errcap, "the password seems wrong: the access point didn't confirm the WPA3 sign-in "
+                              "(%u management frames received)", c->rx_mgmt);
+        return JOIN_PASSWORD;
+    }
+    snprintf(err, errcap, "the access point didn't answer the WPA3 (SAE) sign-in (%u management frames received)",
+             c->rx_mgmt);
+    return JOIN_TIMEOUT;
+}
+
+// Associates with `best` and runs the sign-in until the port is open. `ws` is NULL for an open network; for WPA2
+// it holds the PMK; for WPA3 `sae_pass` is the password (the PMK then comes out of SAE). Writes a one-line reason
+// into `err` on failure.
 static JoinResult conn_associate(Conn *c, const ScanEntry *best, const uint8_t *ssid, size_t ssid_len,
-                                 WpaSupplicant *ws, char *err, size_t errcap) {
+                                 WpaSupplicant *ws, const char *sae_pass, size_t sae_pass_len, char *err, size_t errcap) {
     conn_reset_assoc(c);
     memcpy(c->bssid, best->bss.bssid, 6);
     c->ws = ws;
     c->open_net = ws == NULL;
+    int sae = ws && sae_pass;
+    c->used_sae = sae;
     if (ws) {
         memcpy(ws->aa, best->bss.bssid, 6);
         memcpy(ws->spa, c->mac, 6);
-        ws->rsn_ie_len = wpa_build_rsn_ie(ws->rsn_ie, sizeof ws->rsn_ie);
+        ws->akm_sae = sae;
+        ws->rsn_ie_len = sae ? wpa_build_rsn_ie_sae(ws->rsn_ie, sizeof ws->rsn_ie) : wpa_build_rsn_ie(ws->rsn_ie, sizeof ws->rsn_ie);
         // Keep our own copy: `best` lives in a scan list that the next scan (e.g. the menu's) overwrites, and a
         // later 4-way handshake (PTK rekey) checks message 3 against this element.
         memcpy(c->ap_rsn, best->bss.rsn_ie, best->bss.rsn_ie_len);
@@ -1666,12 +1843,15 @@ static JoinResult conn_associate(Conn *c, const ScanEntry *best, const uint8_t *
     if (!freq || (freq >= 5000) != (best->freq >= 5000)) freq = best->freq;   // trust the scan's band
     uint8_t band = freq >= 5000 ? 1 : 0;
 
-    printf("Connecting to %02x:%02x:%02x:%02x:%02x:%02x on %d MHz...\n", c->bssid[0], c->bssid[1], c->bssid[2],
-           c->bssid[3], c->bssid[4], c->bssid[5], freq);
+    printf("Connecting to %02x:%02x:%02x:%02x:%02x:%02x on %d MHz%s...\n", c->bssid[0], c->bssid[1], c->bssid[2],
+           c->bssid[3], c->bssid[4], c->bssid[5], freq, sae ? " with WPA3" : ws ? " with WPA2" : "");
     fflush(stdout);
     uint8_t p[AIC_SZ_SM_CONNECT_REQ];
-    aic_fmac_connect_params(p, ssid, ssid_len, c->bssid, (uint16_t)freq, band, c->vif, ws ? ws->rsn_ie : NULL,
-                            ws ? ws->rsn_ie_len : 0);
+    if (sae)
+        aic_fmac_connect_params_sae(p, ssid, ssid_len, c->bssid, (uint16_t)freq, band, c->vif, ws->rsn_ie, ws->rsn_ie_len);
+    else
+        aic_fmac_connect_params(p, ssid, ssid_len, c->bssid, (uint16_t)freq, band, c->vif, ws ? ws->rsn_ie : NULL,
+                                ws ? ws->rsn_ie_len : 0);
     double t0 = now_s();
     if (send_msg(c->l, AIC_SM_CONNECT_REQ, p, AIC_SZ_SM_CONNECT_REQ) || pump(c, 3000, w_connect_cfm) || !c->connect_cfm) {
         snprintf(err, errcap, "the firmware didn't answer the connect request");
@@ -1680,6 +1860,10 @@ static JoinResult conn_associate(Conn *c, const ScanEntry *best, const uint8_t *
     if (c->connect_status != 0) {
         snprintf(err, errcap, "the firmware refused the connect request (status %u)", c->connect_status);
         return JOIN_FW;
+    }
+    if (sae) {
+        JoinResult sr = run_sae(c, ws, sae_pass, sae_pass_len, err, errcap);
+        if (sr != JOIN_OK) return sr;
     }
     pump(c, 10000, w_assoc);
     if (!c->associated) {
@@ -1706,7 +1890,8 @@ static JoinResult conn_associate(Conn *c, const ScanEntry *best, const uint8_t *
         if (handle_wpa_events(c, ws)) break;
     }
     if (c->port_open) {
-        printf("Connected: WPA2-PSK handshake done in %.2f s, keys installed, port open.\n", now_s() - th);
+        printf("Connected: %s handshake done in %.2f s, keys installed, port open.\n", sae ? "WPA3 (SAE)" : "WPA2-PSK",
+               now_s() - th);
         return JOIN_OK;
     }
     if (gStop) { snprintf(err, errcap, "stopped"); return JOIN_STOPPED; }
@@ -1723,6 +1908,41 @@ static JoinResult conn_associate(Conn *c, const ScanEntry *best, const uint8_t *
     snprintf(err, errcap, "the password seems wrong: the 4-way handshake didn't finish (%u EAPOL frames, %d rejected)",
              c->rx_eapol, c->eapol_rejects);
     return JOIN_PASSWORD;
+}
+
+static void conn_leave(Conn *c);
+
+// What we know to sign in with: the password (needed for WPA3) and/or the WPA2 key derived from it.
+typedef struct {
+    const char *pass;
+    size_t pass_len;
+    const uint8_t *pmk;
+} JoinCred;
+
+// Joins a secured network: WPA3 when the access point offers it and we have the password, else WPA2. If WPA3
+// fails for a reason other than the password and the access point also offers WPA2 (a "transition" network),
+// WPA2 is tried: that's no weaker than what such a network accepts from any other client.
+static JoinResult conn_join_secured(Conn *c, const ScanEntry *best, const uint8_t *ssid, size_t ssid_len, WpaSupplicant *ws,
+                                    const JoinCred *cred, char *err, size_t errcap) {
+    int can_sae = bss_can_sae(&best->bss) && cred->pass && cred->pass_len && !getenv("MACWIFI_NO_WPA3");
+    int can_psk = bss_can_psk(&best->bss) && cred->pmk;
+    if (!can_sae && !can_psk) {
+        snprintf(err, errcap, "%s", bss_can_sae(&best->bss) && !bss_can_psk(&best->bss)
+                                        ? "this network uses WPA3: enter its password again"
+                                        : "a password is needed");
+        return JOIN_PASSWORD;
+    }
+    if (can_sae) {
+        memset(ws, 0, sizeof *ws);
+        JoinResult jr = conn_associate(c, best, ssid, ssid_len, ws, cred->pass, cred->pass_len, err, errcap);
+        if (jr == JOIN_OK || jr == JOIN_PASSWORD || jr == JOIN_STOPPED || !can_psk || c->usb_error) return jr;
+        printf("WPA3 sign-in didn't work (%s); trying WPA2.\n", err);
+        fflush(stdout);
+        conn_leave(c);
+    }
+    memset(ws, 0, sizeof *ws);
+    memcpy(ws->pmk, cred->pmk, 32);
+    return conn_associate(c, best, ssid, ssid_len, ws, NULL, 0, err, errcap);
 }
 
 // Sends SM_DISCONNECT if we're still associated.
@@ -1972,8 +2192,8 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
     int found = 0;
     const ScanEntry *best = scan_pick(&sl, (const uint8_t *)ssid, ssid_len, 1, &found);
     if (!best) {
-        printf("%s\n", found ? "No access point for this network uses WPA2-PSK with CCMP (or is open), which is what "
-                               "this version supports."
+        printf("%s\n", found ? "No access point for this network uses WPA2 or WPA3 Personal with CCMP (or is open), "
+                               "which is what this version supports."
                              : "Network not found. Check the name (it is case-sensitive) and that it is in range.");
         return 1;
     }
@@ -1984,7 +2204,9 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
     // 2. Password -> PMK. Nothing about it is printed or written anywhere.
     static WpaSupplicant ws;
     memset(&ws, 0, sizeof ws);
-    if (secured && ask_pmk((const uint8_t *)ssid, ssid_len, ws.pmk)) return 2;
+    uint8_t pmk[32];
+    char pass[128] = "";
+    if (secured && ask_pmk((const uint8_t *)ssid, ssid_len, pmk, pass)) return 2;
 
     link_rx_start(&l);                     // several bulk-IN reads in flight from here on
     static Conn c;
@@ -2001,7 +2223,11 @@ static int connect_run(Link *lp, const uint8_t mac[6], uint8_t vif, const char *
     // 3-4. Associate and (for WPA2) the 4-way handshake.
     char err[200] = "";
     int stage = 0;   // 2 connected, 3 traffic seen
-    JoinResult jr = conn_associate(&c, best, (const uint8_t *)ssid, ssid_len, secured ? &ws : NULL, err, sizeof err);
+    JoinCred cred = {pass[0] ? pass : NULL, strlen(pass), pmk};
+    JoinResult jr = secured ? conn_join_secured(&c, best, (const uint8_t *)ssid, ssid_len, &ws, &cred, err, sizeof err)
+                            : conn_associate(&c, best, (const uint8_t *)ssid, ssid_len, NULL, NULL, 0, err, sizeof err);
+    secure_zero(pass, sizeof pass);
+    secure_zero(pmk, sizeof pmk);
     if (jr != JOIN_OK) {
         printf("%c%s.\n", toupper((unsigned char)err[0]), err + 1);
     } else if (feth) {

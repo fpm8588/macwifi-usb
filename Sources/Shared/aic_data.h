@@ -47,6 +47,11 @@ size_t aic_data_build_tx(uint8_t *out, size_t cap, const uint8_t *eth, size_t et
                          uint8_t sta_idx, uint8_t tid, uint8_t cfm_idx);
 int aic_tid_to_ac(uint8_t tid);   // 0 BK, 1 BE, 2 VI, 3 VO
 
+// A management frame for the air (rwnx_start_mgmt_xmit): same 4-byte header and hostdesc, with packet_len = the
+// whole 802.11 frame, ethertype 0, hardware queue VO (3), tid 0xFF, staid 0xFF (not tied to a station) and
+// flags TXU_CNTRL_MGMT (bit 3); the frame follows unchanged. Authentication frames ask for no TX confirmation.
+size_t aic_data_build_mgmt_tx(uint8_t *out, size_t cap, const uint8_t *frame, size_t len, uint8_t vif_idx);
+
 // TX confirmation (bulk IN packet type 0x12, USB_TYPE_CFG_DATA_CFM; aicwf_usb_host_tx_cfm_handler): after the
 // 4-byte packet header, u32 status (union rwnx_hw_txstatus: bit0 tx_done, bit1 retry_required, bit2
 // sw_retry_required, bit3 acknowledged) and u32 the index we put in status_desc_addr. Returns 0 or -1.

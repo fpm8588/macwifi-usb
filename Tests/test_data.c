@@ -183,7 +183,24 @@ static void test_tx_cfm(void) {
     CHECK(aic_data_parse_tx_cfm(d, sizeof d, &st, &idx) == -1);
 }
 
+static void test_mgmt_tx(void) {
+    uint8_t frame[24 + 104], out[600];
+    memset(frame, 0x11, sizeof frame);
+    frame[0] = 0xB0;
+    size_t n = aic_data_build_mgmt_tx(out, sizeof out, frame, sizeof frame, 1);
+    CHECK(n == 4 + 28 + sizeof frame && out[0] == (uint8_t)n && out[2] == 0x01);
+    const uint8_t *d = out + 4;
+    CHECK(d[0] == sizeof frame && d[1] == 0 && d[4] == 0 && d[7] == 0 && d[20] == 0 && d[21] == 0 && d[22] == 3 &&
+          d[23] == 0xFF && d[24] == 1 && d[25] == 0xFF && d[26] == 0x08 && d[27] == 0);
+    CHECK(!memcmp(out + 32, frame, sizeof frame));
+    CHECK(aic_data_build_mgmt_tx(out, 100, frame, sizeof frame, 0) == 0 && aic_data_build_mgmt_tx(out, sizeof out, frame, 20, 0) == 0);
+    uint8_t big[512 - 32];                                   // a transfer of exactly 512 bytes gets one extra byte
+    memset(big, 0, sizeof big);
+    CHECK(aic_data_build_mgmt_tx(out, sizeof out, big, sizeof big, 0) == 513 && out[0] == 0x00 && (out[1] & 0x0f) == 0x02);
+}
+
 int main(void) {
+    test_mgmt_tx();
     test_tx_cfm();
     test_tx();
     test_rx();

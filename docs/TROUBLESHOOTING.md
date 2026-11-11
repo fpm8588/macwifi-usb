@@ -42,8 +42,8 @@ through a firmware load). Unplugging resets it completely; the service picks it 
 
 ## A network I can see in the Mac's own Wi-Fi menu is missing or greyed out
 
-- Greyed out: its security isn't supported yet; hover over it for the reason. WPA3-only, PMF-required and
-  enterprise networks fall in this group.
+- Greyed out: its security isn't supported yet; hover over it for the reason. Enterprise networks, WPA3 networks
+  that only accept "hash-to-element", and WPA2 networks that require PMF fall in this group.
 - Missing: hidden networks aren't listed, and 6 GHz and 5 GHz channels above 165 aren't scanned.
 - While connected, the list keeps networks seen in the last three minutes; click **Scan Again**.
 
@@ -52,6 +52,16 @@ through a firmware load). Unplugging resets it completely; the service picks it 
 The access point stopped after the second handshake message, which is what happens with a wrong password. Retry
 with the right one (right-click the network → Join with a different password). If you're sure it's right, check
 that the network offers WPA2 (a WPA3-only network is shown greyed out).
+
+## "This network uses WPA3: enter its password again"
+
+The network was remembered before MacWifi supported WPA3 (only its WPA2 key was kept) and now accepts WPA3 only.
+Right-click it → **Join with a different password…** and type the password once more.
+
+## WPA3 doesn't work but WPA2 did
+
+On a WPA2/WPA3 network MacWifi falls back to WPA2 by itself and the log says why WPA3 failed ("WPA3 sign-in didn't
+work (…); trying WPA2"). Please open an issue with the diagnostics report; that line is what's needed.
 
 ## Connected, but no internet
 
