@@ -269,7 +269,7 @@ static int d_post(Daemon *d, DCmd cmd, const uint8_t *ssid, size_t ssid_len, con
 // user turns Bluetooth off, or the adapter goes away. No power assertions.
 
 #define BT_DEV_KEEP_S 90      // a device stays listed this long after it was last heard
-#define BT_SCAN_S     8
+#define BT_SCAN_S     11      // ~5 s classic inquiry alone, then ~5 s LE scan
 
 typedef struct {
     pthread_mutex_t mu;
@@ -331,7 +331,7 @@ static void bt_expire(void) {
     gBt.ndev = w;
 }
 
-typedef struct { int inquiry_done; } BtRun;
+typedef struct { int inquiry_done, n_classic, n_le; } BtRun;
 static void bt_d_device(void *ctx, const HciDevice *dv) {
     (void)ctx;
     pthread_mutex_lock(&gBt.mu);
@@ -340,8 +340,9 @@ static void bt_d_device(void *ctx, const HciDevice *dv) {
 }
 static void bt_d_event(void *ctx, const HciEvent *ev) {
     BtRun *r = ctx;
-    if (ev->code == HCI_EV_INQUIRY_COMPLETE) r->inquiry_done = 1;
-    else hci_scan_event(ev, bt_d_device, NULL);
+    if (ev->code == HCI_EV_INQUIRY_COMPLETE) { r->inquiry_done = 1; return; }
+    int k = hci_scan_event(ev, bt_d_device, NULL);
+    if (k > 0) { if (ev->code == HCI_EV_LE_META) r->n_le += k; else r->n_classic += k; }
 }
 
 static int bt_wifi_ready(Daemon *d) {
@@ -406,38 +407,71 @@ static BtLink *bt_up(void) {
     return b;
 }
 
-// One LE + classic scan of BT_SCAN_S seconds; stops early for sleep / off / unplug. 0, or -1 if the link died.
+// Waits for events until `secs` pass or `stop_on_inquiry_done`; 0, -1 if the link died, 1 if asked to stop.
+static int bt_listen(Daemon *d, BtLink *b, BtRun *run, double secs, int stop_on_inquiry_done) {
+    double end = now_s() + secs;
+    uint8_t ev[HCI_MAX_EVENT];
+    size_t n = 0;
+    while (now_s() < end) {
+        if (!bt_should_run(d)) return 1;
+        if (stop_on_inquiry_done && run->inquiry_done) return 0;
+        int r = bt_next_event(b, ev, &n, 250);
+        if (r < 0) return -1;
+        HciEvent e;
+        if (r == 1 && hci_event(ev, n, &e) == 0) bt_d_event(run, &e);
+    }
+    return 0;
+}
+
+static void bt_count(int *le, int *classic) {
+    *le = *classic = 0;
+    for (int i = 0; i < gBt.ndev; i++) { if (gBt.dev[i].kind == HCI_DEV_LE) (*le)++; else (*classic)++; }
+}
+
+// One scan: classic inquiry on its own first (keyboards, mice, headphones in pairing mode: these only answer
+// inquiries, and running an LE scan at the same time can starve the inquiry on a single controller), then an LE
+// scan. Stops early for sleep / off / unplug. 0, or -1 if the link died.
 static int bt_scan_once(Daemon *d, BtLink *b) {
     BtRun run = {0};
     pthread_mutex_lock(&gBt.mu);
     gBt.scanning = 1;
+    int le0, cl0;
+    bt_count(&le0, &cl0);
     pthread_mutex_unlock(&gBt.mu);
-    const uint8_t sp[7] = {1, 0x60, 0x00, 0x30, 0x00, 0, 0};
-    const uint8_t on[2] = {1, 1}, off[2] = {0, 0};
-    int le = bt_call(b, HCI_OP_LE_SET_SCAN_PARAMS, sp, 7, NULL, 0, NULL, 2000, bt_d_event, &run) == 0 &&
-             bt_call(b, HCI_OP_LE_SET_SCAN_ENABLE, on, 2, NULL, 0, NULL, 2000, bt_d_event, &run) == 0;
-    uint8_t inq[5] = {(uint8_t)HCI_GIAC_LAP, (uint8_t)(HCI_GIAC_LAP >> 8), (uint8_t)(HCI_GIAC_LAP >> 16), 6, 0};
-    int classic = bt_call(b, HCI_OP_INQUIRY, inq, 5, NULL, 0, NULL, 2000, bt_d_event, &run) == 0;
-    int rc = 0;
-    double end = now_s() + BT_SCAN_S;
-    uint8_t ev[HCI_MAX_EVENT];
-    size_t n = 0;
-    while (now_s() < end && bt_should_run(d)) {
-        int r = bt_next_event(b, ev, &n, 250);
-        if (r < 0) { rc = -1; break; }
-        HciEvent e;
-        if (r == 1 && hci_event(ev, n, &e) == 0) bt_d_event(&run, &e);
-    }
+    double t0 = now_s();
+    uint8_t inq[5] = {(uint8_t)HCI_GIAC_LAP, (uint8_t)(HCI_GIAC_LAP >> 8), (uint8_t)(HCI_GIAC_LAP >> 16), 4, 0};
+    int ist = bt_call(b, HCI_OP_INQUIRY, inq, 5, NULL, 0, NULL, 2000, bt_d_event, &run);   // 4 x 1.28 s
+    int rc = ist == 0 ? bt_listen(d, b, &run, 6.0, 1) : 0;
+    if (ist == 0 && rc == 0 && !run.inquiry_done)
+        bt_call(b, HCI_OP_INQUIRY_CANCEL, NULL, 0, NULL, 0, NULL, 1000, bt_d_event, &run);
+    pthread_mutex_lock(&gBt.mu);
+    int le1, cl1;
+    bt_count(&le1, &cl1);
+    pthread_mutex_unlock(&gBt.mu);
+    int lst = -3;
     if (rc == 0) {
-        if (le) bt_call(b, HCI_OP_LE_SET_SCAN_ENABLE, off, 2, NULL, 0, NULL, 1000, bt_d_event, &run);
-        if (classic && !run.inquiry_done) bt_call(b, HCI_OP_INQUIRY_CANCEL, NULL, 0, NULL, 0, NULL, 1000, bt_d_event, &run);
+        const uint8_t sp[7] = {1, 0x60, 0x00, 0x30, 0x00, 0, 0};
+        const uint8_t on[2] = {1, 1}, off[2] = {0, 0};
+        lst = bt_call(b, HCI_OP_LE_SET_SCAN_PARAMS, sp, 7, NULL, 0, NULL, 2000, bt_d_event, &run);
+        if (lst == 0) lst = bt_call(b, HCI_OP_LE_SET_SCAN_ENABLE, on, 2, NULL, 0, NULL, 2000, bt_d_event, &run);
+        if (lst == 0) {
+            rc = bt_listen(d, b, &run, BT_SCAN_S - (now_s() - t0) > 3 ? BT_SCAN_S - (now_s() - t0) : 3, 0);
+            if (rc >= 0) bt_call(b, HCI_OP_LE_SET_SCAN_ENABLE, off, 2, NULL, 0, NULL, 1000, bt_d_event, &run);
+        }
     }
     pthread_mutex_lock(&gBt.mu);
     gBt.scanning = 0;
+    int le2, cl2;
+    bt_count(&le2, &cl2);
     bt_expire();
     pthread_mutex_unlock(&gBt.mu);
-    if (!le && !classic) bt_set_error("the controller refused to scan");
-    return rc;
+    // Counts only (no names or addresses in the log).
+    printf("[macwifid] Bluetooth scan %.1f s: classic inquiry status %d%s, %d responses, %d new classic devices; "
+           "LE scan status %d, %d reports, %d new LE devices\n", now_s() - t0, ist, run.inquiry_done ? " (completed)" : "",
+           run.n_classic, cl2 - cl0, lst, run.n_le, le2 - le0);
+    fflush(stdout);
+    if (ist != 0 && lst != 0) bt_set_error("the controller refused to scan");
+    return rc < 0 ? -1 : 0;
 }
 
 static void *bt_thread(void *arg) {

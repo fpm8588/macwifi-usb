@@ -2372,9 +2372,9 @@ static int cmd_bt(int argc, char **argv) {
             fprintf(stderr, "The service didn't accept the request: %s\n", reply);
             return 1;
         }
-        printf("Asked the service to scan; waiting %d s...\n", 9);
+        printf("Asked the service to scan; waiting %d s...\n", 12);
         fflush(stdout);
-        sleep(9);
+        sleep(12);
         int rc = ctl_request(MW_SOCK, "{\"cmd\":\"bt\"}", reply, sizeof reply);
         printf("%s", reply);
         return rc ? 1 : 0;
