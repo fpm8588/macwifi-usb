@@ -38,6 +38,7 @@ static const char *const kStateName[] = {"off", "no_adapter", "starting", "idle"
 // woke up in) and auto-joins as usual.
 #define MW_SLEEP_WAIT_MS 3000
 static atomic_int gSleepReq, gWake;
+static atomic_int gBtSleep, gBtOpen;   // Bluetooth thread: asked to close for sleep / has the interface open
 static pthread_mutex_t gPmMu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gPmCv = PTHREAD_COND_INITIALIZER;
 static int gSleepReady;
@@ -56,6 +57,12 @@ static void d_will_sleep(void) {
         if (pthread_cond_timedwait(&gPmCv, &gPmMu, &ts) != 0) break;
     int ready = gSleepReady;
     pthread_mutex_unlock(&gPmMu);
+    gBtSleep = 1;                                   // Bluetooth closes too, within what is left of the budget
+    for (;;) {
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        if (!gBtOpen || (t1.tv_sec - t0.tv_sec) * 1000 + (t1.tv_nsec - t0.tv_nsec) / 1000000 >= MW_SLEEP_WAIT_MS) break;
+        usleep(20000);
+    }
     clock_gettime(CLOCK_MONOTONIC, &t1);
     double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     printf(ready ? "[macwifid] ready for sleep after %.0f ms\n"
@@ -63,7 +70,7 @@ static void d_will_sleep(void) {
     fflush(stdout);
 }
 
-static void d_did_wake(void) { gWake = 1; }
+static void d_did_wake(void) { gWake = 1; gBtSleep = 0; }
 
 typedef enum { DC_NONE, DC_SCAN, DC_JOIN, DC_DISCONNECT, DC_FORGET, DC_POWER } DCmd;
 
@@ -83,6 +90,7 @@ typedef struct {
     void (*release)(Link *l);
     const char *dir;          // known networks + power state
     const char *sock;
+    int bluetooth;            // run the Bluetooth thread (real adapter only)
 } DaemonHooks;
 
 typedef struct {
@@ -253,6 +261,246 @@ static int d_post(Daemon *d, DCmd cmd, const uint8_t *ssid, size_t ssid_len, con
     return ok;
 }
 
+// ---------------------------------------------------------------- Bluetooth (phase B2)
+//
+// Its own thread: the Bluetooth controller is interface 0 of the same USB device, independent of the Wi-Fi
+// interface the main thread drives, but it only runs once our firmware is on the chip, so it follows the Wi-Fi
+// side's state (adapter present and brought up). It closes the interface whenever the Mac is about to sleep, the
+// user turns Bluetooth off, or the adapter goes away. No power assertions.
+
+#define BT_DEV_KEEP_S 90      // a device stays listed this long after it was last heard
+#define BT_SCAN_S     8
+
+typedef struct {
+    pthread_mutex_t mu;
+    int power;                // user setting (persisted), default on
+    int up, scanning, scan_req;
+    char controller[96], error[160];
+    HciDevice dev[HCI_SEEN_MAX];
+    double seen[HCI_SEEN_MAX];
+    int ndev;
+} BtState;
+
+static BtState gBt = {PTHREAD_MUTEX_INITIALIZER, 1, 0, 0, 0, "", "", {{0}}, {0}, 0};
+
+static void bt_save_power(Daemon *d) {
+    char path[512];
+    d_path(d, "bt_power", path, sizeof path);
+    write_private(path, gBt.power ? "1\n" : "0\n", 2);
+}
+
+static void bt_load_power(Daemon *d) {
+    char path[512];
+    d_path(d, "bt_power", path, sizeof path);
+    size_t n = 0;
+    char *t = read_small(path, &n);
+    if (t) { gBt.power = !(n && t[0] == '0'); free(t); }
+}
+
+static void bt_set_error(const char *e) {
+    pthread_mutex_lock(&gBt.mu);
+    if (strcmp(gBt.error, e)) { printf("[macwifid] Bluetooth: %s\n", e[0] ? e : "ok"); fflush(stdout); }
+    snprintf(gBt.error, sizeof gBt.error, "%s", e);
+    pthread_mutex_unlock(&gBt.mu);
+}
+
+// Merges one scan result into the published list (gBt.mu held by the caller).
+static void bt_publish(const HciDevice *d) {
+    double t = now_s();
+    for (int i = 0; i < gBt.ndev; i++) {
+        HciDevice *e = &gBt.dev[i];
+        if (e->kind != d->kind || memcmp(e->addr, d->addr, 6)) continue;
+        hci_merge(e, d);                     // same merge rules as a single scan
+        gBt.seen[i] = t;
+        return;
+    }
+    int slot = gBt.ndev < HCI_SEEN_MAX ? gBt.ndev++ : -1;
+    if (slot < 0) {                          // full: replace the oldest
+        slot = 0;
+        for (int i = 1; i < gBt.ndev; i++) if (gBt.seen[i] < gBt.seen[slot]) slot = i;
+    }
+    gBt.dev[slot] = *d;
+    gBt.seen[slot] = t;
+}
+
+static void bt_expire(void) {
+    double t = now_s();
+    int w = 0;
+    for (int i = 0; i < gBt.ndev; i++)
+        if (t - gBt.seen[i] <= BT_DEV_KEEP_S) { gBt.dev[w] = gBt.dev[i]; gBt.seen[w] = gBt.seen[i]; w++; }
+    gBt.ndev = w;
+}
+
+typedef struct { int inquiry_done; } BtRun;
+static void bt_d_device(void *ctx, const HciDevice *dv) {
+    (void)ctx;
+    pthread_mutex_lock(&gBt.mu);
+    bt_publish(dv);
+    pthread_mutex_unlock(&gBt.mu);
+}
+static void bt_d_event(void *ctx, const HciEvent *ev) {
+    BtRun *r = ctx;
+    if (ev->code == HCI_EV_INQUIRY_COMPLETE) r->inquiry_done = 1;
+    else hci_scan_event(ev, bt_d_device, NULL);
+}
+
+static int bt_wifi_ready(Daemon *d) {
+    pthread_mutex_lock(&d->mu);
+    int ok = d->adapter && (d->state == DS_IDLE || d->state == DS_SCANNING || d->state == DS_CONNECTING ||
+                            d->state == DS_CONNECTED);
+    pthread_mutex_unlock(&d->mu);
+    return ok;
+}
+
+static int bt_should_run(Daemon *d) {
+    pthread_mutex_lock(&gBt.mu);
+    int on = gBt.power;
+    pthread_mutex_unlock(&gBt.mu);
+    return on && !gBtSleep && !gStop && bt_wifi_ready(d);
+}
+
+static void bt_down(BtLink **b, const char *why) {
+    if (*b) {
+        bt_close(*b);
+        *b = NULL;
+        printf("[macwifid] Bluetooth closed (%s)\n", why);
+        fflush(stdout);
+    }
+    gBtOpen = 0;
+    pthread_mutex_lock(&gBt.mu);
+    gBt.up = 0;
+    gBt.scanning = 0;
+    pthread_mutex_unlock(&gBt.mu);
+}
+
+static BtLink *bt_up(void) {
+    io_service_t svc = find_adapter(AIC_MODE_WIFI, NULL);
+    if (!svc) { bt_set_error("adapter not found"); return NULL; }
+    char err[160];
+    gBtOpen = 1;                              // count it as open while we try, so sleep waits for us
+    BtLink *b = bt_open(svc, gDebug, err, sizeof err);
+    IOObjectRelease(svc);
+    if (!b) { gBtOpen = 0; bt_set_error(err); return NULL; }
+    uint8_t ret[260];
+    size_t rl = 0;
+    BtRun run = {0};
+    if (bt_call(b, HCI_OP_RESET, NULL, 0, NULL, 0, NULL, 3000, bt_d_event, &run) != 0 ||
+        bt_call(b, HCI_OP_READ_LOCAL_VERSION, NULL, 0, ret, sizeof ret, &rl, 2000, bt_d_event, &run) != 0 || rl < 8) {
+        bt_close(b);
+        gBtOpen = 0;
+        bt_set_error("the Bluetooth controller didn't answer");
+        return NULL;
+    }
+    uint8_t mask[8];
+    for (int i = 0; i < 8; i++) mask[i] = (uint8_t)(HCI_EVENT_MASK_SCAN >> (8 * i));
+    bt_call(b, HCI_OP_SET_EVENT_MASK, mask, 8, NULL, 0, NULL, 2000, bt_d_event, &run);
+    uint8_t mode = 2;
+    bt_call(b, HCI_OP_WRITE_INQUIRY_MODE, &mode, 1, NULL, 0, NULL, 2000, bt_d_event, &run);
+    pthread_mutex_lock(&gBt.mu);
+    snprintf(gBt.controller, sizeof gBt.controller, "Bluetooth %s", hci_version_name(ret[0]));
+    gBt.up = 1;
+    pthread_mutex_unlock(&gBt.mu);
+    bt_set_error("");
+    printf("[macwifid] Bluetooth up: %s, manufacturer 0x%04x\n", gBt.controller, ret[4] | (ret[5] << 8));
+    fflush(stdout);
+    return b;
+}
+
+// One LE + classic scan of BT_SCAN_S seconds; stops early for sleep / off / unplug. 0, or -1 if the link died.
+static int bt_scan_once(Daemon *d, BtLink *b) {
+    BtRun run = {0};
+    pthread_mutex_lock(&gBt.mu);
+    gBt.scanning = 1;
+    pthread_mutex_unlock(&gBt.mu);
+    const uint8_t sp[7] = {1, 0x60, 0x00, 0x30, 0x00, 0, 0};
+    const uint8_t on[2] = {1, 1}, off[2] = {0, 0};
+    int le = bt_call(b, HCI_OP_LE_SET_SCAN_PARAMS, sp, 7, NULL, 0, NULL, 2000, bt_d_event, &run) == 0 &&
+             bt_call(b, HCI_OP_LE_SET_SCAN_ENABLE, on, 2, NULL, 0, NULL, 2000, bt_d_event, &run) == 0;
+    uint8_t inq[5] = {(uint8_t)HCI_GIAC_LAP, (uint8_t)(HCI_GIAC_LAP >> 8), (uint8_t)(HCI_GIAC_LAP >> 16), 6, 0};
+    int classic = bt_call(b, HCI_OP_INQUIRY, inq, 5, NULL, 0, NULL, 2000, bt_d_event, &run) == 0;
+    int rc = 0;
+    double end = now_s() + BT_SCAN_S;
+    uint8_t ev[HCI_MAX_EVENT];
+    size_t n = 0;
+    while (now_s() < end && bt_should_run(d)) {
+        int r = bt_next_event(b, ev, &n, 250);
+        if (r < 0) { rc = -1; break; }
+        HciEvent e;
+        if (r == 1 && hci_event(ev, n, &e) == 0) bt_d_event(&run, &e);
+    }
+    if (rc == 0) {
+        if (le) bt_call(b, HCI_OP_LE_SET_SCAN_ENABLE, off, 2, NULL, 0, NULL, 1000, bt_d_event, &run);
+        if (classic && !run.inquiry_done) bt_call(b, HCI_OP_INQUIRY_CANCEL, NULL, 0, NULL, 0, NULL, 1000, bt_d_event, &run);
+    }
+    pthread_mutex_lock(&gBt.mu);
+    gBt.scanning = 0;
+    bt_expire();
+    pthread_mutex_unlock(&gBt.mu);
+    if (!le && !classic) bt_set_error("the controller refused to scan");
+    return rc;
+}
+
+static void *bt_thread(void *arg) {
+    Daemon *d = arg;
+    BtLink *b = NULL;
+    double next_try = 0;
+    while (!gStop) {
+        if (!bt_should_run(d)) {
+            bt_down(&b, gBtSleep ? "the Mac is going to sleep" : !gBt.power ? "turned off" : "adapter not ready");
+            usleep(100000);
+            continue;
+        }
+        if (!b) {
+            if (now_s() < next_try) { usleep(200000); continue; }
+            b = bt_up();
+            if (!b) { next_try = now_s() + 10; continue; }
+            pthread_mutex_lock(&gBt.mu);
+            gBt.scan_req = 1;                  // a first look around after coming up
+            pthread_mutex_unlock(&gBt.mu);
+        }
+        pthread_mutex_lock(&gBt.mu);
+        int scan = gBt.scan_req;
+        gBt.scan_req = 0;
+        pthread_mutex_unlock(&gBt.mu);
+        if (scan && bt_scan_once(d, b) != 0) { bt_down(&b, "lost the adapter"); next_try = now_s() + 2; continue; }
+        uint8_t ev[HCI_MAX_EVENT];
+        size_t n = 0;
+        int r = bt_next_event(b, ev, &n, 200);   // idle: keep the event pipe drained, notice unplugging
+        if (r < 0) { bt_down(&b, "lost the adapter"); next_try = now_s() + 2; }
+    }
+    bt_down(&b, "service stopping");
+    return NULL;
+}
+
+static void reply_bt(JsonOut *j) {
+    pthread_mutex_lock(&gBt.mu);
+    bt_expire();
+    jo_bool(j, "power", gBt.power);
+    jo_bool(j, "up", gBt.up);
+    jo_bool(j, "scanning", gBt.scanning);
+    jo_str(j, "controller", gBt.controller);
+    jo_str(j, "error", gBt.error);
+    jo_key_arr(j, "devices");
+    double t = now_s();
+    for (int i = 0; i < gBt.ndev; i++) {
+        const HciDevice *v = &gBt.dev[i];
+        char a[18];
+        hci_addr_str(v->addr, a);
+        const char *kind = v->kind == HCI_DEV_CLASSIC ? hci_cod_kind(v->cod) : hci_appearance_kind(v->appearance);
+        jo_begin_obj(j);
+        jo_str(j, "id", a);
+        jo_str(j, "name", v->name);
+        jo_str(j, "transport", v->kind == HCI_DEV_CLASSIC ? "classic" : "le");
+        jo_str(j, "type", kind ? kind : "");
+        jo_int(j, "rssi", v->rssi == 127 ? -127 : v->rssi);
+        jo_bool(j, "connectable", v->connectable);
+        jo_int(j, "age", (long long)(t - gBt.seen[i]));
+        jo_end_obj(j);
+    }
+    jo_end_arr(j);
+    pthread_mutex_unlock(&gBt.mu);
+}
+
 static void serve_client(Daemon *d, int fd) {
     struct timeval tv = {5, 0};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
@@ -328,6 +576,27 @@ static void serve_client(Daemon *d, int fd) {
                 int ok = d_post(d, c, (const uint8_t *)ssid, sl, NULL, 0, on ? (int)on->num : 0, 30, msg, sizeof msg);
                 jo_bool(&j, "ok", ok);
                 if (!ok) jo_str(&j, "error", msg);
+            }
+        } else if (!strcmp(cmd, "bt") || !strcmp(cmd, "bt_scan")) {
+            if (!strcmp(cmd, "bt_scan")) {
+                pthread_mutex_lock(&gBt.mu);
+                gBt.scan_req = 1;
+                pthread_mutex_unlock(&gBt.mu);
+            }
+            jo_bool(&j, "ok", 1);
+            reply_bt(&j);
+        } else if (!strcmp(cmd, "bt_power")) {
+            if (!on || on->type != JSON_BOOL) {
+                jo_bool(&j, "ok", 0);
+                jo_str(&j, "error", "missing argument");
+            } else {
+                pthread_mutex_lock(&gBt.mu);
+                gBt.power = on->num != 0;
+                if (!gBt.power) gBt.ndev = 0;
+                pthread_mutex_unlock(&gBt.mu);
+                bt_save_power(d);
+                jo_bool(&j, "ok", 1);
+                reply_bt(&j);
             }
         } else {
             jo_bool(&j, "ok", 0);
@@ -787,6 +1056,12 @@ static int daemon_main(const DaemonHooks *hooks) {
     signal(SIGPIPE, SIG_IGN);
     pthread_t ct;
     pthread_create(&ct, NULL, control_thread, d);
+    pthread_t btt;
+    int bt_on = 0;
+    if (d->h.bluetooth) {
+        bt_load_power(d);
+        bt_on = pthread_create(&btt, NULL, bt_thread, d) == 0;
+    }
 
     Adapter *a = &gA;
     memset(a, 0, sizeof *a);
@@ -973,6 +1248,7 @@ static int daemon_main(const DaemonHooks *hooks) {
     printf("[macwifid] stopping\n");
     d_release(d, a);
     pthread_join(ct, NULL);                 // notices gStop within 300 ms
+    if (bt_on) pthread_join(btt, NULL);     // notices gStop within ~250 ms (a scan stops early)
     close(d->listen_fd);
     unlink(d->h.sock);
     pthread_mutex_lock(&d->mu);
@@ -1012,7 +1288,7 @@ static int cmd_daemon(void) {
     }
     if (chdir(MW_DIR) != 0) fprintf(stderr, "note: %s not found; firmware is looked up relative to the current folder\n", MW_DIR);
     power_watch_start(d_will_sleep, d_did_wake);   // no power assertions: never keeps the Mac awake
-    DaemonHooks h = {real_adapter_present, real_acquire, real_release, MW_DIR, MW_SOCK};
+    DaemonHooks h = {real_adapter_present, real_acquire, real_release, MW_DIR, MW_SOCK, 1};
     return daemon_main(&h);
 }
 

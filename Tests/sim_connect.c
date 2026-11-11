@@ -755,7 +755,7 @@ static void sim_release(Link *l) { (void)l; gReleased++; }
 static char gSock[64], gDir[64];
 static void *daemon_thread(void *arg) {
     (void)arg;
-    DaemonHooks h = {sim_present, sim_acquire, sim_release, gDir, gSock};
+    DaemonHooks h = {sim_present, sim_acquire, sim_release, gDir, gSock, 0};
     daemon_main(&h);
     return NULL;
 }

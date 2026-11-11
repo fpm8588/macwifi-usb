@@ -127,5 +127,7 @@ typedef struct {
     int overflow;
 } HciSeen;
 void hci_seen_add(HciSeen *s, const HciDevice *d);
+// The merge hci_seen_add applies when d is another report from the device already in e.
+void hci_merge(HciDevice *e, const HciDevice *d);
 
 #endif

@@ -44,6 +44,26 @@ struct NetworksReply: Decodable {
     let networks: [NetworkInfo]?
 }
 
+struct BtDevice: Decodable, Identifiable, Hashable {
+    let id: String          // the device's address (never shown)
+    let name: String
+    let transport: String   // "le" or "classic"
+    let type: String        // "Keyboard", "Mouse", "Audio", "Phone"... or ""
+    let rssi: Int
+    let connectable: Bool
+    let age: Int
+}
+
+struct BtReply: Decodable {
+    let ok: Bool
+    let power: Bool?
+    let up: Bool?
+    let scanning: Bool?
+    let controller: String?
+    let error: String?
+    let devices: [BtDevice]?
+}
+
 struct SimpleReply: Decodable {
     let ok: Bool
     let error: String?
@@ -110,6 +130,8 @@ final class Model: ObservableObject {
     @Published var daemonRunning = true
     @Published var scanning = false
     @Published var joining: String?
+    @Published var bt: BtReply?
+    @Published var tab = 0                 // 0 Wi-Fi, 1 Bluetooth
 
     private var timer: Timer?
     private var portalShownFor: String?    // open the sign-in window by itself once per connection
@@ -170,10 +192,60 @@ final class Model: ObservableObject {
             let reply = (try? Daemon.request(["cmd": "status"], timeout: 5)).flatMap {
                 try? JSONDecoder().decode(StatusReply.self, from: $0)
             }
+            let btReply = reply == nil ? nil : (try? Daemon.request(["cmd": "bt"], timeout: 5)).flatMap {
+                try? JSONDecoder().decode(BtReply.self, from: $0)
+            }
             DispatchQueue.main.async {
                 self.daemonRunning = reply != nil
                 self.status = reply
+                self.bt = btReply
                 self.updatePortal()
+            }
+        }
+    }
+
+    // MARK: Bluetooth
+
+    var btPower: Bool { bt?.power ?? false }
+    var btScanning: Bool { bt?.scanning ?? false }
+    var btDevices: [BtDevice] {
+        (bt?.devices ?? []).sorted { a, b in
+            if a.name.isEmpty != b.name.isEmpty { return !a.name.isEmpty }   // named devices first
+            return a.rssi > b.rssi
+        }
+    }
+
+    var btStatusLine: String {
+        guard daemonRunning, let bt = bt else { return "The macwifid service isn't running." }
+        if bt.power != true { return "Bluetooth is off." }
+        if bt.up == true {
+            let what = bt.controller?.isEmpty == false ? bt.controller! : "Bluetooth"
+            return bt.scanning == true ? "\(what) · looking for devices…" : "\(what) · on"
+        }
+        if state == "off" { return "Bluetooth needs the adapter on (it shares the Wi-Fi chip)." }
+        if state == "no_adapter" { return "Plug in the UGREEN adapter." }
+        if state == "starting" || state == "asleep" { return "Waiting for the adapter…" }
+        if let e = bt.error, !e.isEmpty { return "Bluetooth: \(e)" }
+        return "Starting Bluetooth…"
+    }
+
+    func btScan() {
+        queue.async {
+            let reply = (try? Daemon.request(["cmd": "bt_scan"], timeout: 5)).flatMap {
+                try? JSONDecoder().decode(BtReply.self, from: $0)
+            }
+            DispatchQueue.main.async { if let r = reply { self.bt = r } }
+            // the scan runs for about 8 s in the service; the 3 s refresh picks up results as they come
+        }
+    }
+
+    func setBtPower(_ on: Bool) {
+        queue.async {
+            let reply = (try? Daemon.request(["cmd": "bt_power", "on": on], timeout: 5)).flatMap {
+                try? JSONDecoder().decode(BtReply.self, from: $0)
+            }
+            DispatchQueue.main.async {
+                if let r = reply { self.bt = r } else { Model.showError("The macwifid service didn't answer.") }
             }
         }
     }
@@ -359,25 +431,110 @@ struct NetworkRow: View {
     }
 }
 
-struct MenuView: View {
-    @EnvironmentObject var model: Model
+struct BtDeviceRow: View {
+    let dev: BtDevice
 
-    var versionLine: String {
-        let app = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
-        let svc = model.status?.version ?? "not running"
-        return "MacWifi \(app) · service \(svc) · Quit keeps Wi-Fi running"
+    static func symbol(_ type: String, _ transport: String) -> String {
+        switch type {
+        case "Keyboard": return "keyboard"
+        case "Mouse": return "computermouse"
+        case "Keyboard+mouse", "Input": return "keyboard"
+        case "Audio": return "headphones"
+        case "Phone": return "iphone"
+        case "Computer": return "laptopcomputer"
+        case "Watch", "Wearable": return "applewatch"
+        case "Gamepad", "Joystick", "Toy": return "gamecontroller"
+        case "Display", "Media player", "Remote": return "tv"
+        case "Heart rate", "Health": return "heart"
+        case "Imaging": return "printer"
+        default: return "dot.radiowaves.left.and.right"
+        }
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Text("UGREEN Wi-Fi").font(.headline)
-                Spacer()
-                Toggle("", isOn: Binding(get: { model.status?.power ?? false }, set: { model.setPower($0) }))
-                    .toggleStyle(.switch)
-                    .labelsHidden()
-                    .disabled(!model.daemonRunning)
+        HStack(spacing: 8) {
+            Image(systemName: BtDeviceRow.symbol(dev.type, dev.transport))
+                .font(.body)
+                .frame(width: 22)
+            VStack(alignment: .leading, spacing: 0) {
+                Text(dev.name.isEmpty ? "Unnamed device" : dev.name)
+                    .font(.body)
+                    .foregroundStyle(dev.name.isEmpty ? Color.secondary : Color.primary)
+                    .lineLimit(1)
+                if !dev.type.isEmpty {
+                    Text(dev.type).font(.caption2).foregroundStyle(.secondary)
+                }
             }
+            Spacer()
+            Text(dev.transport == "le" ? "LE" : "Classic")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            if dev.rssi > -127 {
+                Image(systemName: "cellularbars", variableValue: Model.strength(dev.rssi))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 8)
+        .frame(height: NetworkRow.height + 4)
+        .contentShape(Rectangle())
+        .help("Connecting to Bluetooth devices through the adapter is coming in the next update.")
+        .contextMenu {
+            Button("Connect (coming soon)") {}.disabled(true)
+        }
+    }
+}
+
+struct BluetoothPane: View {
+    @EnvironmentObject var model: Model
+    @State private var showUnnamed = false
+
+    var body: some View {
+        let named = model.btDevices.filter { !$0.name.isEmpty }
+        let unnamed = model.btDevices.filter { $0.name.isEmpty }
+        let rows = showUnnamed ? named + unnamed : named
+        VStack(alignment: .leading, spacing: 8) {
+            Text(model.btStatusLine)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            Divider()
+            HStack {
+                Text("Nearby Devices").font(.caption).foregroundStyle(.secondary)
+                Spacer()
+                if model.btScanning { ProgressView().controlSize(.small) }
+            }
+            if !model.btPower {
+                Text("Turn Bluetooth on to see nearby devices.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else if rows.isEmpty {
+                Text(model.btScanning ? "Looking…" : unnamed.isEmpty ? "No devices yet." : "Only unnamed devices nearby.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 0) {
+                        ForEach(rows) { BtDeviceRow(dev: $0) }
+                    }
+                }
+                .frame(height: CGFloat(min(max(rows.count, 4), 9)) * (NetworkRow.height + 4))
+            }
+            if model.btPower && !unnamed.isEmpty {
+                Toggle("Show \(unnamed.count) unnamed device\(unnamed.count == 1 ? "" : "s")", isOn: $showUnnamed)
+                    .toggleStyle(.checkbox)
+                    .font(.caption)
+            }
+        }
+    }
+}
+
+struct WifiPane: View {
+    @EnvironmentObject var model: Model
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
             Text(model.statusLine)
                 .font(.callout)
                 .foregroundStyle(.secondary)
@@ -426,9 +583,50 @@ struct MenuView: View {
                 // so give it a real height: every network up to ten rows, then scroll.
                 .frame(height: CGFloat(min(max(model.networks.count, 4), 10)) * NetworkRow.height)
             }
+        }
+    }
+}
+
+struct MenuView: View {
+    @EnvironmentObject var model: Model
+
+    var versionLine: String {
+        let app = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "?"
+        let svc = model.status?.version ?? "not running"
+        return "MacWifi \(app) · service \(svc) · Quit keeps Wi-Fi and Bluetooth running"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack {
+                Picker("", selection: $model.tab) {
+                    Text("Wi-Fi").tag(0)
+                    Text("Bluetooth").tag(1)
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .frame(width: 200)
+                Spacer()
+                if model.tab == 0 {
+                    Toggle("", isOn: Binding(get: { model.status?.power ?? false }, set: { model.setPower($0) }))
+                        .toggleStyle(.switch)
+                        .labelsHidden()
+                        .disabled(!model.daemonRunning)
+                } else {
+                    Toggle("", isOn: Binding(get: { model.btPower }, set: { model.setBtPower($0) }))
+                        .toggleStyle(.switch)
+                        .labelsHidden()
+                        .disabled(!model.daemonRunning || model.bt == nil)
+                }
+            }
+            if model.tab == 0 { WifiPane() } else { BluetoothPane() }
             Divider()
             HStack {
-                Button("Scan Again") { model.scan() }.disabled(model.scanning)
+                if model.tab == 0 {
+                    Button("Scan Again") { model.scan() }.disabled(model.scanning)
+                } else {
+                    Button("Scan Again") { model.btScan() }.disabled(model.btScanning || !model.btPower)
+                }
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }
             }

@@ -247,20 +247,24 @@ const char *hci_appearance_kind(uint16_t app) {
     }
 }
 
+void hci_merge(HciDevice *e, const HciDevice *d) {
+    if (d->rssi != 127) e->rssi = d->rssi;
+    if (d->name[0] && (!e->name[0] || (d->name_complete && !e->name_complete))) {
+        memcpy(e->name, d->name, sizeof e->name);
+        e->name_complete = d->name_complete;
+    }
+    if (!e->appearance) e->appearance = d->appearance;
+    if (!e->has_company && d->has_company) { e->company = d->company; e->has_company = 1; }
+    if (!e->cod) e->cod = d->cod;
+    e->connectable |= d->connectable;
+}
+
 void hci_seen_add(HciSeen *s, const HciDevice *d) {
     for (int i = 0; i < s->n; i++) {
         HciDevice *e = &s->dev[i];
         if (e->kind != d->kind || memcmp(e->addr, d->addr, 6) || (d->kind == HCI_DEV_LE && e->addr_type != d->addr_type))
             continue;
-        if (d->rssi != 127) e->rssi = d->rssi;
-        if (d->name[0] && (!e->name[0] || (d->name_complete && !e->name_complete))) {
-            memcpy(e->name, d->name, sizeof e->name);
-            e->name_complete = d->name_complete;
-        }
-        if (!e->appearance) e->appearance = d->appearance;
-        if (!e->has_company && d->has_company) { e->company = d->company; e->has_company = 1; }
-        if (!e->cod) e->cod = d->cod;
-        e->connectable |= d->connectable;
+        hci_merge(e, d);
         return;
     }
     if (s->n >= HCI_SEEN_MAX) { s->overflow = 1; return; }

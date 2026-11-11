@@ -2365,6 +2365,20 @@ static int cmd_bt(int argc, char **argv) {
     int show_addr = 0;
     for (int i = 2; i < argc; i++) if (!strcmp(argv[i], "--addresses")) show_addr = 1;
 
+    if (daemon_running()) {                       // the service owns the Bluetooth interface: ask it
+        char reply[32768];
+        reply[0] = 0;
+        if (ctl_request(MW_SOCK, "{\"cmd\":\"bt_scan\"}", reply, sizeof reply) != 0) {
+            fprintf(stderr, "The service didn't accept the request: %s\n", reply);
+            return 1;
+        }
+        printf("Asked the service to scan; waiting %d s...\n", 9);
+        fflush(stdout);
+        sleep(9);
+        int rc = ctl_request(MW_SOCK, "{\"cmd\":\"bt\"}", reply, sizeof reply);
+        printf("%s", reply);
+        return rc ? 1 : 0;
+    }
     const AicId *id = NULL;
     io_service_t svc = find_adapter(AIC_MODE_WIFI, &id);
     if (!svc) {

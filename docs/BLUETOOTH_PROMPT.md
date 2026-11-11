@@ -133,10 +133,13 @@ audio.
 - Pass: version and address read, and nearby devices listed. If interface 0 cannot be opened or Reset times
   out, record the exact error, then try with the firmware freshly loaded.
 
-### B2: Bluetooth in the service and the menu
-- [ ] macwifid opens interface 0 after firmware load, keeps an event reader, survives unplug, sleep/wake.
-- [ ] Control verbs `bt_status`, `bt_scan`, `bt_devices`; menu section listing nearby devices.
-- [ ] Bluetooth on/off switch (HCI Reset + scan off; the radio stays powered for Wi-Fi).
+### B2: Bluetooth in the service and the menu (built 2026-11-11, adapter test pending)
+- [x] macwifid opens interface 0 once the Wi-Fi side is up (firmware loaded), keeps an event reader, closes on
+      unplug, sleep (shared 3 s budget, `gBtSleep`/`gBtOpen`) and when turned off; retries every 10 s.
+- [x] Control verbs `bt` (status + devices), `bt_scan`, `bt_power` (persisted in `bt_power`).
+- [x] Menu: Wi-Fi / Bluetooth tabs, the Bluetooth tab laid out like Wi-Fi (switch, status line, nearby
+      devices with type icon, LE/Classic and signal bars, unnamed devices behind a checkbox, Scan Again).
+- [ ] Hardware checkpoint: tab shows the controller and nearby devices; off/on works; lid-close sleep test.
 
 ### B3: LE devices (GATT, pairing)
 - [ ] L2CAP fixed channels, ATT/GATT client, LE connection create/cancel/disconnect.

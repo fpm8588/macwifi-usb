@@ -5,6 +5,10 @@
 **New**
 - Bluetooth, phase B1: `macwifictl bt` opens the adapter's own Bluetooth controller from user space (no kext),
   identifies it and lists nearby Bluetooth LE and classic devices. Plan: `docs/BLUETOOTH_PROMPT.md`.
+- Bluetooth, phase B2: the service runs the Bluetooth controller (its own thread, closed before sleep within the
+  same 3 s budget), and the menu has Wi-Fi and Bluetooth tabs: Bluetooth on/off, controller status, nearby
+  devices with type icons and signal, Scan Again. Connecting comes with the next phases. Control socket verbs
+  `bt`, `bt_scan`, `bt_power`; `macwifictl bt` asks the service when it's running.
 
 **Changed**
 - Faster Wi-Fi (to be measured): outgoing data frames are queued, up to 64 USB transfers in flight like the
