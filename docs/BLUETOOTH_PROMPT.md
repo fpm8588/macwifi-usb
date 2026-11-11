@@ -141,6 +141,22 @@ audio.
       devices with type icon, LE/Classic and signal bars, unnamed devices behind a checkbox, Scan Again).
 - [ ] Hardware checkpoint: tab shows the controller and nearby devices; off/on works; lid-close sleep test.
 
+### B3/B4 classic (built 2026-11-11, adapter test pending)
+- [x] `Shared/bthost.c`: ACL connections (up to 7), command flow control, SSP (IO capability DisplayYesNo,
+      MITM + general bonding; passkey shown for keyboards; Just Works confirmed for mice), link keys via
+      callbacks, legacy PIN "0000", L2CAP signaling (connect/config/disconnect/echo/info, "pending" until
+      encrypted), HID control + interrupt, SET_PROTOCOL boot, virtual cable unplug. `test_bthost`: a scripted
+      keyboard pairing, a device-initiated reconnect, failures, 3000 fuzz rounds.
+- [x] `Shared/hidboot.c`: boot keyboard diff (rollover kept, releases first), boot mouse, HID usage → kVK.
+- [x] Service: paired devices in `bt_paired` (0600), page scan on (connectable, not discoverable), connect /
+      disconnect / forget verbs, per-device state and passkey in `bt`, keys released when a device drops,
+      `bt_input` stream to the app. Report-protocol reports are logged by ID and length only.
+- [x] App: click to connect, state and passkey per row, Accessibility banner, CGEvent injection (keys with
+      modifiers as flagsChanged, pointer with light acceleration, clicks with double-click count, wheel).
+- [ ] Hardware: pair Magic Keyboard (expect a passkey) and Magic Mouse; type and point; sleep/wake reconnect.
+- Open: Magic Mouse in report protocol (scrolling = multitouch decoding), Fn/media keys, keyboard backlight /
+      battery level, LE HID (HOGP).
+
 ### B3: LE devices (GATT, pairing)
 - [ ] L2CAP fixed channels, ATT/GATT client, LE connection create/cancel/disconnect.
 - [ ] SMP LE Secure Connections (Just Works and passkey), bonding keys stored root-only like Wi-Fi passwords.

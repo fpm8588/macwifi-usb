@@ -37,6 +37,8 @@
 #include "aic_msg.h"
 #include "bt_usb.h"
 #include "hci.h"
+#include "bthost.h"
+#include "hidboot.h"
 #include "bridge.h"
 #include "captive.h"
 #include "dhcp.h"

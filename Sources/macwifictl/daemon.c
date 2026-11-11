@@ -284,6 +284,344 @@ typedef struct {
 
 static BtState gBt = {PTHREAD_MUTEX_INITIALIZER, 1, 0, 0, 0, "", "", -1, -1, {{0}}, {0}, 0};
 
+// ---- connections (phase B3/B4): paired devices, per-device status, requests from clients, input to the app
+
+#define BT_PAIRED_MAX 16
+typedef struct {
+    uint8_t addr[6];
+    uint8_t key[16];
+    uint8_t key_type;
+    uint32_t cod;
+    char name[64];
+    char type[24];
+} BtPaired;
+
+typedef struct {
+    uint8_t addr[6];
+    char state[16];            // "connecting", "pairing", "connected", "failed", "" = none
+    uint32_t passkey;          // shown while pairing a keyboard
+    int has_passkey;
+    char why[64];              // after "failed"
+    double t;
+} BtDevStatus;
+
+enum { BT_ACT_CONNECT = 1, BT_ACT_DISCONNECT, BT_ACT_FORGET };
+
+static struct {
+    BtPaired paired[BT_PAIRED_MAX];
+    int npaired;
+    BtDevStatus st[BT_PAIRED_MAX];
+    struct { int op; uint8_t addr[6]; } act[8];
+    int nact;
+} gBp;                         // guarded by gBt.mu
+
+static BtHost gHost;           // Bluetooth thread only
+static BtLink *gBtLink;        // Bluetooth thread only
+static struct { uint8_t addr[6]; int used; HidKbState kb; uint8_t buttons; int unknown_logged; } gHid[BTH_MAX_CONN];
+
+// Input for the menu app (it posts the events into the user's session): a ring of text lines, read by
+// `bt_input` streams. "k <macOS key code> <1 down|0 up> <modifier bits>" and "m <buttons> <dx> <dy> <wheel>".
+#define BT_IN_RING 1024
+static struct {
+    pthread_mutex_t mu;
+    pthread_cond_t cv;
+    char line[BT_IN_RING][40];
+    unsigned long seq;
+    int readers;
+} gIn = {PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, {{0}}, 0, 0};
+
+static void in_push(const char *s) {
+    pthread_mutex_lock(&gIn.mu);
+    snprintf(gIn.line[gIn.seq % BT_IN_RING], sizeof gIn.line[0], "%s", s);
+    gIn.seq++;
+    pthread_cond_broadcast(&gIn.cv);
+    pthread_mutex_unlock(&gIn.mu);
+}
+
+static int hexnib(char c) {
+    return c >= '0' && c <= '9' ? c - '0' : c >= 'a' && c <= 'f' ? c - 'a' + 10 : c >= 'A' && c <= 'F' ? c - 'A' + 10 : -1;
+}
+
+// "AA:BB:CC:DD:EE:FF" (as shown) -> addr (wire order). 0 or -1.
+static int parse_addr(const char *s, size_t n, uint8_t a[6]) {
+    if (n != 17) return -1;
+    for (int i = 0; i < 6; i++) {
+        int hi = hexnib(s[i * 3]), lo = hexnib(s[i * 3 + 1]);
+        if (hi < 0 || lo < 0 || (i < 5 && s[i * 3 + 2] != ':')) return -1;
+        a[5 - i] = (uint8_t)(hi * 16 + lo);
+    }
+    return 0;
+}
+
+static void hexenc(const uint8_t *p, size_t n, char *out) {
+    static const char k[] = "0123456789abcdef";
+    for (size_t i = 0; i < n; i++) { out[2 * i] = k[p[i] >> 4]; out[2 * i + 1] = k[p[i] & 15]; }
+    out[2 * n] = 0;
+}
+
+static size_t hexdec(const char *s, uint8_t *out, size_t cap) {
+    size_t n = 0;
+    while (s[0] && s[1] && n < cap) {
+        int hi = hexnib(s[0]), lo = hexnib(s[1]);
+        if (hi < 0 || lo < 0) break;
+        out[n++] = (uint8_t)(hi * 16 + lo);
+        s += 2;
+    }
+    return n;
+}
+
+// Paired devices file (root-only, like the Wi-Fi keys): addr key type cod name-hex type-hex per line.
+static void bp_save(void) {
+    char path[512];
+    d_path(&gD, "bt_paired", path, sizeof path);
+    char *buf = malloc(BT_PAIRED_MAX * 400);
+    if (!buf) return;
+    size_t o = 0;
+    for (int i = 0; i < gBp.npaired; i++) {
+        const BtPaired *p = &gBp.paired[i];
+        char a[13], k[33], nm[129], ty[49];
+        hexenc(p->addr, 6, a);
+        hexenc(p->key, 16, k);
+        hexenc((const uint8_t *)p->name, strlen(p->name), nm);
+        hexenc((const uint8_t *)p->type, strlen(p->type), ty);
+        o += (size_t)snprintf(buf + o, BT_PAIRED_MAX * 400 - o, "%s %s %u %06x %s %s\n", a, k, p->key_type,
+                              (unsigned)p->cod, nm[0] ? nm : "-", ty[0] ? ty : "-");
+    }
+    write_private(path, buf, o);
+    secure_zero(buf, BT_PAIRED_MAX * 400);
+    free(buf);
+}
+
+static void bp_load(void) {
+    char path[512];
+    d_path(&gD, "bt_paired", path, sizeof path);
+    size_t n = 0;
+    char *t = read_small(path, &n);
+    if (!t) return;
+    char *save = NULL;
+    for (char *line = strtok_r(t, "\n", &save); line && gBp.npaired < BT_PAIRED_MAX; line = strtok_r(NULL, "\n", &save)) {
+        char a[16], k[40], nm[160], ty[64];
+        unsigned kt = 0, cod = 0;
+        if (sscanf(line, "%15s %39s %u %x %159s %63s", a, k, &kt, &cod, nm, ty) != 6) continue;
+        BtPaired *p = &gBp.paired[gBp.npaired];
+        memset(p, 0, sizeof *p);
+        if (hexdec(a, p->addr, 6) != 6 || hexdec(k, p->key, 16) != 16) continue;
+        p->key_type = (uint8_t)kt;
+        p->cod = cod;
+        if (strcmp(nm, "-")) p->name[hexdec(nm, (uint8_t *)p->name, sizeof p->name - 1)] = 0;
+        if (strcmp(ty, "-")) p->type[hexdec(ty, (uint8_t *)p->type, sizeof p->type - 1)] = 0;
+        gBp.npaired++;
+    }
+    secure_zero(t, n);
+    free(t);
+}
+
+static BtPaired *bp_find(const uint8_t a[6]) {
+    for (int i = 0; i < gBp.npaired; i++) if (!memcmp(gBp.paired[i].addr, a, 6)) return &gBp.paired[i];
+    return NULL;
+}
+
+static void bp_remove(const uint8_t a[6]) {
+    for (int i = 0; i < gBp.npaired; i++)
+        if (!memcmp(gBp.paired[i].addr, a, 6)) {
+            secure_zero(&gBp.paired[i], sizeof gBp.paired[i]);
+            gBp.paired[i] = gBp.paired[--gBp.npaired];
+            bp_save();
+            return;
+        }
+}
+
+static BtDevStatus *bs_get(const uint8_t a[6], int create) {
+    BtDevStatus *oldest = &gBp.st[0];
+    for (int i = 0; i < BT_PAIRED_MAX; i++) {
+        if (gBp.st[i].t > 0 && !memcmp(gBp.st[i].addr, a, 6)) return &gBp.st[i];
+        if (gBp.st[i].t < oldest->t) oldest = &gBp.st[i];
+    }
+    if (!create) return NULL;
+    memset(oldest, 0, sizeof *oldest);
+    memcpy(oldest->addr, a, 6);
+    oldest->t = now_s();
+    return oldest;
+}
+
+// The device's kind for logs (never names or addresses there).
+static const char *bt_kind_for_log(const uint8_t a[6]) {
+    const BtPaired *p = bp_find(a);
+    if (p && p->type[0]) return p->type;
+    for (int i = 0; i < gBt.ndev; i++)
+        if (!memcmp(gBt.dev[i].addr, a, 6)) {
+            const char *k = gBt.dev[i].kind == HCI_DEV_CLASSIC ? hci_cod_kind(gBt.dev[i].cod) : NULL;
+            if (k) return k;
+        }
+    return "device";
+}
+
+static void hid_release_all(int slot) {
+    if (!gHid[slot].used) return;
+    HidKeyEvent ev[32];
+    uint8_t zero[8] = {0};
+    int n = hid_kb_diff(&gHid[slot].kb, zero, 8, ev);
+    for (int i = 0; i < n; i++) {
+        int kc = hid_usage_to_mac(ev[i].usage);
+        char line[40];
+        if (kc >= 0) { snprintf(line, sizeof line, "k %d 0 0", kc); in_push(line); }
+    }
+    if (gHid[slot].buttons) in_push("m 0 0 0 0");
+    memset(&gHid[slot], 0, sizeof gHid[slot]);
+}
+
+static int hid_slot(const uint8_t a[6], int create) {
+    int free_slot = -1;
+    for (int i = 0; i < BTH_MAX_CONN; i++) {
+        if (gHid[i].used && !memcmp(gHid[i].addr, a, 6)) return i;
+        if (!gHid[i].used && free_slot < 0) free_slot = i;
+    }
+    if (!create || free_slot < 0) return -1;
+    memset(&gHid[free_slot], 0, sizeof gHid[free_slot]);
+    gHid[free_slot].used = 1;
+    memcpy(gHid[free_slot].addr, a, 6);
+    return free_slot;
+}
+
+// ---- BtHostOps (all on the Bluetooth thread)
+
+static int bh_send_cmd(void *ctx, uint16_t op, const uint8_t *p, size_t n) {
+    (void)ctx;
+    return gBtLink ? bt_send_cmd(gBtLink, op, p, n) : -1;
+}
+static int bh_send_acl(void *ctx, const uint8_t *pkt, size_t n) {
+    (void)ctx;
+    return gBtLink ? bt_send_acl(gBtLink, pkt, n) : -1;
+}
+static int bh_key_load(void *ctx, const uint8_t a[6], uint8_t key[16]) {
+    (void)ctx;
+    pthread_mutex_lock(&gBt.mu);
+    const BtPaired *p = bp_find(a);
+    if (p) memcpy(key, p->key, 16);
+    pthread_mutex_unlock(&gBt.mu);
+    return p ? 0 : -1;
+}
+static void bh_key_store(void *ctx, const uint8_t a[6], const uint8_t key[16], uint8_t type) {
+    (void)ctx;
+    pthread_mutex_lock(&gBt.mu);
+    BtPaired *p = bp_find(a);
+    if (!p && gBp.npaired < BT_PAIRED_MAX) {
+        p = &gBp.paired[gBp.npaired++];
+        memset(p, 0, sizeof *p);
+        memcpy(p->addr, a, 6);
+    }
+    if (p) {
+        memcpy(p->key, key, 16);
+        p->key_type = type;
+        for (int i = 0; i < gBt.ndev; i++)
+            if (!memcmp(gBt.dev[i].addr, a, 6)) {
+                if (gBt.dev[i].name[0]) snprintf(p->name, sizeof p->name, "%s", gBt.dev[i].name);
+                if (gBt.dev[i].cod) p->cod = gBt.dev[i].cod;
+                const char *k = gBt.dev[i].kind == HCI_DEV_CLASSIC ? hci_cod_kind(gBt.dev[i].cod)
+                                                                   : hci_appearance_kind(gBt.dev[i].appearance);
+                if (k) snprintf(p->type, sizeof p->type, "%s", k);
+            }
+        bp_save();
+        printf("[macwifid] Bluetooth: paired a %s (key type %u)\n", p->type[0] ? p->type : "device", type);
+        fflush(stdout);
+    }
+    pthread_mutex_unlock(&gBt.mu);
+}
+static void bh_key_forget(void *ctx, const uint8_t a[6]) {
+    (void)ctx;
+    pthread_mutex_lock(&gBt.mu);
+    bp_remove(a);
+    pthread_mutex_unlock(&gBt.mu);
+}
+static int bh_accept(void *ctx, const uint8_t a[6], uint32_t cod) {
+    (void)ctx;
+    pthread_mutex_lock(&gBt.mu);
+    BtPaired *p = bp_find(a);
+    if (p && cod) p->cod = cod;
+    pthread_mutex_unlock(&gBt.mu);
+    return p != NULL;              // only paired devices may connect to us
+}
+static void bh_event(void *ctx, const uint8_t a[6], BtHostEvent ev, uint32_t v) {
+    (void)ctx;
+    pthread_mutex_lock(&gBt.mu);
+    BtDevStatus *s = bs_get(a, 1);
+    const char *kind = bt_kind_for_log(a);
+    s->t = now_s();
+    switch (ev) {
+    case BTH_EV_CONNECTING: snprintf(s->state, sizeof s->state, "connecting"); s->has_passkey = 0; break;
+    case BTH_EV_PAIRING: snprintf(s->state, sizeof s->state, "pairing"); break;
+    case BTH_EV_PASSKEY: snprintf(s->state, sizeof s->state, "pairing"); s->passkey = v; s->has_passkey = 1; break;
+    case BTH_EV_CONNECTED: snprintf(s->state, sizeof s->state, "connected"); s->has_passkey = 0; s->why[0] = 0; break;
+    case BTH_EV_DISCONNECTED: s->state[0] = 0; s->has_passkey = 0; break;
+    case BTH_EV_UNPLUGGED: s->state[0] = 0; s->has_passkey = 0; break;
+    case BTH_EV_FAILED:
+        snprintf(s->state, sizeof s->state, "failed");
+        s->has_passkey = 0;
+        snprintf(s->why, sizeof s->why, "%s", v == 0x04 ? "it didn't answer (is it on and in pairing mode?)"
+                                              : v == 0x05 || v == 0x06 ? "pairing was refused"
+                                              : v == 0x08 ? "it went out of range"
+                                              : v == 0x13 || v == 0x16 ? "it disconnected"
+                                              : "it couldn't connect");
+        break;
+    }
+    pthread_mutex_unlock(&gBt.mu);
+    static const char *names[] = {"", "connecting", "pairing", "passkey shown", "connected", "disconnected", "failed",
+                                  "unplugged (forgotten)"};
+    printf("[macwifid] Bluetooth %s: %s", kind, names[ev <= BTH_EV_UNPLUGGED ? ev : 0]);
+    if (ev == BTH_EV_FAILED || ev == BTH_EV_DISCONNECTED) printf(" (0x%02x)", v);
+    printf("\n");
+    fflush(stdout);
+    if (ev == BTH_EV_DISCONNECTED || ev == BTH_EV_FAILED || ev == BTH_EV_UNPLUGGED) {
+        int slot = hid_slot(a, 0);
+        if (slot >= 0) hid_release_all(slot);      // never leave a key or button held down
+    }
+}
+static void bh_hid_input(void *ctx, const uint8_t a[6], const uint8_t *r, size_t n) {
+    (void)ctx;
+    int slot = hid_slot(a, 1);
+    if (slot < 0 || n < 1) return;
+    char line[40];
+    if (r[0] == HID_REPORT_KEYBOARD) {
+        HidKeyEvent ev[32];
+        int k = hid_kb_diff(&gHid[slot].kb, r + 1, n - 1, ev);
+        for (int i = 0; i < k; i++) {
+            int kc = hid_usage_to_mac(ev[i].usage);
+            if (kc < 0) continue;
+            snprintf(line, sizeof line, "k %d %d %u", kc, ev[i].down, gHid[slot].kb.mods);
+            in_push(line);
+        }
+        return;
+    }
+    HidMouse m;
+    if (r[0] == HID_REPORT_MOUSE && hid_mouse_parse(r + 1, n - 1, &m) == 0) {
+        gHid[slot].buttons = m.buttons;
+        snprintf(line, sizeof line, "m %u %d %d %d", m.buttons, m.dx, m.dy, m.wheel);
+        in_push(line);
+        return;
+    }
+    if (!gHid[slot].unknown_logged) {               // report protocol data we don't decode yet: shape only
+        gHid[slot].unknown_logged = 1;
+        printf("[macwifid] Bluetooth: input report ID 0x%02x, %zu bytes, not decoded yet\n", r[0], n);
+        fflush(stdout);
+    }
+}
+
+static const BtHostOps kBtOps = {NULL, bh_send_cmd, bh_send_acl, bh_key_load, bh_key_store, bh_key_forget,
+                                 bh_accept, bh_event, bh_hid_input};
+
+static void bt_acl_in(void *ctx, const uint8_t *pkt, size_t n) {
+    (void)ctx;
+    bthost_acl(&gHost, pkt, n);
+}
+
+static int bt_busy_connecting(void) {
+    for (int i = 0; i < BTH_MAX_CONN; i++) {
+        int s = gHost.c[i].state;
+        if (s == BTC_PAGING || s == BTC_SECURING || s == BTC_CHANNELS) return 1;
+    }
+    return 0;
+}
+
 static void bt_save_power(Daemon *d) {
     char path[512];
     d_path(d, "bt_power", path, sizeof path);
@@ -341,9 +679,10 @@ static void bt_d_device(void *ctx, const HciDevice *dv) {
 }
 static void bt_d_event(void *ctx, const HciEvent *ev) {
     BtRun *r = ctx;
-    if (ev->code == HCI_EV_INQUIRY_COMPLETE) { r->inquiry_done = 1; return; }
+    if (ev->code == HCI_EV_INQUIRY_COMPLETE) { if (r) r->inquiry_done = 1; return; }
     int k = hci_scan_event(ev, bt_d_device, NULL);
-    if (k > 0) { if (ev->code == HCI_EV_LE_META) r->n_le += k; else r->n_classic += k; }
+    if (k > 0 && r) { if (ev->code == HCI_EV_LE_META) r->n_le += k; else r->n_classic += k; }
+    if (k == 0 && gBtLink) bthost_event(&gHost, ev);      // connections, pairing, flow control
 }
 
 static int bt_wifi_ready(Daemon *d) {
@@ -363,6 +702,17 @@ static int bt_should_run(Daemon *d) {
 
 static void bt_down(BtLink **b, const char *why) {
     if (*b) {
+        // HCI Reset drops every link at once (fast, for sleep); the devices notice and reconnect later.
+        bt_call(*b, HCI_OP_RESET, NULL, 0, NULL, 0, NULL, 800, NULL, NULL);
+        bt_set_acl_handler(*b, NULL, NULL);
+        gBtLink = NULL;
+        bthost_reset(&gHost);
+        for (int i = 0; i < BTH_MAX_CONN; i++) hid_release_all(i);
+        pthread_mutex_lock(&gBt.mu);
+        for (int i = 0; i < BT_PAIRED_MAX; i++)
+            if (!strcmp(gBp.st[i].state, "connected") || !strcmp(gBp.st[i].state, "connecting") ||
+                !strcmp(gBp.st[i].state, "pairing")) gBp.st[i].state[0] = 0;
+        pthread_mutex_unlock(&gBt.mu);
         bt_close(*b);
         *b = NULL;
         printf("[macwifid] Bluetooth closed (%s)\n", why);
@@ -398,6 +748,21 @@ static BtLink *bt_up(void) {
     bt_call(b, HCI_OP_SET_EVENT_MASK, mask, 8, NULL, 0, NULL, 2000, bt_d_event, &run);
     uint8_t mode = 2;
     bt_call(b, HCI_OP_WRITE_INQUIRY_MODE, &mode, 1, NULL, 0, NULL, 2000, bt_d_event, &run);
+    // Host role for keyboards and mice: Secure Simple Pairing on, a computer's class of device, a name, and page
+    // scan on (connectable, not discoverable) so paired devices can reconnect to us by themselves.
+    uint8_t one = 1;
+    bt_call(b, HCI_OP_WRITE_SSP_MODE, &one, 1, NULL, 0, NULL, 2000, bt_d_event, &run);
+    const uint8_t cod[3] = {0x0C, 0x01, 0x00};          // major class Computer, minor Laptop
+    bt_call(b, HCI_OP_WRITE_CLASS_OF_DEVICE, cod, 3, NULL, 0, NULL, 2000, bt_d_event, &run);
+    uint8_t name[248];
+    memset(name, 0, sizeof name);
+    snprintf((char *)name, sizeof name, "Mac (UGREEN Bluetooth)");
+    bt_call(b, HCI_OP_WRITE_LOCAL_NAME, name, 248, NULL, 0, NULL, 2000, bt_d_event, &run);
+    uint8_t scan = 0x02;                                 // page scan only
+    bt_call(b, HCI_OP_WRITE_SCAN_ENABLE, &scan, 1, NULL, 0, NULL, 2000, bt_d_event, &run);
+    bthost_init(&gHost, &kBtOps);
+    gBtLink = b;
+    bt_set_acl_handler(b, bt_acl_in, NULL);
     pthread_mutex_lock(&gBt.mu);
     snprintf(gBt.controller, sizeof gBt.controller, "Bluetooth %s", hci_version_name(ret[0]));
     gBt.up = 1;
@@ -547,15 +912,56 @@ static void *bt_thread(void *arg) {
             gBt.scan_req = 1;                  // a first look around after coming up
             pthread_mutex_unlock(&gBt.mu);
         }
+        // Requests from the menu (connect / disconnect / forget).
         pthread_mutex_lock(&gBt.mu);
-        int scan = gBt.scan_req;
-        gBt.scan_req = 0;
+        int nact = gBp.nact;
+        struct { int op; uint8_t addr[6]; } act[8];
+        memcpy(act, gBp.act, sizeof act);
+        gBp.nact = 0;
+        pthread_mutex_unlock(&gBt.mu);
+        for (int i = 0; i < nact; i++) {
+            if (act[i].op == BT_ACT_CONNECT) {
+                uint8_t psrm = 1;
+                uint16_t co = 0;
+                pthread_mutex_lock(&gBt.mu);
+                for (int k = 0; k < gBt.ndev; k++)
+                    if (gBt.dev[k].kind == HCI_DEV_CLASSIC && !memcmp(gBt.dev[k].addr, act[i].addr, 6)) {
+                        psrm = gBt.dev[k].psrm;
+                        co = gBt.dev[k].clock_offset;
+                    }
+                pthread_mutex_unlock(&gBt.mu);
+                if (bthost_connect(&gHost, act[i].addr, psrm, co) != 0) {
+                    pthread_mutex_lock(&gBt.mu);
+                    BtDevStatus *s = bs_get(act[i].addr, 1);
+                    if (bthost_state(&gHost, act[i].addr) == BTC_FREE) {
+                        snprintf(s->state, sizeof s->state, "failed");
+                        snprintf(s->why, sizeof s->why, "too many Bluetooth connections");
+                    }
+                    pthread_mutex_unlock(&gBt.mu);
+                }
+            } else {
+                bthost_disconnect(&gHost, act[i].addr);
+                if (act[i].op == BT_ACT_FORGET) {
+                    pthread_mutex_lock(&gBt.mu);
+                    bp_remove(act[i].addr);
+                    BtDevStatus *s = bs_get(act[i].addr, 0);
+                    if (s) s->state[0] = 0;
+                    pthread_mutex_unlock(&gBt.mu);
+                }
+            }
+        }
+        bthost_poll(&gHost, now_s());
+        pthread_mutex_lock(&gBt.mu);
+        int scan = gBt.scan_req && !bt_busy_connecting();   // an inquiry would slow paging down
+        if (scan) gBt.scan_req = 0;
         pthread_mutex_unlock(&gBt.mu);
         if (scan && bt_scan_once(d, b) != 0) { bt_down(&b, "lost the adapter"); next_try = now_s() + 2; continue; }
         uint8_t ev[HCI_MAX_EVENT];
         size_t n = 0;
-        int r = bt_next_event(b, ev, &n, 200);   // idle: keep the event pipe drained, notice unplugging
-        if (r < 0) { bt_down(&b, "lost the adapter"); next_try = now_s() + 2; }
+        int r = bt_next_event(b, ev, &n, 100);   // idle: handle events (connections, input), notice unplugging
+        if (r < 0) { bt_down(&b, "lost the adapter"); next_try = now_s() + 2; continue; }
+        HciEvent e;
+        if (r == 1 && hci_event(ev, n, &e) == 0) bt_d_event(NULL, &e);
     }
     bt_down(&b, "service stopping");
     return NULL;
@@ -578,18 +984,90 @@ static void reply_bt(JsonOut *j) {
         char a[18];
         hci_addr_str(v->addr, a);
         const char *kind = v->kind == HCI_DEV_CLASSIC ? hci_cod_kind(v->cod) : hci_appearance_kind(v->appearance);
+        const BtPaired *pp = bp_find(v->addr);
+        const BtDevStatus *s = bs_get(v->addr, 0);
         jo_begin_obj(j);
         jo_str(j, "id", a);
-        jo_str(j, "name", v->name);
+        jo_str(j, "name", v->name[0] ? v->name : pp ? pp->name : "");
         jo_str(j, "transport", v->kind == HCI_DEV_CLASSIC ? "classic" : "le");
-        jo_str(j, "type", kind ? kind : "");
+        jo_str(j, "type", kind ? kind : pp ? pp->type : "");
         jo_int(j, "rssi", v->rssi == 127 ? -127 : v->rssi);
         jo_bool(j, "connectable", v->connectable);
         jo_int(j, "age", (long long)(t - gBt.seen[i]));
+        jo_bool(j, "paired", pp != NULL);
+        jo_str(j, "state", s ? s->state : "");
+        if (s && s->has_passkey) jo_int(j, "passkey", s->passkey);
+        if (s && !strcmp(s->state, "failed")) jo_str(j, "why", s->why);
+        jo_end_obj(j);
+    }
+    // Paired devices that aren't in the nearby list (off, asleep, or simply not advertising)
+    for (int i = 0; i < gBp.npaired; i++) {
+        const BtPaired *pp = &gBp.paired[i];
+        int listed = 0;
+        for (int k = 0; k < gBt.ndev; k++) if (!memcmp(gBt.dev[k].addr, pp->addr, 6)) listed = 1;
+        if (listed) continue;
+        char a[18];
+        hci_addr_str(pp->addr, a);
+        const BtDevStatus *s = bs_get(pp->addr, 0);
+        jo_begin_obj(j);
+        jo_str(j, "id", a);
+        jo_str(j, "name", pp->name);
+        jo_str(j, "transport", "classic");
+        jo_str(j, "type", pp->type);
+        jo_int(j, "rssi", -127);
+        jo_bool(j, "connectable", 1);
+        jo_int(j, "age", -1);
+        jo_bool(j, "paired", 1);
+        jo_str(j, "state", s ? s->state : "");
+        if (s && s->has_passkey) jo_int(j, "passkey", s->passkey);
+        if (s && !strcmp(s->state, "failed")) jo_str(j, "why", s->why);
         jo_end_obj(j);
     }
     jo_end_arr(j);
+    pthread_mutex_lock(&gIn.mu);
+    jo_bool(j, "input_app", gIn.readers > 0);
+    pthread_mutex_unlock(&gIn.mu);
     pthread_mutex_unlock(&gBt.mu);
+}
+
+// Streams input lines to the menu app until it goes away (or the service stops).
+static void bt_input_stream(int fd) {
+    pthread_mutex_lock(&gIn.mu);
+    unsigned long next = gIn.seq;
+    gIn.readers++;
+    pthread_mutex_unlock(&gIn.mu);
+    signal(SIGPIPE, SIG_IGN);
+    struct timeval stv = {2, 0};                       // an app that stops reading doesn't hold this thread forever
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof stv);
+    char buf[BT_IN_RING * 41];
+    for (;;) {
+        pthread_mutex_lock(&gIn.mu);
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_nsec += 500000000L;
+        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        while (gIn.seq == next && !gStop)
+            if (pthread_cond_timedwait(&gIn.cv, &gIn.mu, &ts) != 0) break;
+        if (gIn.seq - next > BT_IN_RING) next = gIn.seq - BT_IN_RING;   // fell behind: drop the oldest
+        size_t o = 0;
+        for (; next != gIn.seq; next++) o += (size_t)snprintf(buf + o, sizeof buf - o, "%s\n", gIn.line[next % BT_IN_RING]);
+        pthread_mutex_unlock(&gIn.mu);
+        if (gStop) break;
+        if (!o) {                                     // keepalive, so a closed client is noticed
+            if (write(fd, "\n", 1) != 1) break;
+            continue;
+        }
+        size_t w = 0;
+        while (w < o) {
+            ssize_t r = write(fd, buf + w, o - w);
+            if (r <= 0) break;
+            w += (size_t)r;
+        }
+        if (w < o) break;
+    }
+    pthread_mutex_lock(&gIn.mu);
+    gIn.readers--;
+    pthread_mutex_unlock(&gIn.mu);
 }
 
 static void serve_client(Daemon *d, int fd) {
@@ -611,6 +1089,7 @@ static void serve_client(Daemon *d, int fd) {
     jo_init(&j, out, 32768);
     jo_begin_obj(&j);
     JsonObj o;
+    int stream = 0;
     if (json_parse_flat(req, n, &o) != 0) {
         jo_bool(&j, "ok", 0);
         jo_str(&j, "error", "bad request");
@@ -676,6 +1155,39 @@ static void serve_client(Daemon *d, int fd) {
             }
             jo_bool(&j, "ok", 1);
             reply_bt(&j);
+        } else if (!strcmp(cmd, "bt_connect") || !strcmp(cmd, "bt_disconnect") || !strcmp(cmd, "bt_forget")) {
+            size_t il = 0;
+            const char *id = json_str(&o, "id", &il);
+            uint8_t a[6];
+            if (!id || parse_addr(id, il, a) != 0) {
+                jo_bool(&j, "ok", 0);
+                jo_str(&j, "error", "bad device id");
+            } else {
+                int op = !strcmp(cmd, "bt_connect") ? BT_ACT_CONNECT : !strcmp(cmd, "bt_disconnect") ? BT_ACT_DISCONNECT
+                                                                                                 : BT_ACT_FORGET;
+                pthread_mutex_lock(&gBt.mu);
+                int le_only = 0;
+                for (int k = 0; k < gBt.ndev; k++)
+                    if (!memcmp(gBt.dev[k].addr, a, 6) && gBt.dev[k].kind == HCI_DEV_LE && !bp_find(a)) le_only = 1;
+                int ok = gBt.up && gBp.nact < 8 && !(op == BT_ACT_CONNECT && le_only);
+                if (ok) {
+                    gBp.act[gBp.nact].op = op;
+                    memcpy(gBp.act[gBp.nact].addr, a, 6);
+                    gBp.nact++;
+                    if (op == BT_ACT_CONNECT) {
+                        BtDevStatus *s = bs_get(a, 1);
+                        snprintf(s->state, sizeof s->state, "connecting");
+                        s->t = now_s();
+                    }
+                }
+                pthread_mutex_unlock(&gBt.mu);
+                jo_bool(&j, "ok", ok);
+                if (!ok) jo_str(&j, "error", le_only ? "Bluetooth LE devices can't be connected yet (classic ones can)"
+                                                     : "Bluetooth isn't ready");
+            }
+        } else if (!strcmp(cmd, "bt_input")) {
+            stream = 1;
+            jo_bool(&j, "ok", 1);
         } else if (!strcmp(cmd, "bt_power")) {
             if (!on || on->type != JSON_BOOL) {
                 jo_bool(&j, "ok", 0);
@@ -705,6 +1217,7 @@ static void serve_client(Daemon *d, int fd) {
         w += (size_t)r;
     }
     free(out);
+    if (stream) bt_input_stream(fd);
 }
 
 typedef struct { Daemon *d; int fd; } ClientArg;
@@ -1151,6 +1664,7 @@ static int daemon_main(const DaemonHooks *hooks) {
     int bt_on = 0;
     if (d->h.bluetooth) {
         bt_load_power(d);
+        bp_load();
         bt_on = pthread_create(&btt, NULL, bt_thread, d) == 0;
     }
 

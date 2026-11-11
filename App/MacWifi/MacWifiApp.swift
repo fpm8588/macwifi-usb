@@ -6,6 +6,7 @@
 // that offer WPA3 (in a root-only file).
 
 import AppKit
+import ApplicationServices
 import SwiftUI
 import WebKit
 
@@ -52,6 +53,13 @@ struct BtDevice: Decodable, Identifiable, Hashable {
     let rssi: Int
     let connectable: Bool
     let age: Int
+    let paired: Bool?
+    let state: String?      // "connecting", "pairing", "connected", "failed", ""
+    let passkey: Int?       // shown while pairing a keyboard
+    let why: String?        // after "failed"
+
+    var isConnected: Bool { state == "connected" }
+    var isBusy: Bool { state == "connecting" || state == "pairing" }
 }
 
 struct BtReply: Decodable {
@@ -64,6 +72,7 @@ struct BtReply: Decodable {
     let devices: [BtDevice]?
     let last_classic: Int?
     let last_le: Int?
+    let input_app: Bool?
 }
 
 struct SimpleReply: Decodable {
@@ -122,6 +131,147 @@ enum Daemon {
         if out.isEmpty { throw DaemonError.io }
         return out
     }
+
+    // Opens a connection, sends one request and returns the socket for a streaming reply (bt_input).
+    static func openStream(_ object: [String: Any]) -> Int32? {
+        guard var body = try? JSONSerialization.data(withJSONObject: object) else { return nil }
+        body.append(0x0A)
+        let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+        guard fd >= 0 else { return nil }
+        var tv = timeval(tv_sec: 5, tv_usec: 0)   // the service sends a keepalive every 0.5 s
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
+        var addr = sockaddr_un()
+        addr.sun_family = sa_family_t(AF_UNIX)
+        addr.sun_len = UInt8(MemoryLayout<sockaddr_un>.size)
+        let path = Array(socketPath.utf8)
+        withUnsafeMutableBytes(of: &addr.sun_path) { raw in raw.copyBytes(from: path.prefix(raw.count - 1)) }
+        let rc = withUnsafePointer(to: &addr) { p in
+            p.withMemoryRebound(to: sockaddr.self, capacity: 1) { connect(fd, $0, socklen_t(MemoryLayout<sockaddr_un>.size)) }
+        }
+        let wrote = body.withUnsafeBytes { p in write(fd, p.baseAddress!, p.count) }
+        if rc != 0 || wrote != body.count { close(fd); return nil }
+        return fd
+    }
+}
+
+// MARK: - Bluetooth keyboard and mouse input
+
+// macwifid decodes the devices' reports and streams small text lines; this posts them as keyboard and mouse
+// events into the user's session (a system daemon can't). Needs Accessibility permission for MacWifi.
+final class InputInjector {
+    static let shared = InputInjector()
+    private let source = CGEventSource(stateID: .hidSystemState)
+    private var buttons: UInt8 = 0
+    private var lastClick = Date.distantPast
+    private var lastClickPoint = CGPoint.zero
+    private var clickCount: Int64 = 1
+    private var started = false
+
+    func start() {
+        guard !started else { return }
+        started = true
+        Thread.detachNewThread { self.run() }
+    }
+
+    static var trusted: Bool { AXIsProcessTrusted() }
+
+    static func askForTrust() {
+        let key = kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String
+        _ = AXIsProcessTrustedWithOptions([key: true] as CFDictionary)
+    }
+
+    private func run() {
+        while true {
+            if let fd = Daemon.openStream(["cmd": "bt_input"]) {
+                var pending = Data()
+                var buf = [UInt8](repeating: 0, count: 8192)
+                while true {
+                    let n = read(fd, &buf, buf.count)
+                    if n <= 0 { break }
+                    pending.append(buf, count: n)
+                    while let nl = pending.firstIndex(of: 0x0A) {
+                        let line = String(decoding: pending[pending.startIndex..<nl], as: UTF8.self)
+                        pending.removeSubrange(pending.startIndex...nl)
+                        handle(line)
+                    }
+                }
+                close(fd)
+            }
+            sleep(2)
+        }
+    }
+
+    private func handle(_ line: String) {
+        let f = line.split(separator: " ")
+        guard let kind = f.first else { return }      // empty lines are keepalives; the first is the JSON reply
+        if kind == "k", f.count == 4, let code = UInt16(f[1]), let down = Int(f[2]), let mods = UInt8(f[3]) {
+            key(code, down == 1, mods)
+        } else if kind == "m", f.count == 5, let b = UInt8(f[1]), let dx = Int(f[2]), let dy = Int(f[3]), let w = Int(f[4]) {
+            mouse(b, dx, dy, w)
+        }
+    }
+
+    private static func flags(_ mods: UInt8) -> CGEventFlags {
+        var fl: CGEventFlags = []
+        if mods & 0x11 != 0 { fl.insert(.maskControl) }
+        if mods & 0x22 != 0 { fl.insert(.maskShift) }
+        if mods & 0x44 != 0 { fl.insert(.maskAlternate) }
+        if mods & 0x88 != 0 { fl.insert(.maskCommand) }
+        return fl
+    }
+
+    private static let modifierKeys: Set<UInt16> = [0x37, 0x36, 0x38, 0x3C, 0x3A, 0x3D, 0x3B, 0x3E]
+
+    private func key(_ code: UInt16, _ down: Bool, _ mods: UInt8) {
+        guard let e = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
+        if InputInjector.modifierKeys.contains(code) { e.type = .flagsChanged }
+        e.flags = InputInjector.flags(mods)
+        e.post(tap: .cghidEventTap)
+    }
+
+    private static func screenBounds() -> CGRect {
+        var ids = [CGDirectDisplayID](repeating: 0, count: 16)
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(16, &ids, &count) == .success, count > 0 else { return CGRect(x: 0, y: 0, width: 1e5, height: 1e5) }
+        return ids.prefix(Int(count)).map { CGDisplayBounds($0) }.reduce(CGRect.null) { $0.union($1) }
+    }
+
+    private func mouse(_ b: UInt8, _ dx: Int, _ dy: Int, _ wheel: Int) {
+        let current = CGEvent(source: nil)?.location ?? .zero
+        // A little acceleration: boot-protocol mice report raw counts.
+        func accel(_ d: Int) -> CGFloat { CGFloat(d) * (1.0 + min(abs(CGFloat(d)), 20) * 0.12) }
+        let r = InputInjector.screenBounds()
+        let p = CGPoint(x: min(max(current.x + accel(dx), r.minX), r.maxX - 1),
+                        y: min(max(current.y + accel(dy), r.minY), r.maxY - 1))
+        if dx != 0 || dy != 0 {
+            let type: CGEventType = b & 1 != 0 ? .leftMouseDragged : b & 2 != 0 ? .rightMouseDragged
+                                  : b & 4 != 0 ? .otherMouseDragged : .mouseMoved
+            let btn: CGMouseButton = b & 1 != 0 ? .left : b & 2 != 0 ? .right : .center
+            CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: p, mouseButton: btn)?.post(tap: .cghidEventTap)
+        }
+        let changes: [(UInt8, CGEventType, CGEventType, CGMouseButton)] = [
+            (1, .leftMouseDown, .leftMouseUp, .left), (2, .rightMouseDown, .rightMouseUp, .right),
+            (4, .otherMouseDown, .otherMouseUp, .center),
+        ]
+        for (bit, downType, upType, btn) in changes where (b & bit) != (buttons & bit) {
+            let down = b & bit != 0
+            if down && bit == 1 {
+                let near = abs(p.x - lastClickPoint.x) < 5 && abs(p.y - lastClickPoint.y) < 5
+                clickCount = (Date().timeIntervalSince(lastClick) < NSEvent.doubleClickInterval && near) ? clickCount + 1 : 1
+                lastClick = Date()
+                lastClickPoint = p
+            }
+            if let e = CGEvent(mouseEventSource: source, mouseType: down ? downType : upType, mouseCursorPosition: p, mouseButton: btn) {
+                if bit == 1 { e.setIntegerValueField(.mouseEventClickState, value: clickCount) }
+                e.post(tap: .cghidEventTap)
+            }
+        }
+        buttons = b
+        if wheel != 0 {
+            CGEvent(scrollWheelEvent2Source: source, units: .line, wheelCount: 1, wheel1: Int32(wheel), wheel2: 0, wheel3: 0)?
+                .post(tap: .cghidEventTap)
+        }
+    }
 }
 
 // MARK: - Model
@@ -143,6 +293,7 @@ final class Model: ObservableObject {
     private let queue = DispatchQueue(label: "macwifi.requests", qos: .userInitiated)
 
     init() {
+        InputInjector.shared.start()
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refresh() }
     }
@@ -215,7 +366,8 @@ final class Model: ObservableObject {
     var btScanning: Bool { bt?.scanning ?? false }
     var btDevices: [BtDevice] {
         (bt?.devices ?? []).sorted { a, b in
-            if a.name.isEmpty != b.name.isEmpty { return !a.name.isEmpty }   // named devices first
+            if (a.paired == true) != (b.paired == true) { return a.paired == true }   // my devices first
+            if a.name.isEmpty != b.name.isEmpty { return !a.name.isEmpty }   // then named devices
             return a.rssi > b.rssi
         }
     }
@@ -245,6 +397,41 @@ final class Model: ObservableObject {
             }
             DispatchQueue.main.async { if let r = reply { self.bt = r } }
             // the scan runs for about 8 s in the service; the 3 s refresh picks up results as they come
+        }
+    }
+
+    var btNeedsAccessibility: Bool {
+        (bt?.devices ?? []).contains { $0.isConnected } && !InputInjector.trusted
+    }
+
+    func btConnect(_ dev: BtDevice) {
+        if !InputInjector.trusted && (dev.type == "Keyboard" || dev.type == "Mouse" || dev.type.contains("mouse") || dev.type == "Input") {
+            InputInjector.askForTrust()
+        }
+        btAction("bt_connect", dev)
+    }
+    func btDisconnect(_ dev: BtDevice) { btAction("bt_disconnect", dev) }
+    func btForget(_ dev: BtDevice) { btAction("bt_forget", dev) }
+
+    private func btAction(_ cmd: String, _ dev: BtDevice) {
+        queue.async {
+            var message: String?
+            if let data = try? Daemon.request(["cmd": cmd, "id": dev.id], timeout: 5),
+               let reply = try? JSONDecoder().decode(SimpleReply.self, from: data) {
+                if !reply.ok { message = reply.error ?? "It didn't work." }
+            } else {
+                message = "The macwifid service didn't answer."
+            }
+            DispatchQueue.main.async {
+                self.refresh()
+                if let m = message { Model.showError(m) }
+            }
+        }
+    }
+
+    static func openAccessibilitySettings() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
         }
     }
 
@@ -441,7 +628,20 @@ struct NetworkRow: View {
 }
 
 struct BtDeviceRow: View {
+    @EnvironmentObject var model: Model
     let dev: BtDevice
+
+    var subtitle: String {
+        switch dev.state ?? "" {
+        case "connecting": return "Connecting…"
+        case "pairing":
+            if let pk = dev.passkey { return String(format: "Type %06ld on the keyboard, then press Return", pk) }
+            return "Pairing…"
+        case "connected": return "Connected"
+        case "failed": return "Couldn't connect: \(dev.why ?? "unknown reason")"
+        default: return dev.paired == true ? "Paired · not connected" : dev.type
+        }
+    }
 
     static func symbol(_ type: String, _ transport: String) -> String {
         switch type {
@@ -470,11 +670,16 @@ struct BtDeviceRow: View {
                     .font(.body)
                     .foregroundStyle(dev.name.isEmpty ? Color.secondary : Color.primary)
                     .lineLimit(1)
-                if !dev.type.isEmpty {
-                    Text(dev.type).font(.caption2).foregroundStyle(.secondary)
+                if !subtitle.isEmpty {
+                    Text(subtitle)
+                        .font(dev.passkey != nil ? Font.callout.weight(.semibold) : Font.caption2)
+                        .foregroundStyle(dev.state == "failed" ? Color.orange : dev.isConnected ? Color.accentColor : Color.secondary)
+                        .lineLimit(2)
                 }
             }
             Spacer()
+            if dev.isBusy { ProgressView().controlSize(.small) }
+            if dev.isConnected { Image(systemName: "checkmark").font(.caption) }
             Text(dev.transport == "le" ? "LE" : "Classic")
                 .font(.caption2)
                 .foregroundStyle(.secondary)
@@ -486,11 +691,18 @@ struct BtDeviceRow: View {
         }
         .padding(.vertical, 3)
         .padding(.horizontal, 8)
-        .frame(height: NetworkRow.height + 4)
+        .frame(minHeight: NetworkRow.height + 4)
         .contentShape(Rectangle())
-        .help("Connecting to Bluetooth devices through the adapter is coming in the next update.")
+        .opacity(dev.transport == "le" && dev.paired != true ? 0.6 : 1)
+        .help(dev.transport == "le" && dev.paired != true ? "Bluetooth LE devices can't be connected yet."
+              : dev.isConnected ? "Right-click to disconnect or forget." : "Click to connect.")
+        .onTapGesture {
+            if !dev.isConnected && !dev.isBusy && !(dev.transport == "le" && dev.paired != true) { model.btConnect(dev) }
+        }
         .contextMenu {
-            Button("Connect (coming soon)") {}.disabled(true)
+            if !dev.isConnected && !dev.isBusy { Button("Connect") { model.btConnect(dev) } }
+            if dev.isConnected || dev.isBusy { Button("Disconnect") { model.btDisconnect(dev) } }
+            if dev.paired == true { Button("Forget This Device") { model.btForget(dev) } }
         }
     }
 }
@@ -501,17 +713,33 @@ struct BluetoothPane: View {
     var body: some View {
         // "Hidden" = no name and no known type (mostly beacons). A device whose type is known (keyboard, mouse,
         // headphones...) is always listed, even before its name arrives.
-        let named = model.btDevices.filter { !$0.name.isEmpty || !$0.type.isEmpty }
-        let unnamed = model.btDevices.filter { $0.name.isEmpty && $0.type.isEmpty }
+        let named = model.btDevices.filter { $0.paired == true || !$0.name.isEmpty || !$0.type.isEmpty }
+        let unnamed = model.btDevices.filter { $0.paired != true && $0.name.isEmpty && $0.type.isEmpty }
         let rows = model.btShowUnnamed ? named + unnamed : named
         VStack(alignment: .leading, spacing: 8) {
             Text(model.btStatusLine)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
+            if model.btNeedsAccessibility {
+                VStack(alignment: .leading, spacing: 4) {
+                    HStack {
+                        Image(systemName: "hand.raised")
+                        Text("Allow MacWifi to control this Mac").font(.callout)
+                        Spacer()
+                        Button("Open Settings…") { Model.openAccessibilitySettings() }
+                    }
+                    Text("The keyboard and mouse are connected, but their input reaches the Mac only after you turn on MacWifi in Privacy & Security › Accessibility. After an update you may need to turn it off and on again.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(8)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.orange.opacity(0.15)))
+            }
             Divider()
             HStack {
-                Text("Nearby Devices").font(.caption).foregroundStyle(.secondary)
+                Text("Devices").font(.caption).foregroundStyle(.secondary)
                 Spacer()
                 if model.btScanning { ProgressView().controlSize(.small) }
             }

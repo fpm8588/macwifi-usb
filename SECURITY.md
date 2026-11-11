@@ -27,6 +27,17 @@
   protection), and only accepts encrypted key data. Once keys are installed, unencrypted data frames from the air
   are dropped.
 
+## Bluetooth keyboards and mice
+
+- Pairing uses Secure Simple Pairing; the Bluetooth chip does the cryptography. The resulting link keys are kept
+  in `bt_paired` next to the Wi-Fi keys, root-only (0600). "Forget This Device" deletes the key.
+- Only paired devices may connect to the adapter; the adapter is connectable but never discoverable.
+- Key presses travel from macwifid to the MacWifi menu app over the control socket (root:admin 0660), which posts
+  them into your session; that needs MacWifi in Privacy & Security › Accessibility. Any administrator account on
+  the Mac could read that stream, the same way it could read the service's other data.
+- Neither the service nor the app logs key presses or report contents (only the kind of device and, for reports
+  it can't decode, the report ID and length).
+
 ## Privileges
 
 - `macwifid` runs as root: creating a network interface, reading BPF and changing network preferences require

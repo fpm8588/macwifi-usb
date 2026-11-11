@@ -5,6 +5,12 @@
 **New**
 - Bluetooth, phase B1: `macwifictl bt` opens the adapter's own Bluetooth controller from user space (no kext),
   identifies it and lists nearby Bluetooth LE and classic devices. Plan: `docs/BLUETOOTH_PROMPT.md`.
+- Bluetooth keyboards and mice (phases B3/B4, classic Bluetooth): click a device in the Bluetooth tab to
+  connect. Pairing uses Secure Simple Pairing (keyboards show a 6-digit code to type), the HID control and
+  interrupt channels open in boot protocol, and the menu app turns key presses, pointer movement, clicks and the
+  wheel into macOS events (needs Accessibility permission). Several devices at once; paired devices reconnect by
+  themselves; Forget removes the key. Bluetooth LE devices can be seen but not connected yet.
+- Bluetooth scan: Extended Inquiry Result events were masked off, so modern classic devices never appeared.
 - Bluetooth, phase B2: the service runs the Bluetooth controller (its own thread, closed before sleep within the
   same 3 s budget), and the menu has Wi-Fi and Bluetooth tabs: Bluetooth on/off, controller status, nearby
   devices with type icons and signal, Scan Again. Connecting comes with the next phases. Control socket verbs
