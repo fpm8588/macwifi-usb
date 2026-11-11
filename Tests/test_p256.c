@@ -119,6 +119,19 @@ static void test_openssl(void) {
         BN_bn2binpad(sum, ws, 32);
         if (memcmp(ms, ws, 32)) bad++;
         BN_free(a); BN_free(sum);
+        // 48-byte reduction mod p agrees with BN_mod
+        {
+            uint8_t w[48], got[32], want48[32];
+            for (int i = 0; i < 48; i++) w[i] = (uint8_t)rand();
+            if (it % 7 == 0) memset(w, 0xff, 48);
+            BIGNUM *bw = BN_bin2bn(w, 48, NULL), *p = BN_new(), *rr = BN_new();
+            EC_GROUP_get_curve(g, p, NULL, NULL, ctx);
+            BN_mod(rr, bw, p, ctx);
+            BN_bn2binpad(rr, want48, 32);
+            p256_reduce48(w, got);
+            if (memcmp(got, want48, 32)) bad++;
+            BN_free(bw); BN_free(p); BN_free(rr);
+        }
         // y from x agrees with OpenSSL's decompression
         uint8_t yb[32];
         int q = p256_y_from_x(mq.x, yb);

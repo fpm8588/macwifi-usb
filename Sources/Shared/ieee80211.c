@@ -104,7 +104,10 @@ int wifi_parse_bss(const uint8_t *f, size_t len, WifiBss *b) {
                 b->ssid_len = n;
                 break;
             case 1: case 50:                            // (Extended) Supported Rates: membership selectors
-                for (uint8_t i = 0; i < n; i++) if (p[i] == (0x80 | 123)) b->sae_h2e_only = true;
+                for (uint8_t i = 0; i < n; i++) if (p[i] == (0x80 | 123)) b->sae_h2e_only = b->sae_h2e = true;
+                break;
+            case 244:                                   // RSN Extension: bit 5 = SAE hash-to-element
+                if (n >= 1 && (p[0] & 0x20)) b->sae_h2e = true;
                 break;
             case 3:                                     // DS Parameter Set
                 if (n >= 1) { b->channel = p[0]; have_ds = true; }

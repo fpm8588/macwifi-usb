@@ -39,6 +39,8 @@ typedef struct {
     int open;                   // no RSN, no privacy: open network
     int own_only_when_assoc, associated;
     int mode;                   // AP_WPA2 (default), AP_TRANSITION, AP_WPA3
+    int h2e;                    // 1: advertises H2E (RSNXE); 2: H2E only (also membership selector 123)
+    int saw_rsnxe_assoc, saw_rsnxe_msg2;
     int sae_reject, sae_token, fw_no_ext_auth;   // AP refuses SAE (status 77) / asks for a token / firmware never asks
     int sae_session;            // this association's PMK came from SAE
     Sae ap_sae;
@@ -199,11 +201,13 @@ static void beacon_result_for(const char *ssid, const uint8_t *bssid) {
     n += 12;
     size_t sl = strlen(ssid);
     f[n++] = 0; f[n++] = (uint8_t)sl; memcpy(f + n, ssid, sl); n += sl;
+    if (S.h2e == 2) { f[n++] = 1; f[n++] = 2; f[n++] = 0x8c; f[n++] = 0x80 | 123; }   // rates: 6 Mb/s, H2E-only selector
     f[n++] = 3; f[n++] = 1; f[n++] = 1;                     // channel 1
     if (!S.open) {
         gApRsnLen = ap_rsn(gApRsn);
         memcpy(f + n, gApRsn, gApRsnLen);
         n += gApRsnLen;
+        if (S.h2e) { f[n++] = 244; f[n++] = 1; f[n++] = 0x20; }   // RSNXE: SAE hash-to-element
     }
     uint8_t p[300] = {0};
     p[0] = (uint8_t)n; p[1] = (uint8_t)(n >> 8);
@@ -265,7 +269,26 @@ static void ap_on_auth(const uint8_t *body, size_t n) {
         }
         uint8_t commit[SAE_MAX_FRAME];
         memcpy(commit, body, n);
-        if (S.sae_token) {
+        int h2e_commit = body[4] == 126;
+        if (S.h2e == 2 && !h2e_commit) {                     // an H2E-only AP refuses hunting-and-pecking
+            uint8_t rej[6] = {3, 0, 1, 0, 1, 0};
+            in_auth(rej, sizeof rej);
+            return;
+        }
+        if (S.sae_token && h2e_commit) {                     // H2E: token in a container element after the element
+            if (n == 6 + 2 + 96) {
+                uint8_t req[8 + 3 + 16] = {3, 0, 1, 0, 76, 0, 19, 0, 255, 17, 93};
+                memset(req + 11, 0x5A, 16);
+                in_auth(req, sizeof req);
+                S.sae_commits--;
+                return;
+            }
+            int ok = n == 6 + 2 + 96 + 3 + 16 && body[104] == 255 && body[105] == 17 && body[106] == 93;
+            for (int i = 0; ok && i < 16; i++) ok = body[107 + i] == 0x5A;
+            if (!ok) { S.sae_frames_bad++; return; }
+            S.sae_token_ok = 1;
+            n = 6 + 2 + 96;
+        } else if (S.sae_token) {
             if (n == 6 + 2 + 96) {                             // no token yet: ask for one
                 uint8_t req[8 + 16] = {3, 0, 1, 0, 76, 0, 19, 0};
                 memset(req + 8, 0x5A, 16);
@@ -280,7 +303,8 @@ static void ap_on_auth(const uint8_t *body, size_t n) {
             memmove(commit + 8, commit + 24, 96);
             n -= 16;
         }
-        if (sae_start(&S.ap_sae, kBssid, kMac, (const uint8_t *)S.ap_pass, strlen(S.ap_pass), sim_rng)) return;
+        if (sae_start(&S.ap_sae, kBssid, kMac, (const uint8_t *)S.ap_pass, strlen(S.ap_pass), (const uint8_t *)S.ssid,
+                      strlen(S.ssid), h2e_commit, sim_rng)) return;
         size_t cl = sae_build_commit(&S.ap_sae, reply, sizeof reply);
         in_auth(reply, cl);
         if (sae_rx(&S.ap_sae, commit, n, S.ap_confirm, sizeof S.ap_confirm, &S.ap_confirm_len, &err, &wp) != SAE_EV_SEND)
@@ -330,11 +354,12 @@ static void on_msg(uint16_t id, const uint8_t *p, uint16_t plen) {
             wpa_build_rsn_ie(rsn, sizeof rsn);
             wpa_build_rsn_ie_sae(rsn3, sizeof rsn3);
             int want_sae = plen == 320 && p[59] == 3;
+            S.saw_rsnxe_assoc = want_sae && p[54] == 31 && p[64 + 28] == 244 && p[64 + 29] == 1 && p[64 + 30] == 0x20;
             S.connect_req_ok = plen == 320 && p[0] == strlen(S.ssid) && !memcmp(p + 1, S.ssid, p[0]) &&
                                !memcmp(p + 34, kBssid, 6) && p[40] == 0x6c && p[41] == 0x09 && p[42] == 0 &&
                                p[52] == 0x88 && p[53] == 0x8E && p[60] == 1 && p[61] == 0 &&
                                (S.open ? p[48] == 0 && p[54] == 0 && p[64] == 0
-                                : want_sae ? p[48] == 0x19 && p[54] == 28 && !memcmp(p + 64, rsn3, 28)
+                                : want_sae ? p[48] == 0x19 && (p[54] == 28 || S.saw_rsnxe_assoc) && !memcmp(p + 64, rsn3, 28)
                                            : p[48] == 9 && p[54] == 22 && p[59] == 0 && !memcmp(p + 64, rsn, 22));
             in_msg(AIC_SM_CONNECT_CFM, r, 4);
             S.sae_session = 0;
@@ -456,6 +481,7 @@ static void on_data(const uint8_t *b, size_t n) {
                 wpa_pmk_from_passphrase(S.ap_pass, (const uint8_t *)S.ssid, strlen(S.ssid), S.pmk);
                 wpa_derive_ptk(S.pmk, kBssid, kMac, S.anonce, spa_nonce, S.ptk);
             }
+            S.saw_rsnxe_msg2 = k.key_data_len == 31 && k.key_data[28] == 244 && k.key_data[30] == 0x20;
             if (!mic_ok(payload, k.frame_len)) {
                 S.msg2_bad++;
                 S.associated = 0;
@@ -1032,7 +1058,33 @@ int main(void) {
     unsetenv("MACWIFI_NO_WPA3");
     CHECK(rc == 0 && S.connects == 1 && S.sae_commits == 0 && S.msg2_ok == 1 && S.connect_req_ok);
 
-    printf("---- WPA2 with required PMF, and WPA3 hash-to-element only: not offered\n");
+    printf("---- WPA3 hash-to-element only (with an anti-clogging token), like the school's networks\n");
+    reset("SchoolNet", "correct horse battery");
+    S.mode = AP_WPA3;
+    S.h2e = 2;
+    S.sae_token = 1;
+    gPass = "correct horse battery";
+    rc = sim_run("SchoolNet", 1);
+    CHECK(rc == 0 && S.connects == 1 && S.connect_req_ok && S.saw_rsnxe_assoc && S.saw_rsnxe_msg2);
+    CHECK(S.sae_ok == 1 && S.sae_token_ok && S.sae_session && S.igtk_ok && S.dhcp_seen >= 1 && S.sae_frames_bad == 0);
+
+    printf("---- WPA3 hash-to-element only: wrong password\n");
+    reset("SchoolNet", "correct horse battery");
+    S.mode = AP_WPA3;
+    S.h2e = 2;
+    gPass = "incorrect horse battery";
+    rc = sim_run("SchoolNet", 1);
+    CHECK(rc == 1 && S.sae_bad == 1 && S.sae_ok == 0 && S.dhcp_seen == 0);
+
+    printf("---- transition network that also offers H2E: H2E is used\n");
+    reset("ExampleNet", "correct horse battery");
+    S.mode = AP_TRANSITION;
+    S.h2e = 1;
+    gPass = "correct horse battery";
+    rc = sim_run("ExampleNet", 1);
+    CHECK(rc == 0 && S.sae_ok == 1 && S.saw_rsnxe_assoc && S.saw_rsnxe_msg2 && S.connects == 1);
+
+    printf("---- what can be joined\n");
     {
         WifiBss b;
         memset(&b, 0, sizeof b);
@@ -1043,7 +1095,7 @@ int main(void) {
         b.rsn_ie_len = 28;
         CHECK(bss_usable(&b, &sec, &why) == 1 && bss_can_sae(&b) && !bss_can_psk(&b));
         b.sae_h2e_only = 1;
-        CHECK(bss_usable(&b, &sec, &why) == 0 && strstr(why, "hash-to-element"));
+        CHECK(bss_usable(&b, &sec, &why) == 1 && bss_sae_h2e(&b));
         b.sae_h2e_only = 0;
         b.rsn_mgmt_bip_cmac = 0;                              // e.g. BIP-GMAC-256
         CHECK(bss_usable(&b, &sec, &why) == 0);

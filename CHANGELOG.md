@@ -14,7 +14,9 @@ The first release meant for other people: install a package, pick a network from
 - 5 GHz is preferred over 2.4 GHz unless it's clearly weaker.
 - **WPA3-Personal (SAE)**, including WPA3-only networks and WPA2/WPA3 transition networks (WPA3 first, WPA2 as
   the fallback), with management frame protection (the chip gets the BIP integrity key). Own SAE and P-256 code,
-  checked against the IEEE 802.11-2020 test vector and OpenSSL. Simulated only so far: not yet run on an adapter.
+  checked against the IEEE 802.11-2020 test vectors and OpenSSL. Both password-element methods: hunting-and-pecking
+  and hash-to-element (H2E), which access points that advertise it (RSNXE) or require it (many school and
+  enterprise-managed WPA3-Personal networks) get. Simulated only so far: not yet run on an adapter.
   For networks that offer WPA3 the password itself is remembered (root-only file), since WPA3 needs it at every
   sign-in; entries remembered before this version keep using WPA2 until the password is entered again.
 - Open (password-less) networks.
@@ -35,7 +37,7 @@ The first release meant for other people: install a package, pick a network from
 
 **Known limitations**
 - Tested on one Mac (macOS 27) with a UGREEN AX900 so far.
-- Not yet: WPA3 hash-to-element-only networks, WPA2 with required PMF, enterprise, WEP, hidden networks, 6 GHz, roaming between
+- Not yet: WPA2 with required PMF, enterprise, WEP, hidden networks, 6 GHz, roaming between
   access points while connected, regulatory country selection. Untested: IPv6, access points on DFS channels.
 - The package is ad-hoc signed: right-click → Open, or `sudo installer -pkg …`.
 

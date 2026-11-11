@@ -10,8 +10,8 @@
   the key is derived. For a network that offers WPA3 the password itself is stored as well (hex-encoded, not
   encrypted): SAE runs a fresh password-authenticated exchange at every sign-in, so there is no long-lived key to
   keep instead. Treat the file like saved passwords; "Forget This Network" and the uninstaller delete it.
-- **WPA3 (SAE)** is our own implementation (`Sources/Shared/sae.c`, group 19, hunting-and-pecking with a fixed 40
-  rounds) on our own P-256 arithmetic (`Sources/Shared/p256.c`): macOS offers no public API for the raw curve
+- **WPA3 (SAE)** is our own implementation (`Sources/Shared/sae.c`, group 19; hunting-and-pecking with a fixed 40
+  rounds, or hash-to-element through the simplified SWU map when the access point advertises it) on our own P-256 arithmetic (`Sources/Shared/p256.c`): macOS offers no public API for the raw curve
   operations SAE needs, and the project takes no third-party dependencies. It is checked against the IEEE
   802.11-2020 Annex J.10 test vector and, in tests, against OpenSSL. Scalar multiplication runs a fixed number of
   steps, but the code has not been audited for side channels the way wpa_supplicant's has; an attacker who can

@@ -43,6 +43,15 @@ void p256_scalar_add(uint8_t r[32], const uint8_t a[32], const uint8_t b[32]);  
 // y := p - y (the other square root).
 void p256_field_neg(uint8_t r[32], const uint8_t a[32]);
 
+// For SAE hash-to-element (IEEE 802.11-2020 §12.4.4.2.3):
+// a 48-byte big-endian value reduced modulo p;
+void p256_reduce48(const uint8_t in[48], uint8_t out[32]);
+// the simplified SWU map of u (< p) onto the curve, with z = -10 (as for group 19), the sign of y chosen to match
+// the low bit of u;
+int p256_sswu(const uint8_t u[32], P256Point *out);
+// out = (v mod (n - 1)) + 1, for any 256-bit v.
+void p256_scalar_mod_nm1_plus1(const uint8_t v[32], uint8_t out[32]);
+
 #ifdef __cplusplus
 }
 #endif

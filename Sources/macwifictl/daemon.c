@@ -57,7 +57,7 @@ typedef enum { DC_NONE, DC_SCAN, DC_JOIN, DC_DISCONNECT, DC_FORGET, DC_POWER } D
 typedef struct {
     uint8_t ssid[32];
     uint8_t ssid_len;
-    int rssi, freq, secured, usable, known, sae, sae_only;
+    int rssi, freq, secured, usable, known, sae, sae_only, akm_sae, akm_psk;
     const char *why;
     double seen;              // when a scan last saw it
 } NetView;
@@ -206,7 +206,9 @@ static void reply_networks(Daemon *d, JsonOut *j) {
         jo_int(j, "rssi", v->rssi);
         jo_int(j, "freq", v->freq);
         jo_bool(j, "secured", v->secured);
-        jo_str(j, "security", !v->secured ? "open" : v->sae ? (v->sae_only ? "wpa3" : "wpa2/wpa3") : "wpa2");
+        jo_str(j, "security", !v->secured ? "open"
+                              : v->akm_sae ? (v->akm_psk ? "wpa2/wpa3" : "wpa3")
+                              : v->akm_psk ? "wpa2" : "other");
         jo_bool(j, "usable", v->usable);
         jo_bool(j, "known", kn_find(&d->known, v->ssid, v->ssid_len) != NULL);   // as of now, not the scan
         if (!v->usable) jo_str(j, "why", v->why);
@@ -445,6 +447,8 @@ static void d_publish_scan(Daemon *d, const ScanList *sl) {
         v->freq = e->freq;
         v->secured = sec;
         v->sae = bss_can_sae(&e->bss);
+        v->akm_sae = e->bss.rsn_akm_sae;
+        v->akm_psk = e->bss.security == WIFI_SEC_WPA2_PSK || e->bss.security == WIFI_SEC_WPA2_WPA3;
         v->sae_only = v->sae && !bss_can_psk(&e->bss);
         v->usable = usable;
         v->why = why;

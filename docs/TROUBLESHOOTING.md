@@ -42,8 +42,8 @@ through a firmware load). Unplugging resets it completely; the service picks it 
 
 ## A network I can see in the Mac's own Wi-Fi menu is missing or greyed out
 
-- Greyed out: its security isn't supported yet; hover over it for the reason. Enterprise networks, WPA3 networks
-  that only accept "hash-to-element", and WPA2 networks that require PMF fall in this group.
+- Greyed out: its security isn't supported yet; hover over it for the reason. Enterprise (802.1X) networks and WPA2
+  networks that require PMF fall in this group.
 - Missing: hidden networks aren't listed, and 6 GHz and 5 GHz channels above 165 aren't scanned.
 - While connected, the list keeps networks seen in the last three minutes; click **Scan Again**.
 

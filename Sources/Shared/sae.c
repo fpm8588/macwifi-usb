@@ -51,6 +51,64 @@ static int derive_pwe(P256Point *pwe, const uint8_t a[6], const uint8_t b[6], co
     return p256_on_curve(pwe) ? 0 : -1;
 }
 
+// RFC 5869 HKDF-Expand with HMAC-SHA256.
+static int hkdf_expand(const uint8_t prk[32], const char *info, uint8_t *out, size_t len) {
+    uint8_t t[32], m[32 + 64 + 1];
+    size_t il = strlen(info), tl = 0, done = 0;
+    if (il > 64) return -1;
+    for (uint8_t i = 1; done < len; i++) {
+        size_t n = 0;
+        memcpy(m, t, tl); n += tl;
+        memcpy(m + n, info, il); n += il;
+        m[n++] = i;
+        if (mw_hmac_sha256(prk, 32, m, n, t)) return -1;
+        tl = 32;
+        size_t take = len - done < 32 ? len - done : 32;
+        memcpy(out + done, t, take);
+        done += take;
+    }
+    wipe(t, sizeof t);
+    wipe(m, sizeof m);
+    return 0;
+}
+
+int sae_derive_pt(const uint8_t *ssid, size_t ssid_len, const uint8_t *password, size_t pw_len, const char *identifier,
+                  P256Point *pt) {
+    uint8_t ikm[256 + 64], seed[32], val[48], u[32];
+    size_t il = identifier ? strlen(identifier) : 0;
+    if (!pw_len || pw_len > 256 || il > 64 || ssid_len > 32) return -1;
+    memcpy(ikm, password, pw_len);
+    if (il) memcpy(ikm + pw_len, identifier, il);
+    // pwd-seed = HKDF-Extract(salt = SSID, password [|| identifier])
+    int r = mw_hmac_sha256(ssid, ssid_len, ikm, pw_len + il, seed);
+    P256Point p1, p2;
+    static const char *const labels[2] = {"SAE Hash to Element u1 P1", "SAE Hash to Element u2 P2"};
+    for (int k = 0; k < 2 && !r; k++) {
+        r = hkdf_expand(seed, labels[k], val, sizeof val);   // len = olen(p) + ceil(olen(p)/2) = 48
+        if (!r) {
+            p256_reduce48(val, u);
+            r = p256_sswu(u, k ? &p2 : &p1);
+        }
+    }
+    if (!r) r = p256_add(pt, &p1, &p2);
+    if (!r && (pt->inf || !p256_on_curve(pt))) r = -1;
+    wipe(ikm, sizeof ikm); wipe(seed, sizeof seed); wipe(val, sizeof val); wipe(u, sizeof u);
+    wipe(&p1, sizeof p1); wipe(&p2, sizeof p2);
+    return r;
+}
+
+int sae_pwe_from_pt(const P256Point *pt, const uint8_t a[6], const uint8_t b[6], P256Point *pwe) {
+    uint8_t addrs[12], zero[32] = {0}, h[32], val[32];
+    int a_bigger = memcmp(a, b, 6) > 0;
+    memcpy(addrs, a_bigger ? a : b, 6);
+    memcpy(addrs + 6, a_bigger ? b : a, 6);
+    if (mw_hmac_sha256(zero, 32, addrs, 12, h)) return -1;   // val = H(0^32, MAX || MIN)
+    p256_scalar_mod_nm1_plus1(h, val);                         // val mod (q - 1) + 1
+    int r = p256_mul(pwe, val, pt);
+    wipe(val, sizeof val);
+    return r || pwe->inf || !p256_on_curve(pwe) ? -1 : 0;
+}
+
 static int make_commit(Sae *s, const uint8_t rand[32], const uint8_t mask[32]) {
     if (!p256_scalar_ok(rand) || !p256_scalar_ok(mask)) return -1;
     memcpy(s->rand, rand, 32);
@@ -74,11 +132,21 @@ int sae_start_with(Sae *s, const uint8_t own[6], const uint8_t peer[6], const ui
     return make_commit(s, rand, mask);
 }
 
-int sae_start(Sae *s, const uint8_t own[6], const uint8_t peer[6], const uint8_t *password, size_t pw_len, SaeRng rng) {
+int sae_start(Sae *s, const uint8_t own[6], const uint8_t peer[6], const uint8_t *password, size_t pw_len,
+              const uint8_t *ssid, size_t ssid_len, int h2e, SaeRng rng) {
     memset(s, 0, sizeof *s);
     memcpy(s->own, own, 6);
     memcpy(s->peer, peer, 6);
-    if (derive_pwe(&s->pwe, own, peer, password, pw_len) != 0) return -1;
+    s->h2e = h2e;
+    if (h2e) {
+        P256Point pt;
+        int r = sae_derive_pt(ssid, ssid_len, password, pw_len, NULL, &pt);
+        if (!r) r = sae_pwe_from_pt(&pt, own, peer, &s->pwe);
+        wipe(&pt, sizeof pt);
+        if (r) return -1;
+    } else if (derive_pwe(&s->pwe, own, peer, password, pw_len) != 0) {
+        return -1;
+    }
     uint8_t rand[32], mask[32];
     int r = -1;
     for (int tries = 0; tries < 100 && r != 0; tries++) {
@@ -92,17 +160,24 @@ int sae_start(Sae *s, const uint8_t own[6], const uint8_t peer[6], const uint8_t
 }
 
 size_t sae_build_commit(const Sae *s, uint8_t *out, size_t cap) {
-    size_t n = 6 + 2 + s->token_len + 32 + 64;
+    size_t n = 6 + 2 + s->token_len + 32 + 64 + (s->h2e && s->token_len ? 3 : 0);
     if (s->state == SAE_IDLE || s->state == SAE_FAILED || n > cap) return 0;
     put_le16(out, SAE_AUTH_ALG);
     put_le16(out + 2, 1);
-    put_le16(out + 4, 0);
+    put_le16(out + 4, s->h2e ? SAE_STATUS_H2E : 0);
     put_le16(out + 6, 19);
     size_t o = 8;
-    if (s->token_len) { memcpy(out + o, s->token, s->token_len); o += s->token_len; }
+    if (s->token_len && !s->h2e) { memcpy(out + o, s->token, s->token_len); o += s->token_len; }
     memcpy(out + o, s->scalar, 32); o += 32;
     memcpy(out + o, s->element.x, 32); o += 32;
     memcpy(out + o, s->element.y, 32); o += 32;
+    if (s->token_len && s->h2e) {                           // Anti-Clogging Token Container element
+        out[o++] = 255;
+        out[o++] = (uint8_t)(1 + s->token_len);
+        out[o++] = 93;
+        memcpy(out + o, s->token, s->token_len);
+        o += s->token_len;
+    }
     return o;
 }
 
@@ -169,21 +244,28 @@ int sae_rx(Sae *s, const uint8_t *a, size_t len, uint8_t *reply, size_t cap, siz
     size_t n = len - 6;
 
     if (seq == 1 && s->state == SAE_COMMITTED) {
-        if (status == 76) {                                  // anti-clogging token required: group, token
-            if (n < 2 || le16(body) != 19 || n - 2 == 0 || n - 2 > sizeof s->token) {
+        if (status == SAE_STATUS_TOKEN) {                    // anti-clogging token required: group, token
+            const uint8_t *tok = body + 2;
+            size_t tl = n >= 2 ? n - 2 : 0;
+            if (s->h2e) {                                    // H2E: the token comes in a container element
+                if (tl < 3 || tok[0] != 255 || tok[2] != 93 || tok[1] < 2 || (size_t)tok[1] + 2 > tl) tl = 0;
+                else { tl = (size_t)tok[1] - 1; tok += 3; }
+            }
+            if (n < 2 || le16(body) != 19 || tl == 0 || tl > sizeof s->token) {
                 *err = "bad SAE anti-clogging token request";
                 s->state = SAE_FAILED;
                 return -1;
             }
-            s->token_len = n - 2;
-            memcpy(s->token, body + 2, s->token_len);
+            s->token_len = tl;
+            memcpy(s->token, tok, tl);
             *reply_len = sae_build_commit(s, reply, cap);
             return *reply_len ? SAE_EV_SEND : -1;
         }
-        if (status != 0) {
+        if (status != (s->h2e ? SAE_STATUS_H2E : 0)) {
             *err = status == 77 ? "the access point doesn't accept SAE group 19"
-                 : status == 126 ? "the access point insists on SAE hash-to-element (not supported yet)"
-                                 : "the access point rejected the SAE commit";
+                 : status == SAE_STATUS_H2E ? "the access point answered with SAE hash-to-element unexpectedly"
+                 : status == 0 && s->h2e ? "the access point answered without SAE hash-to-element"
+                                         : "the access point rejected the SAE commit";
             s->state = SAE_FAILED;
             return -1;
         }
@@ -224,7 +306,7 @@ int sae_rx(Sae *s, const uint8_t *a, size_t len, uint8_t *reply, size_t cap, siz
         return SAE_EV_DONE;
     }
 
-    if (status != 0 && (s->state == SAE_COMMITTED || s->state == SAE_CONFIRMED)) {
+    if (status != 0 && status != SAE_STATUS_H2E && (s->state == SAE_COMMITTED || s->state == SAE_CONFIRMED)) {
         *err = "the access point rejected SAE authentication";
         *wrong_password = s->state == SAE_CONFIRMED;
         s->state = SAE_FAILED;

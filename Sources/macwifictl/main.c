@@ -1177,7 +1177,7 @@ typedef struct {
     // WPA3 (SAE): the firmware hands authentication to us (SM_EXTERNAL_AUTH_REQUIRED_IND); Authentication frames
     // go out through the management TX path and come back on the data path flagged as 802.11 MPDUs
     Sae sae;
-    int sae_active, ext_auth, sae_done, sae_failed, sae_wrong, used_sae;
+    int sae_active, ext_auth, sae_done, sae_failed, sae_wrong, used_sae, sae_h2e;
     char sae_err[120];
     uint8_t sae_tx[SAE_MAX_FRAME];
     size_t sae_tx_len;
@@ -1657,22 +1657,23 @@ static void print_ip(const char *label, const uint8_t a[4]) {
 // ---------------------------------------------------------------- reusable steps (CLI connect/join and macwifid)
 
 // What we can join: open networks; WPA2-PSK with CCMP for both keys (and no required PMF); WPA3-Personal (SAE,
-// group 19, hunting-and-pecking) with CCMP and management frame protection (BIP-CMAC-128).
+// group 19, hunting-and-pecking or hash-to-element) with CCMP and management frame protection (BIP-CMAC-128).
 static int bss_can_psk(const WifiBss *b) {
     return b->security != WIFI_SEC_OPEN && b->rsn_akm_psk && !b->rsn_pmf_required && b->rsn_ccmp && b->rsn_group_ccmp &&
            b->rsn_ie_len >= 2;
 }
 static int bss_can_sae(const WifiBss *b) {
     return b->security != WIFI_SEC_OPEN && b->rsn_akm_sae && b->rsn_pmf_capable && b->rsn_mgmt_bip_cmac && b->rsn_ccmp &&
-           b->rsn_group_ccmp && b->rsn_ie_len >= 2 && !b->sae_h2e_only;
+           b->rsn_group_ccmp && b->rsn_ie_len >= 2;
 }
+// SAE with hash-to-element whenever the access point advertises it (as wpa_supplicant's sae_pwe=2 does).
+static int bss_sae_h2e(const WifiBss *b) { return b->sae_h2e || b->sae_h2e_only; }
 // `why` gets a short reason when not.
 static int bss_usable(const WifiBss *b, int *secured, const char **why) {
     *secured = b->security != WIFI_SEC_OPEN;
     if (b->security == WIFI_SEC_OPEN) { *why = "open"; return 1; }
     if (bss_can_sae(b)) { *why = bss_can_psk(b) ? "usable (WPA3, or WPA2)" : "usable (WPA3)"; return 1; }
     if (bss_can_psk(b)) { *why = "usable"; return 1; }
-    if (b->rsn_akm_sae && b->sae_h2e_only) { *why = "WPA3 with hash-to-element only (not supported yet)"; return 0; }
     if (b->rsn_akm_sae && !b->rsn_akm_psk) { *why = "WPA3 with settings that aren't supported yet"; return 0; }
     if (!b->rsn_akm_psk) { *why = "needs enterprise sign-in or WEP (not supported)"; return 0; }
     if (b->rsn_pmf_required) { *why = "WPA2 with required PMF (not supported yet)"; return 0; }
@@ -1750,7 +1751,8 @@ static void sae_rng(uint8_t *out, size_t n) { arc4random_buf(out, n); }
 
 // The SAE exchange, once the firmware has asked for it. On success the PMK is in ws->pmk and the firmware has been
 // told to go on (it associates next).
-static JoinResult run_sae(Conn *c, WpaSupplicant *ws, const char *pass, size_t pass_len, char *err, size_t errcap) {
+static JoinResult run_sae(Conn *c, WpaSupplicant *ws, const char *pass, size_t pass_len, const uint8_t *ssid,
+                          size_t ssid_len, char *err, size_t errcap) {
     double t0 = now_s();
     pump(c, 8000, w_ext_auth);
     if (!c->ext_auth) {
@@ -1761,14 +1763,14 @@ static JoinResult run_sae(Conn *c, WpaSupplicant *ws, const char *pass, size_t p
             snprintf(err, errcap, "the firmware didn't ask for WPA3 (SAE) sign-in");
         return gStop ? JOIN_STOPPED : JOIN_FW;
     }
-    if (sae_start(&c->sae, c->mac, c->bssid, (const uint8_t *)pass, pass_len, sae_rng) != 0) {
+    if (sae_start(&c->sae, c->mac, c->bssid, (const uint8_t *)pass, pass_len, ssid, ssid_len, c->sae_h2e, sae_rng) != 0) {
         snprintf(err, errcap, "couldn't prepare the WPA3 (SAE) exchange");
         return JOIN_FW;
     }
     c->sae_active = 1;
     c->sae_tx_len = sae_build_commit(&c->sae, c->sae_tx, sizeof c->sae_tx);
     conn_send_auth(c, c->sae_tx, c->sae_tx_len);
-    printf("  SAE: commit sent\n");
+    printf("  SAE: commit sent (%s)\n", c->sae_h2e ? "hash-to-element" : "hunting-and-pecking");
     fflush(stdout);
     double last = now_s();
     for (int tries = 1; !c->sae_done && !c->sae_failed && !c->disconnected && !gStop && now_s() - t0 < 12;) {
@@ -1826,11 +1828,19 @@ static JoinResult conn_associate(Conn *c, const ScanEntry *best, const uint8_t *
     c->open_net = ws == NULL;
     int sae = ws && sae_pass;
     c->used_sae = sae;
+    c->sae_h2e = sae && bss_sae_h2e(&best->bss);
     if (ws) {
         memcpy(ws->aa, best->bss.bssid, 6);
         memcpy(ws->spa, c->mac, 6);
         ws->akm_sae = sae;
         ws->rsn_ie_len = sae ? wpa_build_rsn_ie_sae(ws->rsn_ie, sizeof ws->rsn_ie) : wpa_build_rsn_ie(ws->rsn_ie, sizeof ws->rsn_ie);
+        if (c->sae_h2e) {
+            // RSN Extension element saying we use H2E: in the association request and, as wpa_supplicant does,
+            // next to the RSN element in message 2 of the 4-way handshake.
+            static const uint8_t rsnxe[3] = {244, 1, 0x20};
+            memcpy(ws->rsn_ie + ws->rsn_ie_len, rsnxe, 3);
+            ws->rsn_ie_len += 3;
+        }
         // Keep our own copy: `best` lives in a scan list that the next scan (e.g. the menu's) overwrites, and a
         // later 4-way handshake (PTK rekey) checks message 3 against this element.
         memcpy(c->ap_rsn, best->bss.rsn_ie, best->bss.rsn_ie_len);
@@ -1862,7 +1872,7 @@ static JoinResult conn_associate(Conn *c, const ScanEntry *best, const uint8_t *
         return JOIN_FW;
     }
     if (sae) {
-        JoinResult sr = run_sae(c, ws, sae_pass, sae_pass_len, err, errcap);
+        JoinResult sr = run_sae(c, ws, sae_pass, sae_pass_len, ssid, ssid_len, err, errcap);
         if (sr != JOIN_OK) return sr;
     }
     pump(c, 10000, w_assoc);

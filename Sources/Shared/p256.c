@@ -359,3 +359,86 @@ void p256_scalar_add(uint8_t r[32], const uint8_t a[32], const uint8_t b[32]) {
     mod_add(&t, &x, &y, &gN);
     to_be(r, &t);
 }
+
+// ---------------------------------------------------------------- hash-to-element helpers
+
+void p256_reduce48(const uint8_t in[48], uint8_t out[32]) {
+    init();
+    uint8_t hb[32] = {0};
+    memcpy(hb + 16, in, 16);                      // high 128 bits
+    U hi = from_be(hb), lo = from_be(in + 16), hm, t;
+    to_mont(&hm, &hi, &gP);                       // hi * 2^256 mod p (hi < p)
+    uint64_t br = sub4(&t, &lo, &gP.m);           // lo < 2^256 < 2p: one subtraction reduces it
+    sel(&lo, 1 - br, &t, &lo);
+    mod_add(&t, &hm, &lo, &gP);
+    to_be(out, &t);
+}
+
+void p256_scalar_mod_nm1_plus1(const uint8_t v[32], uint8_t out[32]) {
+    init();
+    U x = from_be(v), m = gN.m, one = {{1, 0, 0, 0}}, t;
+    sub4(&m, &m, &one);                           // n - 1
+    uint64_t br = sub4(&t, &x, &m);               // v < 2^256 < 2(n - 1): one subtraction reduces it
+    sel(&x, 1 - br, &t, &x);
+    add4(&x, &x, &one);
+    to_be(out, &x);
+}
+
+static U mont_small_neg(uint64_t k) {             // (p - k) in Montgomery form
+    U v = gP.m, kk = {{k, 0, 0, 0}}, r;
+    sub4(&v, &v, &kk);
+    to_mont(&r, &v, &gP);
+    return r;
+}
+
+int p256_sswu(const uint8_t ub[32], P256Point *out) {
+    init();
+    U u = from_be(ub);
+    if (!lt(&u, &gP.m)) return -1;
+    U um, u2, z = mont_small_neg(10), a = mont_small_neg(3), t1, t2, m, t, e, two = {{2, 0, 0, 0}}, one = {{1, 0, 0, 0}};
+    to_mont(&um, &u, &gP);
+    FM(&u2, &um, &um);
+    FM(&t1, &z, &u2);                             // z u^2
+    FM(&t2, &t1, &t1);
+    FA(&m, &t1, &t2);                             // m = z^2 u^4 + z u^2
+    uint64_t m_zero = (uint64_t)is_zero(&m);
+    e = gP.m;
+    sub4(&e, &e, &two);
+    mpow(&t, &m, &e, &gP);                        // t = m^(p-2): 1/m, or 0 when m = 0
+    U za, inv, x1a, x1b, nb, x1, x2, gx1, gx2, chk;
+    FM(&za, &z, &a);
+    finv(&inv, &za);
+    FM(&x1a, &gBm, &inv);                         // b / (z a)
+    U zero = {{0, 0, 0, 0}}, ainv, tp1;
+    FS(&nb, &zero, &gBm);
+    finv(&ainv, &a);
+    FM(&x1b, &nb, &ainv);
+    FA(&tp1, &gP.one, &t);
+    FM(&x1b, &x1b, &tp1);                         // (-b/a)(1 + t)
+    sel(&x1, m_zero, &x1a, &x1b);
+    curve_rhs(&gx1, &x1);                         // x^3 + a x + b with a = -3
+    FM(&x2, &t1, &x1);                            // z u^2 x1
+    curve_rhs(&gx2, &x2);
+    e = gP.m;                                     // (p - 1) / 2
+    sub4(&e, &e, &one);
+    for (int i = 0; i < 3; i++) e.v[i] = (e.v[i] >> 1) | (e.v[i + 1] << 63);
+    e.v[3] >>= 1;
+    mpow(&chk, &gx1, &e, &gP);
+    uint64_t qr = (uint64_t)(is_zero(&chk) | equal(&chk, &gP.one));
+    U v, x, y, yn, ny;
+    sel(&v, qr, &gx1, &gx2);
+    sel(&x, qr, &x1, &x2);
+    e = gP.m;                                     // (p + 1) / 4
+    add4(&e, &e, &one);
+    for (int i = 0; i < 3; i++) e.v[i] = (e.v[i] >> 2) | (e.v[i + 1] << 62);
+    e.v[3] >>= 2;
+    mpow(&y, &v, &e, &gP);
+    from_mont(&yn, &y, &gP);
+    from_mont(&x, &x, &gP);
+    mod_sub(&ny, &zero, &yn, &gP);
+    sel(&yn, (uint64_t)((u.v[0] & 1) == (yn.v[0] & 1)), &yn, &ny);
+    memset(out, 0, sizeof *out);
+    to_be(out->x, &x);
+    to_be(out->y, &yn);
+    return p256_on_curve(out) ? 0 : -1;
+}

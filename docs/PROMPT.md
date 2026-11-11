@@ -243,7 +243,12 @@ TROUBLESHOOTING, PROTOCOL, SECURITY, CONTRIBUTING, CHANGELOG).
   `eapol.c` (key descriptor version 0, IGTK KDE, RSN element with AKM 8 + PMF + BIP).
 - Policy: WPA3 when the AP offers it and the password is known, WPA2 fallback on transition networks when SAE
   fails for a non-password reason; password stored (root-only) only for networks that offer WPA3.
-- Not done: hash-to-element (H2E; H2E-only APs are shown as unsupported), PMKSA caching, SAE-PK, other groups.
+- Hash-to-element (added the same day after a school's H2E-only networks showed up as unsupported): PT =
+  SSWU(HKDF(SSID, password, "…u1 P1")) + SSWU(…"u2 P2"), z = -10; PWE = (H(0, MAX||MIN) mod (q-1) + 1) * PT;
+  commits with status 126, anti-clogging token in a container element (ext 93); RSNXE (244, 0x20) in the
+  association request and in message 2. Used whenever the AP's RSNXE bit 5 or membership selector 123 says so.
+  Annex J.10 PT/PWE vector passes.
+- Not done: PMKSA caching, SAE-PK, password identifiers, rejected-groups, groups other than 19.
 - To learn on the adapter: does the firmware send the IND and forward Authentication frames as assumed; does it
   take the BIP key (a refusal is logged and tolerated).
 

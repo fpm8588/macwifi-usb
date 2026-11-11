@@ -1,6 +1,8 @@
 // sae.h — SAE ("Simultaneous Authentication of Equals", the WPA3-Personal sign-in) for a station.
-// Original code (MIT), written from IEEE 802.11-2020 §12.4 (group 19 = NIST P-256, password element by
-// "hunting and pecking", §12.4.4.2.2). Checked against the standard's own test vector (Annex J.10).
+// Original code (MIT), written from IEEE 802.11-2020 §12.4 (group 19 = NIST P-256). The password element comes
+// either from "hunting and pecking" (§12.4.4.2.2) or from "hash-to-element" (H2E, §12.4.4.2.3: PT from the SSID
+// and password via HKDF and the simplified SWU map, then PWE = val * PT), which newer access points require.
+// Checked against the standard's own test vectors (Annex J.10) for both.
 //
 // SAE proves both sides know the password without sending anything an eavesdropper could test guesses against,
 // and yields a fresh PMK for the 4-way handshake. Exchange (802.11 Authentication frames, algorithm 3):
@@ -33,6 +35,7 @@ typedef enum { SAE_IDLE = 0, SAE_COMMITTED, SAE_CONFIRMED, SAE_ACCEPTED, SAE_FAI
 
 typedef struct {
     SaeState state;
+    int h2e;                 // hash-to-element: commits carry status 126, tokens travel in a container element
     uint8_t own[6], peer[6];
     P256Point pwe;
     uint8_t rand[32], scalar[32];
@@ -50,8 +53,17 @@ enum {
     SAE_EV_DONE = 2,     // authenticated: s->pmk and s->pmkid are valid
 };
 
-// Derives the password element for this pair of addresses and prepares our Commit. Returns 0 or -1.
-int sae_start(Sae *s, const uint8_t own[6], const uint8_t peer[6], const uint8_t *password, size_t pw_len, SaeRng rng);
+#define SAE_STATUS_H2E 126                    // WLAN_STATUS_SAE_HASH_TO_ELEMENT
+#define SAE_STATUS_TOKEN 76                   // WLAN_STATUS_ANTI_CLOGGING_TOKEN_REQ
+
+// Derives the password element for this pair of addresses and prepares our Commit. `h2e` selects hash-to-element
+// (then the SSID is part of the derivation). Returns 0 or -1.
+int sae_start(Sae *s, const uint8_t own[6], const uint8_t peer[6], const uint8_t *password, size_t pw_len,
+              const uint8_t *ssid, size_t ssid_len, int h2e, SaeRng rng);
+// H2E's password-dependent point PT (password identifier optional), and PWE from it for two addresses.
+int sae_derive_pt(const uint8_t *ssid, size_t ssid_len, const uint8_t *password, size_t pw_len, const char *identifier,
+                  P256Point *pt);
+int sae_pwe_from_pt(const P256Point *pt, const uint8_t a[6], const uint8_t b[6], P256Point *pwe);
 // Our Commit frame body (also used to retransmit). Returns its length, 0 on error.
 size_t sae_build_commit(const Sae *s, uint8_t *out, size_t cap);
 // Handles one Authentication frame body from the AP. Returns SAE_EV_* bits (0: ignored), or -1 with *err set;

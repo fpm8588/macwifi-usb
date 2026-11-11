@@ -23,7 +23,8 @@ uses it like any other connection.
 
 ## What works
 
-- WPA3-Personal (SAE) with management frame protection, WPA2-Personal, WPA2/WPA3 "transition" networks (WPA3 is
+- WPA3-Personal (SAE, both the original "hunting-and-pecking" and the newer "hash-to-element" password
+  derivation, used automatically when the access point advertises it) with management frame protection, WPA2-Personal, WPA2/WPA3 "transition" networks (WPA3 is
   used; WPA2 is the fallback) and open networks, 2.4 and 5 GHz, 802.11n/ac/ax access points. WPA3 is new and has
   only been run against a simulated access point so far.
 - Captive portals (hotel, café, airport "sign in to continue" pages): detected over the adapter, and the menu
@@ -35,8 +36,7 @@ uses it like any other connection.
   IPv6 is enabled too but hasn't been tested yet); it's placed after your other connections, so wired Ethernet
   or the built-in Wi-Fi still win when they're connected
 
-Not yet: WPA3 networks that insist on "hash-to-element" (H2E-only, mostly 6 GHz), WPA2 networks that require
-management frame protection, WPA2/WPA3-Enterprise, WEP, hidden networks, 6 GHz, roaming between access points of one network while connected, picking your regulatory
+Not yet: WPA2 networks that require management frame protection, WPA2/WPA3-Enterprise, WEP, hidden networks, 6 GHz, roaming between access points of one network while connected, picking your regulatory
 country (a worldwide channel set is used: channels 1–14 at 2.4 GHz and 36–165 at 5 GHz; access points on DFS
 radar channels 52–144 are scanned but joining them hasn't been tested). See [CHANGELOG.md](CHANGELOG.md).
 

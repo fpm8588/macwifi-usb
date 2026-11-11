@@ -53,17 +53,18 @@ static void test_vector(void) {
 }
 
 // One full exchange between a station and an "access point" instance. Returns 1 if both accepted with equal PMKs.
-static int exchange(const char *sta_pw, const char *ap_pw, int token, int *wrong) {
+static int exchange(const char *sta_pw, const char *ap_pw, int token, int h2e, int *wrong) {
     static const uint8_t sta[6] = {0x02, 0x11, 0x22, 0x33, 0x44, 0x55}, ap[6] = {0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01};
     Sae s, a;
     uint8_t c1[SAE_MAX_FRAME], c2[SAE_MAX_FRAME], r1[SAE_MAX_FRAME], r2[SAE_MAX_FRAME], tmp[SAE_MAX_FRAME];
     size_t n1, n2, l1 = 0, l2 = 0, tl = 0;
     const char *err = NULL;
     *wrong = 0;
-    if (sae_start(&s, sta, ap, (const uint8_t *)sta_pw, strlen(sta_pw), rng)) return 0;
-    if (sae_start(&a, ap, sta, (const uint8_t *)ap_pw, strlen(ap_pw), rng)) return 0;
+    if (sae_start(&s, sta, ap, (const uint8_t *)sta_pw, strlen(sta_pw), (const uint8_t *)"net", 3, h2e, rng)) return 0;
+    if (sae_start(&a, ap, sta, (const uint8_t *)ap_pw, strlen(ap_pw), (const uint8_t *)"net", 3, h2e, rng)) return 0;
     n1 = sae_build_commit(&s, c1, sizeof c1);
-    if (token) {   // AP asks for a token first; the station's second commit must carry it
+    if (c1[4] != (h2e ? 126 : 0)) return 0;
+    if (token && !h2e) {   // AP asks for a token first; the station's second commit must carry it
         uint8_t req[6 + 2 + 20] = {3, 0, 1, 0, 76, 0, 19, 0};
         memset(req + 8, 0xA5, 20);
         if (sae_rx(&s, req, sizeof req, tmp, sizeof tmp, &tl, &err, wrong) != SAE_EV_SEND) return 0;
@@ -71,6 +72,14 @@ static int exchange(const char *sta_pw, const char *ap_pw, int token, int *wrong
         n1 = tl - 20;                                        // what the AP parses: the commit without the token
         memmove(tmp + 8, tmp + 28, 96);
         memcpy(c1, tmp, n1);
+    } else if (token) {    // H2E: the token travels in an Anti-Clogging Token Container element, after the element
+        uint8_t req[6 + 2 + 3 + 20] = {3, 0, 1, 0, 76, 0, 19, 0, 255, 21, 93};
+        memset(req + 11, 0xA5, 20);
+        if (sae_rx(&s, req, sizeof req, tmp, sizeof tmp, &tl, &err, wrong) != SAE_EV_SEND) return 0;
+        if (tl != n1 + 23 || memcmp(tmp, c1, n1) || tmp[n1] != 255 || tmp[n1 + 1] != 21 || tmp[n1 + 2] != 93 ||
+            memcmp(tmp + n1 + 3, req + 11, 20)) return 0;
+        memcpy(c1, tmp, tl);
+        n1 = tl;                                             // the AP's parser skips the trailing element
     }
     n2 = sae_build_commit(&a, c2, sizeof c2);
     if (sae_rx(&a, c1, n1, r2, sizeof r2, &l2, &err, wrong) != SAE_EV_SEND) return 0;     // AP: commit in, confirm out
@@ -85,8 +94,21 @@ static int exchange(const char *sta_pw, const char *ap_pw, int token, int *wrong
 static void test_exchange(void) {
     int wp = 0;
     srand(21);
-    for (int i = 0; i < 5; i++) CHECK(exchange("correct horse battery", "correct horse battery", i & 1, &wp) == 1);
-    CHECK(exchange("incorrect horse battery", "correct horse battery", 0, &wp) == 0 && wp == 1);
+    for (int i = 0; i < 8; i++) CHECK(exchange("correct horse battery", "correct horse battery", i & 1, (i >> 1) & 1, &wp) == 1);
+    CHECK(exchange("incorrect horse battery", "correct horse battery", 0, 0, &wp) == 0 && wp == 1);
+    CHECK(exchange("incorrect horse battery", "correct horse battery", 0, 1, &wp) == 0 && wp == 1);
+    // H2E and hunting-and-pecking don't mix: a station using H2E rejects a reply without status 126
+    {
+        static const uint8_t sta[6] = {2, 1, 1, 1, 1, 1}, ap[6] = {2, 2, 2, 2, 2, 2};
+        Sae s, a;
+        uint8_t f[SAE_MAX_FRAME], rep[SAE_MAX_FRAME];
+        size_t rl;
+        const char *err = NULL;
+        sae_start(&s, sta, ap, (const uint8_t *)"pw-pw-pw", 8, (const uint8_t *)"net", 3, 1, rng);
+        sae_start(&a, ap, sta, (const uint8_t *)"pw-pw-pw", 8, (const uint8_t *)"net", 3, 0, rng);
+        size_t n = sae_build_commit(&a, f, sizeof f);
+        CHECK(sae_rx(&s, f, n, rep, sizeof rep, &rl, &err, &wp) == -1 && err && strstr(err, "hash-to-element"));
+    }
 
     // rejects: bad group, invalid element, scalar out of range, reflection, rejection statuses, short frames
     static const uint8_t sta[6] = {2, 1, 1, 1, 1, 1}, ap[6] = {2, 2, 2, 2, 2, 2};
@@ -96,8 +118,8 @@ static void test_exchange(void) {
     const char *err;
     for (int kind = 0; kind < 7; kind++) {
         Sae a;
-        sae_start(&s, sta, ap, (const uint8_t *)"pw-pw-pw", 8, rng);
-        sae_start(&a, ap, sta, (const uint8_t *)"pw-pw-pw", 8, rng);
+        sae_start(&s, sta, ap, (const uint8_t *)"pw-pw-pw", 8, (const uint8_t *)"net", 3, 0, rng);
+        sae_start(&a, ap, sta, (const uint8_t *)"pw-pw-pw", 8, (const uint8_t *)"net", 3, 0, rng);
         size_t n = sae_build_commit(&a, f, sizeof f);
         if (kind == 0) f[6] = 20;                              // group
         if (kind == 1) f[8 + 32 + 40] ^= 1;                    // element off the curve
@@ -111,16 +133,16 @@ static void test_exchange(void) {
         CHECK(sae_build_commit(&s, c, sizeof c) == 0);
     }
     // not SAE, wrong state: ignored
-    sae_start(&s, sta, ap, (const uint8_t *)"pw-pw-pw", 8, rng);
+    sae_start(&s, sta, ap, (const uint8_t *)"pw-pw-pw", 8, (const uint8_t *)"net", 3, 0, rng);
     uint8_t open[6] = {0, 0, 2, 0, 0, 0}, conf[40] = {3, 0, 2, 0, 0, 0};
     CHECK(sae_rx(&s, open, 6, rep, sizeof rep, &rl, &err, &wp) == 0);
     CHECK(sae_rx(&s, conf, 40, rep, sizeof rep, &rl, &err, &wp) == 0 && s.state == SAE_COMMITTED);   // confirm before commit
-    CHECK(sae_start(&s, sta, ap, (const uint8_t *)"", 0, rng) == -1);
+    CHECK(sae_start(&s, sta, ap, (const uint8_t *)"", 0, (const uint8_t *)"net", 3, 0, rng) == -1);
     // fuzz: random frames never crash or get accepted
     srand(5);
     int accepted = 0;
     for (int it = 0; it < 300; it++) {
-        if (it % 30 == 0) sae_start(&s, sta, ap, (const uint8_t *)"pw-pw-pw", 8, rng);
+        if (it % 30 == 0) sae_start(&s, sta, ap, (const uint8_t *)"pw-pw-pw", 8, (const uint8_t *)"net", 3, 0, rng);
         size_t n = (size_t)(rand() % 140);
         for (size_t i = 0; i < n; i++) f[i] = (uint8_t)rand();
         if (n > 6) { f[0] = 3; f[1] = 0; f[2] = (uint8_t)(1 + rand() % 2); f[3] = 0; f[4] = 0; f[5] = 0; f[6] = 19; f[7] = 0; }
@@ -128,6 +150,27 @@ static void test_exchange(void) {
         if (r > 0 && (r & SAE_EV_DONE)) accepted++;
     }
     CHECK(accepted == 0);
+}
+
+static void test_h2e_vector(void) {
+    P256Point pt, pwe;
+    CHECK(sae_derive_pt((const uint8_t *)"byteme", 6, (const uint8_t *)"mekmitasdigoat", 14, "psk4internet", &pt) == 0);
+    CHECK(sae_pwe_from_pt(&pt, kJ10_addr1b, kJ10_addr2b, &pwe) == 0);
+    CHECK(!memcmp(pwe.x, kJ10_pwe_19_x, 32) && !memcmp(pwe.y, kJ10_pwe_19_y, 32));
+    CHECK(sae_pwe_from_pt(&pt, kJ10_addr2b, kJ10_addr1b, &pwe) == 0 && !memcmp(pwe.x, kJ10_pwe_19_x, 32));
+    // a different SSID gives a different PT
+    P256Point pt2;
+    CHECK(sae_derive_pt((const uint8_t *)"bytemf", 6, (const uint8_t *)"mekmitasdigoat", 14, "psk4internet", &pt2) == 0 &&
+          memcmp(pt.x, pt2.x, 32) != 0);
+    // SSWU edge: u = 0 gives m = 0, which takes the exceptional branch and must still land on the curve
+    uint8_t zero[32] = {0}, u48[48];
+    P256Point q;
+    CHECK(p256_sswu(zero, &q) == 0 && p256_on_curve(&q));
+    CHECK(p256_sswu(kP256P, &q) == -1);
+    memset(u48, 0xff, 48);
+    uint8_t red[32];
+    p256_reduce48(u48, red);
+    CHECK(p256_lt_p(red));
 }
 
 static void test_kdf(void) {
@@ -145,6 +188,7 @@ static void test_kdf(void) {
 int main(void) {
     test_cmac();
     test_vector();
+    test_h2e_vector();
     test_exchange();
     test_kdf();
     printf("sae: %d checks, %d failures\n", checks, failures);
