@@ -322,6 +322,7 @@ final class PortalWindow: NSObject, NSWindowDelegate {
 // MARK: - Views
 
 struct NetworkRow: View {
+    static let height: CGFloat = 32
     @EnvironmentObject var model: Model
     let net: NetworkInfo
 
@@ -329,8 +330,10 @@ struct NetworkRow: View {
         let isCurrent = model.connectedSSID == net.ssid
         HStack(spacing: 8) {
             Image(systemName: "wifi", variableValue: Model.strength(net.rssi))
-                .frame(width: 18)
+                .font(.body)
+                .frame(width: 22)
             Text(net.ssid)
+                .font(.body)
                 .fontWeight(isCurrent ? .semibold : .regular)
                 .lineLimit(1)
             if model.joining == net.ssid { ProgressView().controlSize(.small) }
@@ -341,8 +344,9 @@ struct NetworkRow: View {
             if net.secured { Image(systemName: "lock.fill").font(.caption).foregroundStyle(.secondary) }
             if isCurrent { Image(systemName: "checkmark").font(.caption) }
         }
-        .padding(.vertical, 3)
-        .padding(.horizontal, 6)
+        .padding(.vertical, 5)
+        .padding(.horizontal, 8)
+        .frame(height: NetworkRow.height)
         .contentShape(Rectangle())
         .opacity(net.usable ? 1 : 0.45)
         .help(net.usable ? (net.known ? "Remembered network" : "") : (net.why ?? "Not supported yet"))
@@ -418,7 +422,9 @@ struct MenuView: View {
                         ForEach(model.networks) { NetworkRow(net: $0) }
                     }
                 }
-                .frame(maxHeight: 320)
+                // A MenuBarExtra window sizes a bare ScrollView to its minimum (one row),
+                // so give it a real height: every network up to ten rows, then scroll.
+                .frame(height: CGFloat(min(max(model.networks.count, 4), 10)) * NetworkRow.height)
             }
             Divider()
             HStack {
@@ -430,8 +436,8 @@ struct MenuView: View {
                 .font(.caption2)
                 .foregroundStyle(.tertiary)
         }
-        .padding(12)
-        .frame(width: 320)
+        .padding(14)
+        .frame(width: 380)
         .onAppear { model.refresh(); model.scan() }
     }
 }

@@ -96,6 +96,18 @@ build_app() {
     /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$app/Contents/Info.plist"
     swiftc -O -parse-as-library -target "arm64-apple-macos$MINOS" App/MacWifi/MacWifiApp.swift \
         -o "$app/Contents/MacOS/MacWifi"
+    # App icon: our own art (App/MacWifi/Icon/AppIcon.svg, rendered to AppIcon.png) packed into an .icns
+    # with tools that ship with macOS. The art already fills Apple's icon grid as a rounded square.
+    mkdir -p "$app/Contents/Resources"
+    local iconset="$B/AppIcon.iconset"
+    rm -rf "$iconset"; mkdir -p "$iconset"
+    local sz
+    for sz in 16 32 128 256 512; do
+        sips -z $sz $sz App/MacWifi/Icon/AppIcon.png --out "$iconset/icon_${sz}x${sz}.png" >/dev/null
+        sips -z $((sz*2)) $((sz*2)) App/MacWifi/Icon/AppIcon.png --out "$iconset/icon_${sz}x${sz}@2x.png" >/dev/null
+    done
+    iconutil -c icns "$iconset" -o "$app/Contents/Resources/AppIcon.icns"
+    rm -rf "$iconset"
     codesign --force --sign - "$app"
 }
 

@@ -9,6 +9,7 @@ The first release meant for other people: install a package, pick a network from
   joins the strongest remembered network, rejoins after drops, handles unplugging, Wi-Fi on/off.
 - MacWifi menu bar app: networks with signal bars, lock and band; join (password asked once); disconnect;
   forget; on/off switch. Starts at login.
+- A wider menu that shows up to ten networks at once, and an app icon (original art, in `App/MacWifi/Icon`).
 - Sleep and wake: never keeps the Mac awake; disconnects cleanly before sleep and rejoins after wake.
 - Remembered networks are stored as WPA2 keys (PMKs) in a root-only file, never as passwords.
 - 5 GHz is preferred over 2.4 GHz unless it's clearly weaker.
