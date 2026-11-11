@@ -6,6 +6,10 @@
 - Bluetooth, phase B1: `macwifictl bt` opens the adapter's own Bluetooth controller from user space (no kext),
   identifies it and lists nearby Bluetooth LE and classic devices. Plan: `docs/BLUETOOTH_PROMPT.md`.
 
+**Changed**
+- Sleep: the service now waits at most 3 s (was 20 s) for the adapter to shut down before letting the Mac sleep,
+  and logs how long it took, so closing the lid always sleeps promptly. It still never takes a power assertion.
+
 ## 0.6.0 (first public beta)
 
 The first release meant for other people: install a package, pick a network from the menu bar, done.

@@ -31,8 +31,12 @@ static const char *const kStateName[] = {"off", "no_adapter", "starting", "idle"
 // ---------------------------------------------------------------- sleep / wake (power.c calls these)
 //
 // Before sleep the power callback asks the main thread to shut the adapter down cleanly (leave the network, remove
-// the macOS interface and service, release USB) and waits for it, at most 20 s; macOS sleeps right after. After
-// wake the main thread finds the adapter again (whatever state it woke up in) and auto-joins as usual.
+// the macOS interface and service, release USB) and waits for it, at most MW_SLEEP_WAIT_MS; macOS sleeps right
+// after. The cap is short on purpose: closing the lid must put the Mac to sleep promptly even if the adapter is
+// stuck, and the adapter's firmware survives sleep anyway (hardware log). macwifid never takes a power assertion,
+// so nothing here can keep the Mac awake. After wake the main thread finds the adapter again (whatever state it
+// woke up in) and auto-joins as usual.
+#define MW_SLEEP_WAIT_MS 3000
 static atomic_int gSleepReq, gWake;
 static pthread_mutex_t gPmMu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t gPmCv = PTHREAD_COND_INITIALIZER;
@@ -42,12 +46,21 @@ static void d_will_sleep(void) {
     pthread_mutex_lock(&gPmMu);
     gSleepReady = 0;
     gSleepReq = 1;
-    struct timespec ts;
+    struct timespec ts, t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
     clock_gettime(CLOCK_REALTIME, &ts);
-    ts.tv_sec += 20;
+    ts.tv_sec += MW_SLEEP_WAIT_MS / 1000;
+    ts.tv_nsec += (long)(MW_SLEEP_WAIT_MS % 1000) * 1000000L;
+    if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
     while (!gSleepReady)
         if (pthread_cond_timedwait(&gPmCv, &gPmMu, &ts) != 0) break;
+    int ready = gSleepReady;
     pthread_mutex_unlock(&gPmMu);
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    double ms = (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    printf(ready ? "[macwifid] ready for sleep after %.0f ms\n"
+                 : "[macwifid] adapter still busy after %.0f ms; letting the Mac sleep anyway\n", ms);
+    fflush(stdout);
 }
 
 static void d_did_wake(void) { gWake = 1; }

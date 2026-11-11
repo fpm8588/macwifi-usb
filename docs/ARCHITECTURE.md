@@ -89,7 +89,7 @@ This is the map for anyone reading or changing the code. The research behind the
   replies under a mutex.
 - **Control** (+ one short-lived thread per client): answers status/networks directly; hands scan, join,
   disconnect, forget and power commands to the main thread through a one-slot mailbox and waits for the result.
-- **Power**: IOKit sleep/wake callbacks; before sleep it waits (≤ 20 s) for the main thread to shut down cleanly.
+- **Power**: IOKit sleep/wake callbacks; before sleep it waits (≤ 3 s) for the main thread to shut down cleanly, and never takes a power assertion.
 
 ## Testing without hardware
 

@@ -218,7 +218,7 @@ TROUBLESHOOTING, PROTOCOL, SECURITY, CONTRIBUTING, CHANGELOG).
 - Remembered networks: SSID + PMK (never the passphrase), `/Library/Application Support/macwifi/networks`, 0600.
 - Sleep/wake (`power.c`, IORegisterForSystemPower): no power assertions; idle-sleep questions answered yes;
   on kIOMessageSystemWillSleep the main thread leaves the network, removes the interface and service and releases
-  USB, then sleep is allowed (callback waits at most 20 s); on kIOMessageSystemHasPoweredOn the adapter is found
+  USB, then sleep is allowed (callback waits at most 3 s); on kIOMessageSystemHasPoweredOn the adapter is found
   again in whatever mode it woke (driver CD, ROM, running firmware) and the remembered network is rejoined.
 - Menu bar app (`App/MacWifi`, SwiftUI MenuBarExtra, macOS 13+, built with `swiftc`): networks with signal bars,
   lock, band; join (password prompt only for new secured networks), disconnect, forget, on/off; LaunchAgent

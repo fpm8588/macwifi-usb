@@ -62,6 +62,39 @@ Input: BLE / classic HID reports turned into keyboard and pointer events with CG
        Accessibility approval; no kext, no restricted entitlement).
 ```
 
+## Requirements the user set (apply to every phase)
+
+### Several Bluetooth devices at once (2026-11-11)
+- The host stack keeps a **connection table**, not a single link: one entry per ACL (classic) or LE connection,
+  keyed by its HCI connection handle, with its own L2CAP channels, security state and profile (HID, audio...).
+- HCI flow control is shared: track the controller's free ACL/LE buffers (Read Buffer Size, LE Read Buffer
+  Size, Number Of Completed Packets) across all connections and schedule fairly, so a busy audio link can't
+  starve a keyboard.
+- Several devices of each kind: e.g. keyboard + mouse + headphones together, or two BLE sensors. The menu lists
+  every paired device with its own connect/disconnect and battery level.
+- Remembered devices reconnect on their own (like Wi-Fi auto-join), one at a time, in the order last used.
+- Known limits to explain, not hide: the controller has a fixed number of simultaneous links (read it from
+  the controller and show it); one radio is shared by Wi-Fi and Bluetooth, so heavy use of both lowers both;
+  two A2DP headphones at once is out of scope (bandwidth and timing), one audio device plus input devices is
+  the target.
+- Tests: the simulator gets a fake controller with several concurrent connections, interleaved traffic, and
+  disconnects in every order.
+
+### Sleep must never be blocked (2026-11-11)
+- Closing the lid or choosing Sleep must put the Mac to sleep promptly with the adapter plugged in, whatever
+  Wi-Fi and Bluetooth are doing.
+- No power assertions anywhere (no IOPMAssertion, no caffeinate, no audio stream left running that holds one).
+  `pmset -g assertions` must never list macwifid or MacWifi.
+- On will-sleep the Bluetooth side, like Wi-Fi, stops scanning, disconnects every link (HCI Disconnect,
+  reason 0x15 "power off") and closes the USB interface within the same short budget (`MW_SLEEP_WAIT_MS`,
+  3 s, daemon.c); if anything is still busy when the budget ends, sleep goes ahead anyway.
+- The HAL audio plug-in reports the device as gone before sleep so Core Audio doesn't keep it running.
+- The adapter must not wake the Mac: don't arm USB remote wakeup; check `pmset -g log` after a night asleep
+  for wakes caused by the adapter.
+- After wake: Wi-Fi first (auto-join), then reconnect remembered Bluetooth devices.
+- Every phase's hardware checkpoint includes: close the lid with the feature active, wait a minute, open it,
+  confirm it slept (`pmset -g log | grep -E " Sleep | Wake " | tail -4`) and recovered.
+
 ## Phases (stop at each hardware checkpoint and ask the user to run it)
 
 ### W1: band control (Wi-Fi)
