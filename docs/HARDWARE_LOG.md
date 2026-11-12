@@ -294,3 +294,11 @@ Found:
   sniff mode (and Exit Sniff if the device enters it anyway, logged), user-interactive QoS for the Bluetooth
   thread, USB readers and the app's input thread, no Wi-Fi scan on every menu open (off-channel time stalls
   Bluetooth on this combo chip). The service now logs mouse reports per 20 s and the longest pause.
+
+## 2026-11-11 (evening): AirPods (B5a)
+
+- AirPods in pairing mode showed only as LE devices: the 5 s classic inquiry got 0-1 replies with keyboard and
+  mouse connected (kept out of sniff mode). Inquiry length raised to 10.24 s; a classic "AirPods Pro" entry then
+  appeared and paired; the row showed Connected.
+- No chime heard (Play Test Sound). Not diagnosed yet: the next build logs every AVDTP message, SDP request and
+  channel. Classic remote-name requests had been cancelled after 4 s, before the 5.12 s page timeout: now 7 s.

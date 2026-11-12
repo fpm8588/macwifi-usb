@@ -1,10 +1,11 @@
-# MacWifi: USB Wi-Fi for Apple Silicon Macs (AIC8800 / UGREEN AX900)
+# MacWifi: USB Wi-Fi and Bluetooth for Apple Silicon Macs (AIC8800 / UGREEN AX900)
 
 [![CI](https://github.com/fpm8588/macwifi-usb/actions/workflows/ci.yml/badge.svg)](https://github.com/fpm8588/macwifi-usb/actions/workflows/ci.yml)
 
-A free, open-source driver that makes **AICsemi AIC8800D80 USB Wi-Fi adapters**, like the **UGREEN AX900
-(CM762)**, work on **Apple Silicon Macs**. No kernel extension, no DriverKit, no changes to System Integrity
-Protection, no paid Apple developer account.
+A free, open-source driver that makes **AICsemi AIC8800D80 USB Wi-Fi + Bluetooth adapters**, like the **UGREEN
+AX900 (CM762)**, work on **Apple Silicon Macs**: Wi-Fi with WPA3, and the adapter's Bluetooth for keyboards, mice
+and (beta) headphones. No kernel extension, no DriverKit, no changes to System Integrity Protection, no paid Apple
+developer account. Useful when a Mac's own Wi-Fi/Bluetooth is broken, or when you want a second radio.
 
 macOS has no way for third parties to add Wi-Fi hardware, so MacWifi runs as a small background service that
 drives the adapter over USB and gives macOS an ordinary network connection. You pick networks from its own menu
@@ -16,7 +17,7 @@ uses it like any other connection.
 
 ## Contents
 
-- [What works](#what-works) · [Supported adapters](#supported-adapters) · [Install](#install) ·
+- [What works](#what-works) · [Bluetooth](#bluetooth) · [Supported adapters](#supported-adapters) · [Install](#install) ·
   [Using it](#using-it) · [Uninstall](#uninstall) · [Troubleshooting](docs/TROUBLESHOOTING.md) ·
   [Reporting a problem](#reporting-a-problem) · [How it works](#how-it-works) · [Privacy and security](#privacy-and-security) ·
   [Building from source](#building-from-source) · [Contributing](CONTRIBUTING.md) · [License](#license)
@@ -39,6 +40,25 @@ uses it like any other connection.
 Not yet: WPA2 networks that require management frame protection, WPA2/WPA3-Enterprise, WEP, hidden networks, 6 GHz, roaming between access points of one network while connected, picking your regulatory
 country (a worldwide channel set is used: channels 1–14 at 2.4 GHz and 36–165 at 5 GHz; access points on DFS
 radar channels 52–144 are scanned but joining them hasn't been tested). See [CHANGELOG.md](CHANGELOG.md).
+
+## Bluetooth
+
+The adapter's chip also has a Bluetooth 5 radio. macOS's own Bluetooth only uses Apple's hardware, so MacWifi runs
+its own Bluetooth host in the background service and shows it in the menu's **Bluetooth** tab:
+
+- **Keyboards and mice** (classic Bluetooth, e.g. Apple Magic Keyboard and Magic Mouse): tested. Click the device
+  to pair (a keyboard shows a 6-digit code to type), then MacWifi turns its keys and pointer movement into macOS
+  input. That needs **MacWifi** turned on in System Settings → Privacy & Security → **Accessibility** (after
+  an update you may have to switch it off and on again, because the app isn't signed with a paid certificate).
+  Several devices at once; paired devices reconnect by themselves, also after sleep.
+- **Headphones** (beta, not confirmed on hardware yet): pair them (AirPods: open the case, hold its button until
+  the light flashes white, then click AirPods in the list), then choose **UGREEN Bluetooth** as the output in
+  Sound settings or the menu bar's volume menu. Audio is SBC at about 325 kb/s (A2DP "high quality"); latency
+  is about 0.2 s.
+- Not yet: Bluetooth LE input devices, microphones, AirPods extras (automatic switching, spatial audio), Magic Mouse
+  gestures beyond pointing and clicking, Touch ID. Devices paired through MacWifi don't appear in System Settings.
+- Wi-Fi and Bluetooth share one radio, so heavy use of both slows both a little. Plan and status:
+  [docs/BLUETOOTH_PROMPT.md](docs/BLUETOOTH_PROMPT.md).
 
 ## Supported adapters
 
@@ -76,6 +96,8 @@ Prefer to build it yourself? See [Building from source](#building-from-source).
 - **Plug and play**: when you plug the adapter in, MacWifi switches it out of its "driver CD" mode, loads the
   firmware into it (nothing is written to the adapter itself), and joins the strongest remembered network.
 - **Sleep**: MacWifi never keeps your Mac awake. It leaves the network before sleep and rejoins after wake.
+- **Bluetooth tab**: the switch turns Bluetooth on and off; **Scan Again** looks for devices in pairing mode
+  (about 15 s); click a device to connect, right-click to disconnect or forget it.
 - **Quit** in the menu closes only the menu; the connection stays up. The menu comes back at the next login.
 - **Terminal**: `macwifictl status` shows what the service is doing, `macwifictl networks` scans. The service's
   log is `/Library/Logs/macwifid.log`.
@@ -89,7 +111,8 @@ Prefer to build it yourself? See [Building from source](#building-from-source).
 sudo "/Library/Application Support/macwifi/uninstall.sh"
 ```
 
-This removes the service, the menu bar app, the remembered networks and the logs. Unplug the adapter afterwards;
+This removes the service, the menu bar app, the "UGREEN Bluetooth" audio device, the remembered networks and paired
+Bluetooth devices, and the logs. Unplug the adapter afterwards;
 it returns to its factory state (the firmware only ever lives in its RAM).
 
 ## Reporting a problem
@@ -116,7 +139,13 @@ Common problems and fixes are in [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.
 The adapter's chip is "FullMAC": its firmware (loaded by MacWifi at plug-in) handles the radio, association and
 encryption. MacWifi talks to it with the same messages as the Linux driver, runs the WPA2 4-way handshake itself,
 installs the keys in the chip, and moves Ethernet frames between the chip and a macOS `feth` virtual Ethernet
-interface. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the control socket API:
+interface.
+
+Bluetooth uses the adapter's standard USB Bluetooth interface (HCI). MacWifi implements the host side from the
+Bluetooth specifications (pairing via Secure Simple Pairing, L2CAP, HID, SDP, AVDTP, an SBC encoder); a small Core
+Audio plug-in provides the "UGREEN Bluetooth" output, and the menu app posts keyboard and mouse input.
+
+Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the control socket API:
 [docs/PROTOCOL.md](docs/PROTOCOL.md); research and design notes: [docs/RESEARCH.md](docs/RESEARCH.md).
 
 ## Privacy and security
@@ -128,6 +157,8 @@ interface. Details: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md); the control so
   keep it; macOS keeps its own in the keychain).
 - The service runs as root (it has to, to create a network interface); the menu talks to it over a socket only
   administrators can open.
+- Bluetooth link keys are kept root-only like the Wi-Fi keys; key presses and audio are never logged. Only paired
+  devices may connect to the adapter, and it is never discoverable.
 - Nothing is sent anywhere except your normal network traffic and, at install time, the firmware download.
 - More, and how to report a vulnerability: [SECURITY.md](SECURITY.md).
 

@@ -89,6 +89,33 @@ download. Please report other reasons with the diagnostics report.
 The log should show `the Mac is going to sleep` … `asleep` … `the Mac is awake` … `auto-joining a remembered
 network`. If it stops at an error, unplug and replug the adapter, and report it with the diagnostics report.
 
+## Bluetooth: a device doesn't show up
+
+Only devices in **pairing mode** (or advertising over Bluetooth LE) can be found. Put it in pairing mode (a Magic
+Keyboard or Mouse: switch it off and on with no computer to reconnect to; AirPods: open the case and hold its
+button until the light flashes white), then click **Scan Again** and wait about 15 seconds. A device connected to
+another computer stays quiet: disconnect it there first. `grep "Bluetooth scan" /Library/Logs/macwifid.log` shows
+how many classic and LE replies each scan got.
+
+## Bluetooth: the keyboard or mouse is connected but does nothing
+
+macOS only accepts the input once MacWifi is allowed in System Settings → Privacy & Security → **Accessibility**.
+After installing an update, switch MacWifi off and on there (the app is ad-hoc signed, so macOS treats each build as
+new). The Bluetooth tab shows an orange banner while this is missing.
+
+## Bluetooth: the mouse feels slow or jumpy
+
+The service keeps mice out of Bluetooth "sniff" power-saving mode and logs the report rate:
+`grep "Bluetooth mouse" /Library/Logs/macwifid.log`. A long Wi-Fi scan briefly takes the shared radio away from
+Bluetooth; heavy Wi-Fi traffic can also cost some smoothness.
+
+## Bluetooth: headphones are connected but there's no sound
+
+Choose **UGREEN Bluetooth** as the output (Sound settings or the volume menu). Right-click the headphones in the
+Bluetooth tab → **Play Test Sound** plays a chime through the service alone. If that is silent too, send
+`grep "Bluetooth audio" /Library/Logs/macwifid.log | tail -30`: it lists every step of setting up the stream.
+If "UGREEN Bluetooth" is missing from the output list, run `sudo killall coreaudiod` once.
+
 ## The developer commands say the service owns the adapter
 
 `macwifictl scan/connect/join/fwload/up` drive the adapter directly and refuse while the service is running.

@@ -5,6 +5,14 @@
 **New**
 - Bluetooth, phase B1: `macwifictl bt` opens the adapter's own Bluetooth controller from user space (no kext),
   identifies it and lists nearby Bluetooth LE and classic devices. Plan: `docs/BLUETOOTH_PROMPT.md`.
+- Bluetooth audio output (phase B5b): a "UGREEN Bluetooth" output device (a Core Audio plug-in) sends what the
+  Mac plays to the connected headphones, with a volume control. The stream starts when audio plays and pauses after
+  5 s of silence.
+- Clicking AirPods (seen over LE) looks for their classic, audio-capable side in pairing mode and connects it.
+- Bluetooth scans run the classic search for 10 s (5 s missed AirPods in pairing mode).
+- Diagnostics: every AVDTP step, SDP request and Bluetooth classic reply is logged (no audio, no addresses).
+- Power: the menu app polls every 20 s while closed (2 s while open or busy); the service sleeps longer when
+  idle or when no adapter is plugged in; fewer keepalives.
 - Bluetooth audio, first step (phase B5a): AirPods and other headphones connect as an A2DP audio sink. New
   from-scratch pieces: an SBC encoder (checked against a spec decoder: 66-69 dB SNR at bitpool 53), AVDTP
   signaling as initiator and acceptor, an SDP server advertising an A2DP source and AVRCP, L2CAP channels for
