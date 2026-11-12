@@ -882,10 +882,16 @@ static void bh_l2_open(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid
         if (gAudio.we_started) avdtp_start(&gAudio.av);
         else gAudio.avdtp_kick = now_s() + 1.5;         // give the device a moment to drive it; then we do
         printf("[macwifid] Bluetooth audio: signaling channel open\n");
-    } else if (audio_is(a) && !gAudio.media_cid) {      // the second is the media transport
+    } else if (audio_is(a) && !gAudio.media_cid &&
+               (gAudio.av.state == AV_OPENING || gAudio.av.state == AV_OPEN || gAudio.av.state == AV_STARTING ||
+                gAudio.av.state == AV_STREAMING)) {     // after OPEN, the next AVDTP channel is the media transport
         gAudio.media_cid = cid;
         printf("[macwifid] Bluetooth audio: media channel open (MTU %u)\n", bthost_l2cap_mtu(&gHost, a, cid));
         avdtp_media_open(&gAudio.av, 1);
+    } else if (audio_is(a) && cid != gAudio.sig_cid) {
+        // Both sides opened a signaling channel at once (or a stray one): keep the first, close this one.
+        printf("[macwifid] Bluetooth audio: closing a second signaling channel\n");
+        bthost_l2cap_close(&gHost, a, cid);
     }
     fflush(stdout);
 }
