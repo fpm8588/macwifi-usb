@@ -663,6 +663,9 @@ typedef struct {
     double tone_until, idle_since, avdtp_kick;
     double phase;
     int chimed;
+    uint16_t avctp_cid;         // AVRCP control channel (absolute volume)
+    int avctp_asked;
+    uint8_t avctp_label;
     unsigned long packets, dropped;
 } BtAudio;
 static BtAudio gAudio;
@@ -759,6 +762,11 @@ static void av_streaming(void *ctx, int on, const SbcConfig *cfg) {
         static const double fs[4] = {16000, 32000, 44100, 48000};
         gAudio.rate = fs[cfg->fs & 3];
         gAudio.streaming = 1;
+        if (!gAudio.avctp_cid && !gAudio.avctp_asked) {   // for absolute volume (see avrcp_set_volume)
+            gAudio.avctp_asked = 1;
+            if (bthost_l2cap_connect(&gHost, gAudio.addr, L2CAP_PSM_AVCTP) < 0)
+                printf("[macwifid] Bluetooth audio: couldn't open the AVRCP channel\n");
+        }
         gAudio.next_due = now_s();
         gAudio.idle_since = now_s();
         if (gPcmReady) pcmring_clear(&gPcm);
@@ -866,6 +874,39 @@ static void audio_pump(void) {
     else if (t - gAudio.idle_since > 5) avdtp_suspend(&gAudio.av);   // nothing to play: let the earbuds rest
 }
 
+// AVRCP over AVCTP (AVCTP 1.4, AVRCP 1.6): headphones that support absolute volume (AirPods do) let the source set
+// their volume, and may stay silent until it does. We set it to the maximum once the stream is up; the "UGREEN
+// Bluetooth" slider still scales the audio itself. Commands from the headphones are answered "not implemented".
+static void avrcp_set_volume(uint8_t vol) {
+    if (!gAudio.avctp_cid) return;
+    uint8_t p[14] = {0, 0x11, 0x0E,                     // AVCTP: label, single packet, command; PID A/V remote control
+                     0x00, 0x48, 0x00,                  // AV/C: CONTROL, panel subunit, VENDOR DEPENDENT
+                     0x00, 0x19, 0x58,                  // Bluetooth SIG company ID
+                     0x50, 0x00, 0x00, 0x01, 0};        // SetAbsoluteVolume, single packet, 1 parameter byte
+    p[0] = (uint8_t)((gAudio.avctp_label++ & 0x0F) << 4);
+    p[13] = vol & 0x7F;
+    int r = bthost_l2cap_send_ctrl(&gHost, gAudio.addr, gAudio.avctp_cid, p, sizeof p);
+    printf("[macwifid] Bluetooth audio: AVRCP > set absolute volume %u/127 (%s)\n", vol & 0x7F, r == 0 ? "sent" : "failed");
+    fflush(stdout);
+}
+
+static void avrcp_rx(const uint8_t a[6], uint16_t cid, const uint8_t *d, size_t n) {
+    if (n < 4) return;
+    int response = (d[0] >> 1) & 1;
+    uint8_t ctype = d[3] & 0x0F;
+    printf("[macwifid] Bluetooth audio: AVRCP < %s ctype 0x%02x opcode 0x%02x%s", response ? "response" : "command",
+           ctype, n > 5 ? d[5] : 0, n > 9 && d[5] == 0 ? "" : "\n");
+    if (n > 9 && d[5] == 0x00) printf(" PDU 0x%02x\n", d[9]);
+    fflush(stdout);
+    if (response) return;
+    uint8_t r[64];
+    size_t m = n < sizeof r ? n : sizeof r;
+    memcpy(r, d, m);
+    r[0] = (uint8_t)(d[0] | 0x02);                    // response, same transaction label
+    r[3] = (uint8_t)((d[3] & 0xF0) | 0x08);           // NOT IMPLEMENTED
+    bthost_l2cap_send_ctrl(&gHost, a, cid, r, m);
+}
+
 static int bh_l2_accept(void *ctx, const uint8_t a[6], uint16_t psm) {
     (void)ctx;
     if (psm == L2CAP_PSM_SDP || psm == L2CAP_PSM_AVCTP) return 1;
@@ -878,6 +919,10 @@ static void bh_l2_open(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid
         printf("[macwifid] Bluetooth audio: %s channel open\n", psm == L2CAP_PSM_SDP ? "SDP (service search)"
                                                               : psm == L2CAP_PSM_AVCTP ? "AVCTP (remote control)" : "other");
         fflush(stdout);
+        if (psm == L2CAP_PSM_AVCTP && audio_is(a) && !gAudio.avctp_cid) {
+            gAudio.avctp_cid = cid;
+            avrcp_set_volume(0x7F);
+        }
         return;
     }
     if (!gAudio.active) {                               // the first AVDTP channel is signaling
@@ -922,12 +967,13 @@ static void bh_l2_data(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid
         av_log("<", d, n);
         avdtp_rx(&gAudio.av, d, n);
     }
-    // AVCTP (remote control): accepted so the device is happy; commands aren't acted on yet.
+    if (psm == L2CAP_PSM_AVCTP && audio_is(a)) avrcp_rx(a, cid, d, n);
 }
 static void bh_l2_closed(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid) {
     (void)ctx;
     printf("[macwifid] Bluetooth audio: channel closed (PSM 0x%04x)\n", psm);
     fflush(stdout);
+    if (psm == L2CAP_PSM_AVCTP && audio_is(a) && cid == gAudio.avctp_cid) { gAudio.avctp_cid = 0; return; }
     if (psm != L2CAP_PSM_AVDTP || !audio_is(a)) return;
     if (cid == gAudio.media_cid) {
         gAudio.media_cid = 0;
