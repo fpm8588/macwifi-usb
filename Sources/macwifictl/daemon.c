@@ -269,7 +269,7 @@ static int d_post(Daemon *d, DCmd cmd, const uint8_t *ssid, size_t ssid_len, con
 // user turns Bluetooth off, or the adapter goes away. No power assertions.
 
 #define BT_DEV_KEEP_S 90      // a device stays listed this long after it was last heard
-#define BT_SCAN_S     11      // ~5 s classic inquiry alone (+ name requests), then at least 3 s LE scan
+#define BT_SCAN_S     15      // ~10 s classic inquiry alone (+ name requests), then at least 3 s LE scan
 
 typedef struct {
     pthread_mutex_t mu;
@@ -1088,9 +1088,12 @@ static int bt_scan_once(Daemon *d, BtLink *b) {
     bt_count(&le0, &cl0);
     pthread_mutex_unlock(&gBt.mu);
     double t0 = now_s();
-    uint8_t inq[5] = {(uint8_t)HCI_GIAC_LAP, (uint8_t)(HCI_GIAC_LAP >> 8), (uint8_t)(HCI_GIAC_LAP >> 16), 4, 0};
-    int ist = bt_call(b, HCI_OP_INQUIRY, inq, 5, NULL, 0, NULL, 2000, bt_d_event, &run);   // 4 x 1.28 s
-    int rc = ist == 0 ? bt_listen(d, b, &run, 6.0, 1) : 0;
+    // 8 x 1.28 s = 10.24 s, the length the specification suggests for reliable discovery: a device in pairing
+    // mode answers only during its own short scan windows, and connected keyboards / mice (kept out of sniff
+    // mode) leave the controller less time for the inquiry train. 5 s missed AirPods in pairing mode.
+    uint8_t inq[5] = {(uint8_t)HCI_GIAC_LAP, (uint8_t)(HCI_GIAC_LAP >> 8), (uint8_t)(HCI_GIAC_LAP >> 16), 8, 0};
+    int ist = bt_call(b, HCI_OP_INQUIRY, inq, 5, NULL, 0, NULL, 2000, bt_d_event, &run);
+    int rc = ist == 0 ? bt_listen(d, b, &run, 11.5, 1) : 0;
     if (ist == 0 && rc == 0 && !run.inquiry_done)
         bt_call(b, HCI_OP_INQUIRY_CANCEL, NULL, 0, NULL, 0, NULL, 1000, bt_d_event, &run);
     int names = 0;
