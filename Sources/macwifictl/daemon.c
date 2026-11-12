@@ -711,9 +711,33 @@ static int pcm_recent(void) { return gPcmReady && now_s() * 1000 - (double)gPcmL
 
 static int audio_is(const uint8_t a[6]) { return gAudio.active && !memcmp(gAudio.addr, a, 6); }
 
+// AVDTP traffic in the log: signal names and message types, the stream end points and codecs a sink offers,
+// reject error codes. No audio, no addresses.
+static void av_log(const char *dir, const uint8_t *d, size_t n) {
+    static const char *sig[] = {"?", "DISCOVER", "GET_CAPABILITIES", "SET_CONFIGURATION", "GET_CONFIGURATION",
+                                "RECONFIGURE", "OPEN", "START", "CLOSE", "SUSPEND", "ABORT", "SECURITY_CONTROL",
+                                "GET_ALL_CAPABILITIES", "DELAYREPORT"};
+    static const char *type[] = {"command", "general reject", "accept", "reject"};
+    if (n < 2) return;
+    uint8_t s = d[1] & 0x3F, t = d[0] & 3;
+    printf("[macwifid] Bluetooth audio %s %s %s", dir, s < 14 ? sig[s] : "?", type[t]);
+    if (t == 3 && n >= 3) printf(" (error 0x%02x%s)", d[n - 1], n >= 4 ? ", category in the byte before" : "");
+    if (s == 1 && t == 2)
+        for (size_t o = 2; o + 1 < n; o += 2)
+            printf(" [SEP %u %s %s%s]", d[o] >> 2, (d[o + 1] >> 4) == 0 ? "audio" : "other",
+                   ((d[o + 1] >> 3) & 1) ? "sink" : "source", ((d[o] >> 1) & 1) ? " in use" : "");
+    if ((s == 2 || s == 12) && t == 2)
+        for (size_t o = 2; o + 1 < n && o + 2 + d[o + 1] <= n; o += 2 + d[o + 1])
+            if (d[o] == 7 && d[o + 1] >= 2)
+                printf(" [codec %s]", d[o + 3] == 0 ? "SBC" : d[o + 3] == 2 ? "AAC" : d[o + 3] == 0xFF ? "vendor" : "other");
+    printf("\n");
+    fflush(stdout);
+}
+
 static int av_send(void *ctx, const uint8_t *d, size_t n) {
     (void)ctx;
     if (!gAudio.sig_cid) return -1;
+    av_log(">", d, n);
     int r = bthost_l2cap_send(&gHost, gAudio.addr, gAudio.sig_cid, d, n);
     if (r == -2) {                                      // buffers full of media: drain a little, then try once more
         uint8_t ev[HCI_MAX_EVENT];
@@ -724,6 +748,7 @@ static int av_send(void *ctx, const uint8_t *d, size_t n) {
         }
         r = bthost_l2cap_send(&gHost, gAudio.addr, gAudio.sig_cid, d, n);
     }
+    if (r != 0) { printf("[macwifid] Bluetooth audio: couldn't send (%d)\n", r); fflush(stdout); }
     return r;
 }
 static void av_open_media(void *ctx) {
@@ -846,7 +871,12 @@ static int bh_l2_accept(void *ctx, const uint8_t a[6], uint16_t psm) {
 }
 static void bh_l2_open(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid) {
     (void)ctx;
-    if (psm != L2CAP_PSM_AVDTP) return;
+    if (psm != L2CAP_PSM_AVDTP) {
+        printf("[macwifid] Bluetooth audio: %s channel open\n", psm == L2CAP_PSM_SDP ? "SDP (service search)"
+                                                              : psm == L2CAP_PSM_AVCTP ? "AVCTP (remote control)" : "other");
+        fflush(stdout);
+        return;
+    }
     if (!gAudio.active) {                               // the first AVDTP channel is signaling
         memset(&gAudio, 0, sizeof gAudio);
         gAudio.active = 1;
@@ -872,17 +902,23 @@ static void bh_l2_data(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid
     if (psm == L2CAP_PSM_SDP) {
         uint8_t rsp[512];
         size_t m = sdp_server_handle(d, n, rsp, sizeof rsp);
+        printf("[macwifid] Bluetooth audio: SDP request 0x%02x answered with 0x%02x (%zu bytes)\n", n ? d[0] : 0,
+               m ? rsp[0] : 0, m);
+        fflush(stdout);
         if (m) bthost_l2cap_send(&gHost, a, cid, rsp, m);
         return;
     }
     if (psm == L2CAP_PSM_AVDTP && audio_is(a) && cid == gAudio.sig_cid) {
         gAudio.avdtp_kick = 0;                          // the device is driving AVDTP
+        av_log("<", d, n);
         avdtp_rx(&gAudio.av, d, n);
     }
     // AVCTP (remote control): accepted so the device is happy; commands aren't acted on yet.
 }
 static void bh_l2_closed(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid) {
     (void)ctx;
+    printf("[macwifid] Bluetooth audio: channel closed (PSM 0x%04x)\n", psm);
+    fflush(stdout);
     if (psm != L2CAP_PSM_AVDTP || !audio_is(a)) return;
     if (cid == gAudio.media_cid) {
         gAudio.media_cid = 0;
