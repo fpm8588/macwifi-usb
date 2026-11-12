@@ -1244,7 +1244,7 @@ static void *bt_thread(void *arg) {
     while (!gStop) {
         if (!bt_should_run(d)) {
             bt_down(&b, gBtSleep ? "the Mac is going to sleep" : !gBt.power ? "turned off" : "adapter not ready");
-            usleep(100000);
+            usleep(gBtSleep ? 50000 : 500000);         // power: no adapter is the common case away from the desk
             continue;
         }
         if (!b) {
@@ -1366,7 +1366,9 @@ static void *bt_thread(void *arg) {
         }
         uint8_t ev[HCI_MAX_EVENT];
         size_t n = 0;
-        int wait_ms = 100;
+        // Power: sleep longer when nothing is going on (no queued commands, no connection being set up, no audio
+        // device). Clicks from the menu then take up to half a second to start, which is fine.
+        int wait_ms = (gHost.qn == 0 && !bt_busy_connecting() && !gAudio.active && !gBt.scan_req) ? 500 : 100;
         if (gAudio.streaming) {                   // wake up in time for the next audio packet
             double dt = (gAudio.next_due - now_s()) * 1000;
             wait_ms = dt < 1 ? 1 : dt > 20 ? 20 : (int)dt;
@@ -1459,8 +1461,7 @@ static void bt_input_stream(int fd) {
         pthread_mutex_lock(&gIn.mu);
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_nsec += 500000000L;
-        if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
+        ts.tv_sec += 5;                               // keepalive every 5 s when idle (power: few wakeups)
         while (gIn.seq == next && !gStop)
             if (pthread_cond_timedwait(&gIn.cv, &gIn.mu, &ts) != 0) break;
         if (gIn.seq - next > BT_IN_RING) next = gIn.seq - BT_IN_RING;   // fell behind: drop the oldest
@@ -1673,7 +1674,7 @@ static void *control_thread(void *arg) {
     Daemon *d = (Daemon *)arg;
     while (!gStop) {
         struct pollfd pf = {d->listen_fd, POLLIN, 0};
-        if (poll(&pf, 1, 300) <= 0) continue;
+        if (poll(&pf, 1, 1000) <= 0) continue;     // a stop is noticed within a second
         int fd = accept(d->listen_fd, NULL, NULL);
         if (fd < 0) continue;
         ClientArg *ca = malloc(sizeof *ca);
@@ -2198,7 +2199,9 @@ static int daemon_main(const DaemonHooks *hooks) {
                 quick_retries = 4;   // a freshly plugged adapter can need a moment (e.g. its virtual CD isn't mounted yet)
             }
             d_handle(d, a, &manual_off, &next_autojoin);
-            if (!a->up) usleep(500000);
+            // Power: with no adapter plugged in (the usual case away from the desk) look for it every 1.5 s, not
+            // twice a second; still well inside the 3 s sleep budget.
+            if (!a->up) usleep(present ? 500000 : 1500000);
             continue;
         }
 

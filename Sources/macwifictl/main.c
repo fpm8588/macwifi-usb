@@ -2073,7 +2073,7 @@ static int bridge_start(Conn *c, int self_test) {
 static void bridge_poll(Conn *c, int status_every) {
     Bridge *b = &c->br;
     double t = now_s();
-    if (t - b->last_ip_check >= 1) {
+    if (t - b->last_ip_check >= (b->ip[0] && t - b->t0 > 30 ? 3 : 1)) {   // power: settle to every 3 s
         b->last_ip_check = t;
         char now_ip[64];
         feth_ipv4(c->feth, now_ip, sizeof now_ip);

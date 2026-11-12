@@ -139,7 +139,7 @@ enum Daemon {
         body.append(0x0A)
         let fd = socket(AF_UNIX, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
-        var tv = timeval(tv_sec: 5, tv_usec: 0)   // the service sends a keepalive every 0.5 s
+        var tv = timeval(tv_sec: 15, tv_usec: 0)  // the service sends a keepalive every 5 s
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, socklen_t(MemoryLayout<timeval>.size))
         var addr = sockaddr_un()
         addr.sun_family = sa_family_t(AF_UNIX)
@@ -299,7 +299,32 @@ final class Model: ObservableObject {
     init() {
         InputInjector.shared.start()
         refresh()
-        timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refresh() }
+        setPolling(open: false)
+    }
+
+    // Power: ask the service for its status every 2 s while the menu is open, every 20 s while it's closed (enough
+    // for the menu bar icon and the captive-portal prompt). The timer tolerance lets macOS batch the wakeups.
+    // Also fast while something is in progress (joining, scanning, pairing: a passkey has to show up quickly), in
+    // case the menu's appear/disappear events don't arrive.
+    private var menuOpen = false
+    private var pollInterval: TimeInterval = 0
+
+    func setPolling(open: Bool) {
+        menuOpen = open
+        reschedulePolling()
+    }
+
+    private func reschedulePolling() {
+        let busy = state == "connecting" || state == "scanning" || state == "starting" || btScanning ||
+            (bt?.devices ?? []).contains { $0.isBusy }
+        let interval: TimeInterval = (menuOpen || busy) ? 2 : 20
+        if interval == pollInterval, timer != nil { return }
+        timer?.invalidate()
+        pollInterval = interval
+        let t = Timer(timeInterval: interval, repeats: true) { [weak self] _ in self?.refresh() }
+        t.tolerance = interval * 0.25
+        RunLoop.main.add(t, forMode: .common)
+        timer = t
     }
 
     var state: String { daemonRunning ? (status?.state ?? "unknown") : "no_service" }
@@ -360,6 +385,7 @@ final class Model: ObservableObject {
                 self.status = reply
                 self.bt = btReply
                 self.updatePortal()
+                self.reschedulePolling()
             }
         }
     }
@@ -902,7 +928,8 @@ struct MenuView: View {
         .frame(width: 380)
         // Scanning Wi-Fi takes the shared radio off its channel for a few seconds, which also stalls Bluetooth (a
         // mouse would stutter): only scan on open when not connected or the list is old.
-        .onAppear { model.refresh(); model.scanIfStale() }
+        .onAppear { model.refresh(); model.scanIfStale(); model.setPolling(open: true) }
+        .onDisappear { model.setPolling(open: false) }
     }
 }
 
