@@ -60,7 +60,7 @@ struct BtDevice: Decodable, Identifiable, Hashable {
     let audio: String?      // for the connected audio device: "setting up", "ready", "playing"
 
     var isConnected: Bool { state == "connected" }
-    var isBusy: Bool { state == "connecting" || state == "pairing" }
+    var isBusy: Bool { state == "connecting" || state == "pairing" || state == "finding" }
 }
 
 struct BtReply: Decodable {
@@ -643,9 +643,15 @@ struct BtDeviceRow: View {
     @EnvironmentObject var model: Model
     let dev: BtDevice
 
+    // AirPods / Beats over LE: clicking them looks for their classic (audio) side in pairing mode.
+    var looksLikeAppleAudio: Bool {
+        dev.transport == "le" && (dev.name.contains("AirPods") || dev.name.contains("Beats") || dev.type == "Audio")
+    }
+
     var subtitle: String {
         switch dev.state ?? "" {
         case "connecting": return "Connecting…"
+        case "finding": return "Looking for them… keep the case open with the light flashing white"
         case "pairing":
             if let pk = dev.passkey { return String(format: "Type %06ld on the keyboard, then press Return", pk) }
             return "Pairing…"
@@ -707,14 +713,16 @@ struct BtDeviceRow: View {
         .padding(.horizontal, 8)
         .frame(minHeight: NetworkRow.height + 4)
         .contentShape(Rectangle())
-        .opacity(dev.transport == "le" && dev.paired != true ? 0.6 : 1)
+        .opacity(dev.transport == "le" && dev.paired != true && !looksLikeAppleAudio ? 0.6 : 1)
         .help(dev.transport == "le" && dev.paired != true
               ? (dev.type == "Audio" || dev.name.localizedCaseInsensitiveContains("AirPods")
                  ? "This is the earbuds' LE signal. To connect, open the case and hold its button until the light flashes white, then Scan Again: they appear a second time as a Classic device."
                  : "Bluetooth LE devices can't be connected yet.")
               : dev.isConnected ? "Right-click to disconnect or forget." : "Click to connect.")
         .onTapGesture {
-            if !dev.isConnected && !dev.isBusy && !(dev.transport == "le" && dev.paired != true) { model.btConnect(dev) }
+            if !dev.isConnected && !dev.isBusy && (!(dev.transport == "le" && dev.paired != true) || looksLikeAppleAudio) {
+                model.btConnect(dev)
+            }
         }
         .contextMenu {
             if !dev.isConnected && !dev.isBusy { Button("Connect") { model.btConnect(dev) } }

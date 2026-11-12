@@ -313,6 +313,9 @@ static struct {
     BtDevStatus st[BT_PAIRED_MAX];
     struct { int op; uint8_t addr[6]; } act[8];
     int nact;
+    // Clicking the LE side of AirPods (or other Apple / Beats audio): their audio is classic Bluetooth, at another
+    // address we can't derive from the LE one, so scan for a classic audio device in pairing mode and connect it.
+    struct { int active; uint8_t le_addr[6]; double until; } find;
 } gBp;                         // guarded by gBt.mu
 
 static BtHost gHost;           // Bluetooth thread only
@@ -1039,7 +1042,7 @@ static int bt_fetch_names(Daemon *d, BtLink *b, BtRun *run) {
         uint8_t prm[10];
         hci_remote_name_params(&want[k], prm);
         if (bt_call(b, HCI_OP_REMOTE_NAME_REQ, prm, 10, NULL, 0, NULL, 2000, bt_d_event, run) != 0) continue;
-        double end = now_s() + 4;
+        double end = now_s() + 7;                         // the controller's page timeout is 5.12 s by default
         uint8_t ev[HCI_MAX_EVENT];
         size_t n = 0;
         int done = 0;
@@ -1050,6 +1053,7 @@ static int bt_fetch_names(Daemon *d, BtLink *b, BtRun *run) {
             HciEvent e;
             if (r != 1 || hci_event(ev, n, &e)) continue;
             if (e.code == HCI_EV_REMOTE_NAME_COMPLETE && e.len >= 7 && !memcmp(e.p + 1, want[k].addr, 6)) {
+                if (e.p[0]) { printf("[macwifid] Bluetooth: name request failed (0x%02x)\n", e.p[0]); fflush(stdout); }
                 uint8_t a[6];
                 char name[HCI_NAME_MAX + 1];
                 if (hci_parse_remote_name(&e, a, name) == 0 && name[0]) {
@@ -1117,6 +1121,12 @@ static int bt_scan_once(Daemon *d, BtLink *b) {
         }
     }
     pthread_mutex_lock(&gBt.mu);
+    for (int k = 0; k < gBt.ndev; k++)
+        if (gBt.dev[k].kind == HCI_DEV_CLASSIC && gBt.seen[k] >= t0) {
+            const char *kind = hci_cod_kind(gBt.dev[k].cod);
+            printf("[macwifid] Bluetooth classic reply: class 0x%06x (%s), %d dBm, %s\n", (unsigned)gBt.dev[k].cod,
+                   kind ? kind : "?", gBt.dev[k].rssi == 127 ? 0 : gBt.dev[k].rssi, gBt.dev[k].name[0] ? "named" : "no name");
+        }
     gBt.scanning = 0;
     gBt.last_classic = run.n_classic;
     gBt.last_le = run.n_le;
@@ -1224,6 +1234,42 @@ static void *bt_thread(void *arg) {
         if (scan) gBt.scan_req = 0;
         pthread_mutex_unlock(&gBt.mu);
         if (scan && bt_scan_once(d, b) != 0) { bt_down(&b, "lost the adapter"); next_try = now_s() + 2; continue; }
+        if (scan) {
+            pthread_mutex_lock(&gBt.mu);
+            if (gBp.find.active) {
+                int best = -1;
+                for (int k = 0; k < gBt.ndev; k++) {
+                    const HciDevice *v = &gBt.dev[k];
+                    if (v->kind != HCI_DEV_CLASSIC || ((v->cod >> 8) & 0x1F) != 4 || now_s() - gBt.seen[k] > 30) continue;
+                    if (bp_find(v->addr) || audio_is(v->addr)) continue;
+                    int score = (strstr(v->name, "AirPods") || strstr(v->name, "Beats") ? 1000 : 0) + (v->rssi == 127 ? -100 : v->rssi);
+                    int bscore = best < 0 ? -100000 : (strstr(gBt.dev[best].name, "AirPods") || strstr(gBt.dev[best].name, "Beats") ? 1000 : 0) +
+                                                      (gBt.dev[best].rssi == 127 ? -100 : gBt.dev[best].rssi);
+                    if (score > bscore) best = k;
+                }
+                BtDevStatus *ls = bs_get(gBp.find.le_addr, 1);
+                if (best >= 0 && gBp.nact < 8) {
+                    gBp.act[gBp.nact].op = BT_ACT_CONNECT;
+                    memcpy(gBp.act[gBp.nact].addr, gBt.dev[best].addr, 6);
+                    gBp.nact++;
+                    BtDevStatus *cs = bs_get(gBt.dev[best].addr, 1);
+                    snprintf(cs->state, sizeof cs->state, "connecting");
+                    cs->t = now_s();
+                    ls->state[0] = 0;
+                    gBp.find.active = 0;
+                    printf("[macwifid] Bluetooth: found a classic audio device in pairing mode; connecting\n");
+                } else if (now_s() < gBp.find.until) {
+                    gBt.scan_req = 1;                             // keep looking
+                } else {
+                    snprintf(ls->state, sizeof ls->state, "failed");
+                    snprintf(ls->why, sizeof ls->why, "no headphones in pairing mode found");
+                    gBp.find.active = 0;
+                    printf("[macwifid] Bluetooth: no classic audio device in pairing mode found\n");
+                }
+                fflush(stdout);
+            }
+            pthread_mutex_unlock(&gBt.mu);
+        }
         uint8_t ev[HCI_MAX_EVENT];
         size_t n = 0;
         int wait_ms = 100;
@@ -1442,9 +1488,30 @@ static void serve_client(Daemon *d, int fd) {
                 int op = !strcmp(cmd, "bt_connect") ? BT_ACT_CONNECT : !strcmp(cmd, "bt_disconnect") ? BT_ACT_DISCONNECT
                        : !strcmp(cmd, "bt_forget") ? BT_ACT_FORGET : BT_ACT_SOUND;
                 pthread_mutex_lock(&gBt.mu);
-                int le_only = 0;
+                int le_only = 0, le_audio = 0;
                 for (int k = 0; k < gBt.ndev; k++)
-                    if (!memcmp(gBt.dev[k].addr, a, 6) && gBt.dev[k].kind == HCI_DEV_LE && !bp_find(a)) le_only = 1;
+                    if (!memcmp(gBt.dev[k].addr, a, 6) && gBt.dev[k].kind == HCI_DEV_LE && !bp_find(a)) {
+                        const HciDevice *v = &gBt.dev[k];
+                        const char *kind = hci_appearance_kind(v->appearance);
+                        le_only = 1;
+                        le_audio = (v->has_company && v->company == 0x004C) || strstr(v->name, "AirPods") ||
+                                   strstr(v->name, "Beats") || (kind && !strcmp(kind, "Audio"));
+                    }
+                if (op == BT_ACT_CONNECT && le_only && le_audio && gBt.up) {
+                    gBp.find.active = 1;
+                    memcpy(gBp.find.le_addr, a, 6);
+                    gBp.find.until = now_s() + 50;
+                    gBt.scan_req = 1;
+                    BtDevStatus *s = bs_get(a, 1);
+                    snprintf(s->state, sizeof s->state, "finding");
+                    s->t = now_s();
+                    le_only = 0;                                  // handled: not an error
+                    printf("[macwifid] Bluetooth: looking for the classic side of an LE audio device\n");
+                    fflush(stdout);
+                    pthread_mutex_unlock(&gBt.mu);
+                    jo_bool(&j, "ok", 1);
+                    goto bt_done;
+                }
                 int ok = gBt.up && gBp.nact < 8 && !(op == BT_ACT_CONNECT && le_only);
                 if (ok) {
                     gBp.act[gBp.nact].op = op;
@@ -1458,9 +1525,10 @@ static void serve_client(Daemon *d, int fd) {
                 }
                 pthread_mutex_unlock(&gBt.mu);
                 jo_bool(&j, "ok", ok);
-                if (!ok) jo_str(&j, "error", le_only ? "Bluetooth LE devices can't be connected yet (classic ones can)"
+                if (!ok) jo_str(&j, "error", le_only ? "This device uses Bluetooth LE only, which can't be connected yet."
                                                      : "Bluetooth isn't ready");
             }
+        bt_done:;
         } else if (!strcmp(cmd, "bt_input")) {
             stream = 1;
             jo_bool(&j, "ok", 1);
