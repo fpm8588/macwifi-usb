@@ -313,3 +313,10 @@ Found:
   moment after START), and AirPods out of the case.
 - The "UGREEN Bluetooth" Core Audio device loaded (system_profiler lists it) after `killall coreaudiod`, but it
   wasn't shown in the Sound menu while it reported the Bluetooth transport type: now "virtual".
+
+## 2026-11-12: AirPods play the test sound (B5a passes)
+
+- The stream setup and delivery were already correct (basic-mode channels, RTP/SBC headers checked, 370 packets
+  completed, 0 flushed). The missing piece was AVRCP absolute volume: after we opened AVCTP and sent
+  SetAbsoluteVolume(127), the user heard the test sound in the AirPods Pro. Headphones that support absolute volume
+  can stay silent until the source sets it.

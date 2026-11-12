@@ -177,7 +177,9 @@ audio.
 - [x] Service: audio-class devices connect with AVDTP as the first profile; incoming devices may drive AVDTP
       (we start it after 1.5 s if they don't); RTP + SBC packets paced by the sample clock; a chime on start;
       suspend after 5 s of silence; "Play Test Sound"; no scans while streaming.
-- [ ] Hardware: pair AirPods (case button), hear the chime; reconnect after the case closes/opens; sleep/wake.
+- [x] Hardware: AirPods Pro paired (case button) and played the test sound (2026-11-12), once AVRCP absolute
+      volume was set.
+- [ ] Hardware: system audio through "UGREEN Bluetooth"; reconnect after the case closes/opens; sleep/wake.
 
 ### B5: audio
 - [ ] BR/EDR connections, SSP pairing, SDP, AVDTP, SBC encoder (tested against reference vectors), A2DP source,
