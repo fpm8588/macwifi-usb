@@ -302,3 +302,14 @@ Found:
   appeared and paired; the row showed Connected.
 - No chime heard (Play Test Sound). Not diagnosed yet: the next build logs every AVDTP message, SDP request and
   channel. Classic remote-name requests had been cancelled after 4 s, before the 5.12 s page timeout: now 7 s.
+
+## 2026-11-12: AirPods stream negotiation works; no audible sound yet
+
+- The AirPods drove AVDTP themselves after an SDP search: DISCOVER, GET_CAPABILITIES (SBC), SET_CONFIGURATION
+  (44.1 kHz, joint stereo, 16 blocks, bitpool 53), OPEN, their media channel (MTU 1023), START accepted; 268
+  packets of 8 frames sent, none dropped, then SUSPEND after 5 s of silence. ACL buffers: 9 x 1021 bytes.
+- No sound heard. The encoder's frame format, CRC and bit allocation were checked line by line against BlueZ's
+  decoder (sbc.c, read only): they match. Next: a longer test sound with a 0.6 s lead-in (sinks start playing a
+  moment after START), and AirPods out of the case.
+- The "UGREEN Bluetooth" Core Audio device loaded (system_profiler lists it) after `killall coreaudiod`, but it
+  wasn't shown in the Sound menu while it reported the Bluetooth transport type: now "virtual".

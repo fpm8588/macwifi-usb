@@ -667,6 +667,10 @@ typedef struct {
 } BtAudio;
 static BtAudio gAudio;
 
+// The test sound: 0.6 s of silence first (headphones need a moment after START before they play anything), then
+// two tones (E5, A5) at about -6 dBFS with a fade, 3 s in all.
+#define BT_CHIME_S 3.0
+
 // Audio from the Core Audio plug-in ("UGREEN Bluetooth" output): UDP datagrams on 127.0.0.1 into a jitter
 // buffer (~93 ms before playback starts, at most 1 s).
 static PcmRing gPcm;
@@ -759,7 +763,7 @@ static void av_streaming(void *ctx, int on, const SbcConfig *cfg) {
         gAudio.idle_since = now_s();
         if (gPcmReady) pcmring_clear(&gPcm);
         if (!gAudio.chimed && !pcm_recent()) {   // a short chime the first time: it works
-            gAudio.tone_until = now_s() + 1.2;
+            gAudio.tone_until = now_s() + BT_CHIME_S;
             gAudio.chimed = 1;
         }
         printf("[macwifid] Bluetooth audio: streaming SBC %.1f kHz, %s, %d blocks, bitpool %d (%zu-byte frames)\n",
@@ -821,12 +825,12 @@ static void audio_pump(void) {
         }
         for (int i = 0; i < spf; i++) {
             double v = 0;
-            if (chime) {              // two soft tones (E5 then A5) with a fade, like a connect chime
-                double el = 1.2 - (gAudio.tone_until - t);
-                double fr = el < 0.45 ? 659.25 : 880.0;
-                double env = el < 0.45 ? (el / 0.45) : (1.2 - el) / 0.75;
+            if (chime) {              // silence, then two tones (E5 then A5) with a fade
+                double el = BT_CHIME_S - (gAudio.tone_until - t) - 0.6;
+                double fr = el < 1.0 ? 659.25 : 880.0;
+                double env = el < 0 ? 0 : el < 0.05 ? el / 0.05 : el < 1.0 ? 1.0 : (BT_CHIME_S - 0.6 - el) / (BT_CHIME_S - 1.6);
                 if (env < 0) env = 0;
-                v = 0.25 * env * sin(gAudio.phase);
+                v = 0.5 * env * sin(gAudio.phase);
                 gAudio.phase += 2 * M_PI * fr / gAudio.rate;
                 if (gAudio.phase > 2 * M_PI) gAudio.phase -= 2 * M_PI;
             }
@@ -1294,7 +1298,7 @@ static void *bt_thread(void *arg) {
                 }
             } else if (act[i].op == BT_ACT_SOUND) {
                 if (audio_is(act[i].addr)) {
-                    gAudio.tone_until = now_s() + 1.2;
+                    gAudio.tone_until = now_s() + BT_CHIME_S;
                     gAudio.phase = 0;
                     if (!gAudio.streaming) {
                         if (avdtp_resume(&gAudio.av) != 0 && gAudio.av.state == AV_IDLE) avdtp_start(&gAudio.av);

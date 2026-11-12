@@ -316,7 +316,9 @@ static OSStatus GetPropertyData(AudioServerPlugInDriverRef d, AudioObjectID id, 
             *outSize = sizeof(AudioObjectID);
             return 0;
         case kAudioDevicePropertyRelatedDevices: NEED(AudioObjectID); *(AudioObjectID *)out = kObjDevice; return 0;
-        case kAudioDevicePropertyTransportType: NEED(UInt32); *(UInt32 *)out = kAudioDeviceTransportTypeBluetooth; return 0;
+        // "Virtual", like other software devices: macOS leaves Bluetooth-type devices that its own Bluetooth stack
+        // doesn't manage out of the Sound menu and Sound settings (seen on macOS 27).
+        case kAudioDevicePropertyTransportType: NEED(UInt32); *(UInt32 *)out = kAudioDeviceTransportTypeVirtual; return 0;
         case kAudioDevicePropertyClockDomain: NEED(UInt32); *(UInt32 *)out = 0; return 0;
         case kAudioDevicePropertyDeviceIsAlive: NEED(UInt32); *(UInt32 *)out = 1; return 0;
         case kAudioDevicePropertyDeviceIsRunning:
