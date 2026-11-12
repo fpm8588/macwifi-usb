@@ -30,7 +30,7 @@ launchctl print "system/$L" >/dev/null 2>&1 || echo "macwifid didn't start; run:
 # Load the "UGREEN Bluetooth" Core Audio device (Core Audio reads plug-ins when it starts).
 if [ -d /Library/Audio/Plug-Ins/HAL/MacWifiAudio.driver ]; then
     chown -R root:wheel /Library/Audio/Plug-Ins/HAL/MacWifiAudio.driver
-    launchctl kickstart -k system/com.apple.audio.coreaudiod 2>/dev/null || killall coreaudiod 2>/dev/null || true
+    killall coreaudiod 2>/dev/null || true
 fi
 user=$(stat -f %Su /dev/console 2>/dev/null)
 if [ -n "$user" ] && [ "$user" != "root" ]; then
