@@ -46,6 +46,9 @@
 #include "avdtp.h"
 #include "sdp.h"
 #include "sbc.h"
+#include "pcmring.h"
+#include <netinet/in.h>
+#include <arpa/inet.h>
 #include "bridge.h"
 #include "captive.h"
 #include "dhcp.h"

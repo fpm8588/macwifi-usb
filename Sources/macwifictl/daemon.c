@@ -662,9 +662,52 @@ typedef struct {
     uint16_t seq;
     double tone_until, idle_since, avdtp_kick;
     double phase;
+    int chimed;
     unsigned long packets, dropped;
 } BtAudio;
 static BtAudio gAudio;
+
+// Audio from the Core Audio plug-in ("UGREEN Bluetooth" output): UDP datagrams on 127.0.0.1 into a jitter
+// buffer (~93 ms before playback starts, at most 1 s).
+static PcmRing gPcm;
+static _Atomic long long gPcmLastMs;          // when audio last arrived (ms on the monotonic clock)
+static int gPcmReady;
+
+static void *pcm_thread(void *arg) {
+    (void)arg;
+    int s = socket(AF_INET, SOCK_DGRAM, 0);
+    if (s < 0) return NULL;
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof sa);
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(MW_PCM_PORT);
+    sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);              // local only
+    if (bind(s, (struct sockaddr *)&sa, sizeof sa) != 0) {
+        printf("[macwifid] Bluetooth audio: can't listen on 127.0.0.1:%d (%s)\n", MW_PCM_PORT, strerror(errno));
+        fflush(stdout);
+        close(s);
+        return NULL;
+    }
+    struct timeval tv = {1, 0};
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);
+    int rcvbuf = 256 * 1024;
+    setsockopt(s, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof rcvbuf);
+    uint8_t buf[sizeof(MwPcmHeader) + MW_PCM_MAX_FRAMES * 4];
+    while (!gStop) {
+        ssize_t n = recv(s, buf, sizeof buf, 0);
+        if (n <= 0) continue;
+        MwPcmHeader h;
+        const int16_t *smp;
+        if (pcm_datagram(buf, (size_t)n, &h, &smp) != 0) continue;
+        if (!gAudio.active) continue;                         // nobody to play to
+        pcmring_write(&gPcm, smp, h.frames, h.rate);
+        gPcmLastMs = (long long)(now_s() * 1000);
+    }
+    close(s);
+    return NULL;
+}
+
+static int pcm_recent(void) { return gPcmReady && now_s() * 1000 - (double)gPcmLastMs < 500; }
 
 static int audio_is(const uint8_t a[6]) { return gAudio.active && !memcmp(gAudio.addr, a, 6); }
 
@@ -698,7 +741,11 @@ static void av_streaming(void *ctx, int on, const SbcConfig *cfg) {
         gAudio.streaming = 1;
         gAudio.next_due = now_s();
         gAudio.idle_since = now_s();
-        if (gAudio.tone_until < now_s()) gAudio.tone_until = now_s() + 1.2;   // a short chime: it works
+        if (gPcmReady) pcmring_clear(&gPcm);
+        if (!gAudio.chimed && !pcm_recent()) {   // a short chime the first time: it works
+            gAudio.tone_until = now_s() + 1.2;
+            gAudio.chimed = 1;
+        }
         printf("[macwifid] Bluetooth audio: streaming SBC %.1f kHz, %s, %d blocks, bitpool %d (%zu-byte frames)\n",
                gAudio.rate / 1000, cfg->mode == SBC_MODE_MONO ? "mono" : cfg->mode == SBC_MODE_JOINT ? "joint stereo"
                                    : cfg->mode == SBC_MODE_DUAL ? "dual channel" : "stereo",
@@ -745,11 +792,19 @@ static void audio_pump(void) {
     int16_t pcm[16 * 8 * 2];
     uint8_t pkt[13 + 15 * 520];
     size_t o = 13;
-    int playing = t < gAudio.tone_until;
+    int chime = t < gAudio.tone_until;
+    int system = !chime && pcm_recent();
+    int playing = chime || system;
     for (int f = 0; f < frames; f++) {
+        if (system) {                                 // the Mac's own audio, from the plug-in
+            pcmring_read(&gPcm, pcm, (size_t)spf, nch, (uint32_t)gAudio.rate);
+            if (!sbc_encode(&gAudio.enc, pcm, pkt + o, sizeof pkt - o)) return;
+            o += flen;
+            continue;
+        }
         for (int i = 0; i < spf; i++) {
             double v = 0;
-            if (playing) {            // two soft tones (E5 then A5) with a fade, like a connect chime
+            if (chime) {              // two soft tones (E5 then A5) with a fade, like a connect chime
                 double el = 1.2 - (gAudio.tone_until - t);
                 double fr = el < 0.45 ? 659.25 : 880.0;
                 double env = el < 0.45 ? (el / 0.45) : (1.2 - el) / 0.75;
@@ -1226,6 +1281,9 @@ static void *bt_thread(void *arg) {
         if (gAudio.active && gAudio.avdtp_kick > 0 && now_s() >= gAudio.avdtp_kick) {
             gAudio.avdtp_kick = 0;
             if (gAudio.av.state == AV_IDLE) avdtp_start(&gAudio.av);   // the device didn't set the stream up itself
+        }
+        if (gAudio.active && !gAudio.streaming && pcm_recent() && gAudio.media_cid) {
+            if (avdtp_resume(&gAudio.av) != 0 && gAudio.av.state == AV_IDLE) avdtp_start(&gAudio.av);   // audio arrived
         }
         audio_pump();
         pthread_mutex_lock(&gBt.mu);
@@ -2009,6 +2067,11 @@ static int daemon_main(const DaemonHooks *hooks) {
     if (d->h.bluetooth) {
         bt_load_power(d);
         bp_load();
+        if (pcmring_init(&gPcm, 44100, 4096) == 0) {
+            gPcmReady = 1;
+            pthread_t pt;
+            if (pthread_create(&pt, NULL, pcm_thread, NULL) == 0) pthread_detach(pt);
+        }
         bt_on = pthread_create(&btt, NULL, bt_thread, d) == 0;
     }
 

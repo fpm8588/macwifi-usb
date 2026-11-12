@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleExecutable</key>
+    <string>MacWifiAudio</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.fpm8588.macwifi.audio</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>MacWifiAudio</string>
+    <key>CFBundlePackageType</key>
+    <string>BNDL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFPlugInFactories</key>
+    <dict>
+        <key>DD9C16DE-1099-448E-87CF-98C24BA47201</key>
+        <string>MacWifiAudio_Create</string>
+    </dict>
+    <key>CFPlugInTypes</key>
+    <dict>
+        <key>443ABAB8-E7B3-491A-B985-BEB9187030DB</key>
+        <array>
+            <string>DD9C16DE-1099-448E-87CF-98C24BA47201</string>
+        </array>
+    </dict>
+    <!-- The plug-in runs in Core Audio's sandbox; this lets it send the audio to macwifid on 127.0.0.1. -->
+    <key>AudioServerPlugIn_Network</key>
+    <true/>
+</dict>
+</plist>

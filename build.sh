@@ -63,6 +63,8 @@ run_tests() {
     "$B/test_sbc"
     $cc "${CFLAGS[@]}" Tests/test_av.c "$S/avdtp.c" "$S/sdp.c" "$S/sbc.c" -lm -o "$B/test_av"
     "$B/test_av"
+    $cc "${CFLAGS[@]}" Tests/test_pcmring.c "$S/pcmring.c" -lm -lpthread -o "$B/test_pcmring"
+    "$B/test_pcmring"
     $cc "${CFLAGS[@]}" Tests/test_reorder.c "$S/reorder.c" -o "$B/test_reorder"
     "$B/test_reorder"
     $cc "${CFLAGS[@]}" Tests/test_captive.c "$S/captive.c" -o "$B/test_captive"
@@ -76,7 +78,7 @@ run_tests() {
         $cc "${CFLAGS[@]}" -Wno-unused-function -no-pie -I Tests/macstubs -I Sources/macwifictl Tests/sim_connect.c \
             Sources/macwifictl/descdump.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" \
             "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/json.c" \
-            "$S/knownnet.c" "$S/rxq.c" "$S/reorder.c" "$S/captive.c" "$S/sae.c" "$S/p256.c" "$S/hci.c" "$S/bthost.c" "$S/hidboot.c" "$S/sbc.c" "$S/avdtp.c" "$S/sdp.c" $libs -lm -lpthread \
+            "$S/knownnet.c" "$S/rxq.c" "$S/reorder.c" "$S/captive.c" "$S/sae.c" "$S/p256.c" "$S/hci.c" "$S/bthost.c" "$S/hidboot.c" "$S/sbc.c" "$S/avdtp.c" "$S/sdp.c" "$S/pcmring.c" $libs -lm -lpthread \
             -Wl,--unresolved-symbols=ignore-all -o "$B/sim_connect"
         "$B/sim_connect" > "$B/sim_connect.log" 2>&1 || { cat "$B/sim_connect.log"; exit 1; }
         if grep -q "horse" "$B/sim_connect.log"; then echo "a test password appeared in the output"; exit 1; fi
@@ -94,7 +96,7 @@ build_cli() {
     [[ "$(uname)" == "Darwin" ]] || { echo "macwifictl needs macOS (IOKit)"; exit 1; }
     echo "== macwifictl (arm64)"
     clang "${CFLAGS[@]}" -arch arm64 -mmacosx-version-min=$MINOS -Wno-deprecated-declarations \
-        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c Sources/macwifictl/feth.c Sources/macwifictl/power.c Sources/macwifictl/rx_async.c Sources/macwifictl/bt_usb.c "$S/hci.c" "$S/bthost.c" "$S/hidboot.c" "$S/sbc.c" "$S/avdtp.c" "$S/sdp.c" "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/json.c" "$S/knownnet.c" "$S/rxq.c" "$S/reorder.c" "$S/captive.c" "$S/sae.c" "$S/p256.c" \
+        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c Sources/macwifictl/feth.c Sources/macwifictl/power.c Sources/macwifictl/rx_async.c Sources/macwifictl/bt_usb.c "$S/hci.c" "$S/bthost.c" "$S/hidboot.c" "$S/sbc.c" "$S/avdtp.c" "$S/sdp.c" "$S/pcmring.c" "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/json.c" "$S/knownnet.c" "$S/rxq.c" "$S/reorder.c" "$S/captive.c" "$S/sae.c" "$S/p256.c" \
         -framework IOKit -framework CoreFoundation -framework SystemConfiguration -o "$B/macwifictl"
     codesign --force --sign - "$B/macwifictl"
     file "$B/macwifictl"
@@ -128,16 +130,35 @@ build_app() {
 # The installer package. By default it includes this Mac's downloaded firmware when present (a package for your
 # own Macs; AICsemi's firmware has no open-source license, so don't share that package). With MW_PKG_NO_FIRMWARE=1
 # (the GitHub release build) it contains none, and the installer downloads and verifies it on the target Mac.
+# The Core Audio output device for Bluetooth headphones (an AudioServerPlugIn bundle, ad-hoc signed).
+build_audio() {
+    [[ "$(uname)" == "Darwin" ]] || { echo "the audio driver needs macOS"; exit 1; }
+    echo "== MacWifiAudio.driver (arm64)"
+    local drv="$B/MacWifiAudio.driver"
+    rm -rf "$drv"
+    mkdir -p "$drv/Contents/MacOS"
+    cp App/AudioDriver/Info.plist "$drv/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" "$drv/Contents/Info.plist"
+    cc -O2 -Wall -Wextra -bundle -arch arm64 -mmacosx-version-min=$MINOS App/AudioDriver/MacWifiAudio.c \
+        -framework CoreAudio -framework CoreFoundation -o "$drv/Contents/MacOS/MacWifiAudio"
+    # Core Audio finds the plug-in through this factory function (named in Info.plist): it must be exported.
+    nm -gU "$drv/Contents/MacOS/MacWifiAudio" | grep -q " _MacWifiAudio_Create$" ||
+        { echo "MacWifiAudio_Create isn't exported"; exit 1; }
+    codesign --force --sign - "$drv"
+}
+
 build_pkg() {
     build_cli
     build_app
+    build_audio
     local with_fw=1
     [[ "${MW_PKG_NO_FIRMWARE:-0}" == 1 || ! -d firmware/aic8800D80-legacy-mcu1 || ! -d firmware/aic8800D80 ]] && with_fw=0
     echo "== MacWifi.pkg ($VERSION, firmware $([[ $with_fw == 1 ]] && echo included || echo "downloaded at install"))"
     local root="$B/pkgroot" ver=$VERSION
     local A="$root/Library/Application Support/macwifi"
     rm -rf "$root"
-    mkdir -p "$A/firmware" "$root/Library/LaunchDaemons" "$root/Library/LaunchAgents" "$root/Applications"
+    mkdir -p "$A/firmware" "$root/Library/LaunchDaemons" "$root/Library/LaunchAgents" "$root/Applications" \
+        "$root/Library/Audio/Plug-Ins/HAL"
     cp "$B/macwifictl" "$A/macwifid"
     cp "$B/macwifictl" "$A/macwifictl"
     [[ $with_fw == 1 ]] && cp -R firmware/aic8800D80 firmware/aic8800D80-legacy-mcu1 "$A/firmware/"
@@ -147,6 +168,7 @@ build_pkg() {
     cp packaging/io.github.fpm8588.macwifid.plist "$root/Library/LaunchDaemons/"
     cp packaging/io.github.fpm8588.macwifi.menu.plist "$root/Library/LaunchAgents/"
     cp -R "$B/MacWifi.app" "$root/Applications/"
+    cp -R "$B/MacWifiAudio.driver" "$root/Library/Audio/Plug-Ins/HAL/"
     pkgbuild --root "$root" --component-plist packaging/components.plist --scripts packaging/scripts \
         --identifier io.github.fpm8588.macwifi --version "$ver" --install-location / --ownership recommended \
         "$B/MacWifi-$ver.pkg"
@@ -158,8 +180,9 @@ case "${1:-all}" in
     test)  run_tests ;;
     cli)   build_cli ;;
     app)   build_app ;;
+    audio) build_audio ;;
     pkg)   build_pkg ;;
     all)   run_tests; if [[ "$(uname)" == "Darwin" ]]; then build_cli; build_app; fi ;;
     clean) rm -rf "$B" ;;
-    *)     echo "usage: $0 test|cli|app|pkg|all|clean"; exit 2 ;;
+    *)     echo "usage: $0 test|cli|app|audio|pkg|all|clean"; exit 2 ;;
 esac
