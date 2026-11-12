@@ -458,6 +458,15 @@ static void test_profile_channels(void) {
     uint8_t nocp2[5] = {1, 0x21, 0x00, 50, 0};
     feed(&h, HCI_EV_NUM_COMPLETED_PKTS, nocp2, 5);
     CHECK(h.acl_credits == 4);                                                  // capped at the controller's total
+    // Control messages go out even when the count says full; a stale count recovers after a second
+    for (int i = 0; i < 4; i++) bthost_l2cap_send(&h, ADDR, (uint16_t)lmedia, big, 100);
+    CHECK(h.acl_credits == 0 && bthost_l2cap_send(&h, ADDR, (uint16_t)lmedia, big, 100) == -2);
+    CHECK(bthost_l2cap_send_ctrl(&h, ADDR, (uint16_t)lmedia, big, 10) == 0 && h.acl_credits == -1);
+    bthost_poll(&h, 50.0);
+    bthost_poll(&h, 50.5);
+    CHECK(h.acl_credits == -1);
+    bthost_poll(&h, 51.2);
+    CHECK(h.acl_credits == 4 && h.credit_resets == 1);
     // We close the media channel; the device closes signaling
     CHECK(bthost_l2cap_close(&h, ADDR, (uint16_t)lmedia) == 0 && ext_closed == 1);
     CHECK(host_sig(L2CAP_DISCONN_REQ, NULL, NULL) != NULL);

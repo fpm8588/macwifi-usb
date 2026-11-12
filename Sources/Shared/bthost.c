@@ -51,6 +51,15 @@ int bthost_cmd(BtHost *h, uint16_t opcode, const void *params, size_t plen) {
 }
 
 void bthost_poll(BtHost *h, double now) {
+    h->now = now;
+    if (h->last_nocp <= 0) h->last_nocp = now;
+    // No buffer-free report for a second while we think every buffer is in use: the count is stale (a lost or
+    // never-sent event). Start over rather than stall audio forever.
+    if (h->acl_credits <= 0 && now - h->last_nocp > 1.0) {
+        h->acl_credits = h->acl_total;
+        h->last_nocp = now;
+        h->credit_resets++;
+    }
     if (h->last_send < 0) h->last_send = now;
     // No Command Complete/Status for our last command seen in 0.5 s (it may have been consumed by a synchronous
     // caller, or lost): allow one more.
@@ -649,6 +658,7 @@ void bthost_event(BtHost *h, const HciEvent *ev) {
         if (n < 1) return;
         for (size_t i = 0; i < p[0] && 1 + i * 4 + 4 <= n; i++) h->acl_credits += le16(p + 1 + i * 4 + 2);
         if (h->acl_credits > h->acl_total) h->acl_credits = h->acl_total;
+        h->last_nocp = h->now;
         return;
     case HCI_EV_MODE_CHANGE:
         if (n < 6 || p[0] != 0) return;
@@ -688,6 +698,14 @@ int bthost_l2cap_send(BtHost *h, const uint8_t addr[6], uint16_t cid, const uint
     if (!ch || ch->state != CH_OPEN || n > ch->rmtu) return -1;
     int frags = (int)((4 + n + h->acl_mtu - 1) / h->acl_mtu);
     if (h->acl_credits < frags) return -2;
+    return send_l2cap(h, c, ch->rcid, d, n);
+}
+
+int bthost_l2cap_send_ctrl(BtHost *h, const uint8_t addr[6], uint16_t cid, const uint8_t *d, size_t n) {
+    BtConn *c = by_addr(h, addr);
+    if (!c) return -1;
+    BtChan *ch = chan_by_lcid(c, cid);
+    if (!ch || ch->state != CH_OPEN || n > ch->rmtu) return -1;
     return send_l2cap(h, c, ch->rcid, d, n);
 }
 

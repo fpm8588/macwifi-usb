@@ -738,16 +738,7 @@ static int av_send(void *ctx, const uint8_t *d, size_t n) {
     (void)ctx;
     if (!gAudio.sig_cid) return -1;
     av_log(">", d, n);
-    int r = bthost_l2cap_send(&gHost, gAudio.addr, gAudio.sig_cid, d, n);
-    if (r == -2) {                                      // buffers full of media: drain a little, then try once more
-        uint8_t ev[HCI_MAX_EVENT];
-        size_t m = 0;
-        if (gBtLink && bt_next_event(gBtLink, ev, &m, 20) == 1) {
-            HciEvent e;
-            if (hci_event(ev, m, &e) == 0) bthost_event(&gHost, &e);
-        }
-        r = bthost_l2cap_send(&gHost, gAudio.addr, gAudio.sig_cid, d, n);
-    }
+    int r = bthost_l2cap_send_ctrl(&gHost, gAudio.addr, gAudio.sig_cid, d, n);   // signaling is never dropped
     if (r != 0) { printf("[macwifid] Bluetooth audio: couldn't send (%d)\n", r); fflush(stdout); }
     return r;
 }
@@ -777,7 +768,8 @@ static void av_streaming(void *ctx, int on, const SbcConfig *cfg) {
                cfg->blocks, cfg->bitpool, sbc_frame_length(cfg));
     } else if (gAudio.streaming) {
         gAudio.streaming = 0;
-        printf("[macwifid] Bluetooth audio: stream paused (%lu packets sent, %lu dropped)\n", gAudio.packets, gAudio.dropped);
+        printf("[macwifid] Bluetooth audio: stream paused (%lu packets sent, %lu dropped; buffer count reset %lu times)\n",
+           gAudio.packets, gAudio.dropped, gHost.credit_resets);
     }
     fflush(stdout);
 }

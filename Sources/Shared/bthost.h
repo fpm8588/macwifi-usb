@@ -162,6 +162,8 @@ typedef struct {
     // ACL data flow control (Read Buffer Size, Number Of Completed Packets)
     uint16_t acl_mtu;
     int acl_total, acl_credits;
+    double now, last_nocp;       // poll time; when buffers were last reported free
+    unsigned long credit_resets; // times we assumed lost Number Of Completed Packets events
 } BtHost;
 
 void bthost_init(BtHost *h, const BtHostOps *ops);
@@ -188,6 +190,9 @@ void bthost_set_acl(BtHost *h, uint16_t mtu, int count);
 // are full (try later; audio drops the packet). close: 0 or -1.
 int bthost_l2cap_connect(BtHost *h, const uint8_t addr[6], uint16_t psm);
 int bthost_l2cap_send(BtHost *h, const uint8_t addr[6], uint16_t cid, const uint8_t *d, size_t n);
+// The same for small control messages that must not be dropped (AVDTP signaling): sent even when the buffer count
+// says full (the controller holds a few more, and the count may be stale).
+int bthost_l2cap_send_ctrl(BtHost *h, const uint8_t addr[6], uint16_t cid, const uint8_t *d, size_t n);
 int bthost_l2cap_close(BtHost *h, const uint8_t addr[6], uint16_t cid);
 // The other side's MTU for a channel (0 if none).
 uint16_t bthost_l2cap_mtu(const BtHost *h, const uint8_t addr[6], uint16_t cid);
