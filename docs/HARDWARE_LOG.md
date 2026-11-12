@@ -113,7 +113,7 @@ Stack started: 5 GHz supported, vendor info 0x00
 Firmware version: zh Dec 29 2023 16:46:29 - gf876b0f
 TX power levels: sent
 RF calibration done (rx gain tables 0x00181b2c / 0x00182540, tx 0x00182904 / 0x00182a8c)
-MAC address: 6c:1f:f7:8b:81:46
+MAC address: 6c:1f:f7:xx:xx:xx (masked)
 MAC reset; LMAC 0x06090100, MAC HW 0x0002fdfb/0x00014047, PHY 0x5ee24111/0x01020000, features 0x01e877d5, 32 stations, 4 interfaces
 Phase 2b hardware check passed.
 ```
