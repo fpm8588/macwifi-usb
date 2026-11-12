@@ -772,8 +772,9 @@ static void av_streaming(void *ctx, int on, const SbcConfig *cfg) {
                cfg->blocks, cfg->bitpool, sbc_frame_length(cfg));
     } else if (gAudio.streaming) {
         gAudio.streaming = 0;
-        printf("[macwifid] Bluetooth audio: stream paused (%lu packets sent, %lu dropped; buffer count reset %lu times)\n",
-           gAudio.packets, gAudio.dropped, gHost.credit_resets);
+        printf("[macwifid] Bluetooth audio: stream paused (%lu packets sent, %lu dropped; controller: %lu completed, "
+           "%lu flushed, %lu overflows; buffer count reset %lu times)\n", gAudio.packets, gAudio.dropped,
+           gHost.completed, gHost.flushed, gHost.overflows, gHost.credit_resets);
     }
     fflush(stdout);
 }
@@ -853,6 +854,12 @@ static void audio_pump(void) {
     gAudio.seq++;
     gAudio.ts += (uint32_t)(frames * spf);
     gAudio.next_due += frames * spf / gAudio.rate;
+    if (gAudio.packets == 0) {                       // the first packet's headers (RTP, SBC payload and frame headers)
+        printf("[macwifid] Bluetooth audio: first packet %zu bytes, %d frames:", o, frames);
+        for (size_t k = 0; k < 20 && k < o; k++) printf(" %02x", pkt[k]);
+        printf("\n");
+        fflush(stdout);
+    }
     if (bthost_l2cap_send(&gHost, gAudio.addr, gAudio.media_cid, pkt, o) == 0) gAudio.packets++;
     else gAudio.dropped++;
     if (playing) gAudio.idle_since = t;
@@ -930,8 +937,15 @@ static void bh_l2_closed(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t c
     }
 }
 
+static void bh_log(void *ctx, const char *line) {
+    (void)ctx;
+    printf("[macwifid] Bluetooth audio: %s\n", line);   // "audio" so the usual grep finds it
+    fflush(stdout);
+}
+
 static const BtHostOps kBtOps = {NULL, bh_send_cmd, bh_send_acl, bh_key_load, bh_key_store, bh_key_forget,
-                                 bh_accept, bh_event, bh_hid_input, bh_l2_accept, bh_l2_open, bh_l2_data, bh_l2_closed};
+                                 bh_accept, bh_event, bh_hid_input, bh_l2_accept, bh_l2_open, bh_l2_data, bh_l2_closed,
+                                 bh_log};
 
 static void bt_acl_in(void *ctx, const uint8_t *pkt, size_t n) {
     (void)ctx;

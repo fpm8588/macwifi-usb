@@ -2,6 +2,7 @@
 
 #include "bthost.h"
 
+#include <stdio.h>
 #include <string.h>
 
 static uint16_t le16(const uint8_t *p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -329,8 +330,41 @@ static void on_sig(BtHost *h, BtConn *c, uint8_t code, uint8_t id, const uint8_t
             send_sig(h, c, L2CAP_CMD_REJECT, id, r, 6);
             return;
         }
-        for (size_t o = 4; o + 2 <= n && o + 2 + d[o + 1] <= n; o += 2 + d[o + 1])
-            if ((d[o] & 0x7F) == 0x01 && d[o + 1] == 2) ch->rmtu = le16(d + o + 2);   // MTU option
+        // Options [Vol 3 Part A 5]: MTU (1), flush timeout (2), QoS (3), retransmission and flow control mode (4),
+        // FCS (5), ... We take any MTU / flush timeout / QoS, but only basic mode: a request for ERTM or streaming
+        // mode (which frame every packet differently) is refused with basic mode as the counter-proposal.
+        int bad_mode = 0;
+        char opts[160];
+        size_t ol = 0;
+        opts[0] = 0;
+        for (size_t o = 4; o + 2 <= n && o + 2 + d[o + 1] <= n; o += 2 + d[o + 1]) {
+            uint8_t type = d[o] & 0x7F, len = d[o + 1];
+            if (type == 0x01 && len == 2) ch->rmtu = le16(d + o + 2);
+            if (type == 0x04 && len >= 1 && d[o + 2] != 0x00) bad_mode = d[o + 2];
+            if (ol < sizeof opts - 24) {
+                ol += (size_t)snprintf(opts + ol, sizeof opts - ol, " %u:", type);
+                for (uint8_t k = 0; k < len && k < 4 && ol < sizeof opts - 4; k++)
+                    ol += (size_t)snprintf(opts + ol, sizeof opts - ol, "%02x", d[o + 2 + k]);
+            }
+        }
+        if (h->ops.log) {
+            char line[220];
+            snprintf(line, sizeof line, "L2CAP config request for PSM 0x%04x, flags 0x%04x, options:%s", ch->psm,
+                     le16(d + 2), opts[0] ? opts : " none");
+            h->ops.log(h->ops.ctx, line);
+        }
+        if (bad_mode) {
+            uint8_t r[6 + 11];
+            put16(r, ch->rcid);
+            put16(r + 2, 0);
+            put16(r + 4, 0x0001);                 // unacceptable parameters
+            r[6] = 0x04;                          // retransmission and flow control option, 9 bytes: basic mode
+            r[7] = 9;
+            memset(r + 8, 0, 9);
+            send_sig(h, c, L2CAP_CONF_RSP, id, r, 17);
+            if (h->ops.log) h->ops.log(h->ops.ctx, "L2CAP: refused a non-basic mode, proposed basic mode");
+            return;
+        }
         uint8_t r[6];
         put16(r, ch->rcid);
         put16(r + 2, 0);
@@ -345,6 +379,11 @@ static void on_sig(BtHost *h, BtConn *c, uint8_t code, uint8_t id, const uint8_t
         BtChan *ch = chan_by_lcid(c, le16(d));
         if (!ch || ch->state != CH_CONFIG) return;
         uint16_t result = le16(d + 4);
+        if (h->ops.log && result != 0) {
+            char line[96];
+            snprintf(line, sizeof line, "L2CAP config response for PSM 0x%04x: result 0x%04x", ch->psm, result);
+            h->ops.log(h->ops.ctx, line);
+        }
         if (result == 0) {
             ch->cfg_out_ok = 1;
             check_open(h, c, ch);
@@ -656,9 +695,18 @@ void bthost_event(BtHost *h, const HciEvent *ev) {
         return;
     case HCI_EV_NUM_COMPLETED_PKTS:
         if (n < 1) return;
-        for (size_t i = 0; i < p[0] && 1 + i * 4 + 4 <= n; i++) h->acl_credits += le16(p + 1 + i * 4 + 2);
+        for (size_t i = 0; i < p[0] && 1 + i * 4 + 4 <= n; i++) {
+            h->acl_credits += le16(p + 1 + i * 4 + 2);
+            h->completed += le16(p + 1 + i * 4 + 2);
+        }
         if (h->acl_credits > h->acl_total) h->acl_credits = h->acl_total;
         h->last_nocp = h->now;
+        return;
+    case HCI_EV_FLUSH_OCCURRED:
+        h->flushed++;
+        return;
+    case HCI_EV_DATA_BUFFER_OVERFLOW:
+        h->overflows++;
         return;
     case HCI_EV_MODE_CHANGE:
         if (n < 6 || p[0] != 0) return;

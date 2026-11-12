@@ -68,8 +68,10 @@ static void f_l2_data(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid,
 }
 static void f_l2_closed(void *ctx, const uint8_t a[6], uint16_t psm, uint16_t cid) { (void)ctx; (void)a; (void)psm; (void)cid; ext_closed++; }
 
+static int nlog;
+static void f_log(void *ctx, const char *line) { (void)ctx; (void)line; nlog++; }
 static const BtHostOps kOps = {NULL, f_cmd, f_acl, f_key_load, f_key_store, f_key_forget, f_accept, f_event, f_hid,
-                               f_l2_accept, f_l2_open, f_l2_data, f_l2_closed};
+                               f_l2_accept, f_l2_open, f_l2_data, f_l2_closed, f_log};
 static const uint8_t ADDR[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
 
 static void reset_capture(void) { ncmds = 0; nacls = 0; nev = 0; }
@@ -421,6 +423,11 @@ static void test_profile_channels(void) {
     cq = host_sig(L2CAP_CONF_REQ, &id, NULL);
     uint8_t r2[6] = {(uint8_t)lav, (uint8_t)(lav >> 8), 0, 0, 0, 0};
     dev_sig(&h, 0x21, L2CAP_CONF_RSP, id, r2, 6);
+    // First the device asks for streaming mode: refused (unacceptable parameters) with basic mode proposed
+    uint8_t rs[17] = {(uint8_t)lav, (uint8_t)(lav >> 8), 0, 0, 0x04, 0x09, 0x04, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0};
+    dev_sig(&h, 0x21, L2CAP_CONF_REQ, 0x5A, rs, 17);
+    const uint8_t *crej = host_sig(L2CAP_CONF_RSP, &id, NULL);
+    CHECK(crej && id == 0x5A && u16(crej + 4) == 0x0001 && crej[6] == 0x04 && crej[8] == 0x00 && ext_open == 1 && nlog >= 2);
     uint8_t r3[8] = {(uint8_t)lav, (uint8_t)(lav >> 8), 0, 0, 0x01, 0x02, 0x7F, 0x03};   // MTU 895
     dev_sig(&h, 0x21, L2CAP_CONF_REQ, 0x54, r3, 8);
     CHECK(ext_open == 2 && ext_psm == L2CAP_PSM_AVDTP && ext_cid == lav);

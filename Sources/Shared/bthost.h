@@ -44,6 +44,8 @@
 #define HCI_EV_ENCRYPT_CHANGE          0x08
 #define HCI_EV_NUM_COMPLETED_PKTS      0x13
 #define HCI_EV_MODE_CHANGE             0x14
+#define HCI_EV_FLUSH_OCCURRED          0x11
+#define HCI_EV_DATA_BUFFER_OVERFLOW    0x1A
 #define HCI_EV_PIN_CODE_REQUEST        0x16
 #define HCI_EV_LINK_KEY_REQUEST        0x17
 #define HCI_EV_LINK_KEY_NOTIFY         0x18
@@ -146,6 +148,8 @@ typedef struct {
     void (*l2cap_open)(void *ctx, const uint8_t addr[6], uint16_t psm, uint16_t cid);
     void (*l2cap_data)(void *ctx, const uint8_t addr[6], uint16_t psm, uint16_t cid, const uint8_t *d, size_t n);
     void (*l2cap_closed)(void *ctx, const uint8_t addr[6], uint16_t psm, uint16_t cid);
+    // Diagnostics (may be NULL): one line of text, no addresses or payloads.
+    void (*log)(void *ctx, const char *line);
 } BtHostOps;
 
 #define BTH_CMDQ 24
@@ -164,6 +168,7 @@ typedef struct {
     int acl_total, acl_credits;
     double now, last_nocp;       // poll time; when buffers were last reported free
     unsigned long credit_resets; // times we assumed lost Number Of Completed Packets events
+    unsigned long completed, flushed, overflows;   // ACL packets the controller reported sent / flushed; overflows
 } BtHost;
 
 void bthost_init(BtHost *h, const BtHostOps *ops);
