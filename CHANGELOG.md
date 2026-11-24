@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+**Safety**
+- Crash guard: the service keeps a marker file while it runs. A start that finds it still there (after a kernel
+  panic, a power loss or a crash) doesn't join networks by itself, and a second unclean start leaves the adapter
+  off, until the person joins a network or switches Wi-Fi on. A crash can no longer repeat on every boot.
+- Only well-formed plain IPv4, ARP and IPv6 frames (no VLAN tags, no 802.3/LLC, no frame whose header disagrees with
+  its length) are written to macOS's network stack. Motivation: two kernel panics ("Bounds safety trap", macOS 27.2)
+  while the service ran on an open public network; none without the service. The cause is not confirmed.
+
 **New**
 - Bluetooth, phase B1: `macwifictl bt` opens the adapter's own Bluetooth controller from user space (no kext),
   identifies it and lists nearby Bluetooth LE and classic devices. Plan: `docs/BLUETOOTH_PROMPT.md`.

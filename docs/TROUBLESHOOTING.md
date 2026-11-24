@@ -121,6 +121,22 @@ If "UGREEN Bluetooth" is missing from the output list, run `sudo killall coreaud
 `macwifictl scan/connect/join/fwload/up` drive the adapter directly and refuse while the service is running.
 Uninstall the service first, or use `macwifictl status` / `macwifictl networks`.
 
+## The Mac restarts with "Your computer was restarted because of a problem"
+
+A kernel panic. macwifi runs in user space and cannot crash the kernel itself, but what it hands the kernel (USB
+transfers, network frames, the network service) can trigger a bug in it. Two panics were seen on macOS 27.2 with the
+service running on an open public network, none with it stopped (docs/HARDWARE_LOG.md). To get the Mac stable:
+
+1. Unplug the adapter and stop the service: `sudo launchctl disable system/io.github.fpm8588.macwifid` and
+   `sudo launchctl bootout system/io.github.fpm8588.macwifid`.
+2. After an update, `echo 1 | sudo tee "/Library/Application Support/macwifi/guard"` makes the next start paused
+   (no automatic joining); then `sudo launchctl enable system/io.github.fpm8588.macwifid` and
+   `sudo launchctl bootstrap system /Library/LaunchDaemons/io.github.fpm8588.macwifid.plist`.
+3. The service starts paused after any unclean shutdown by itself (the menu shows why). Joining a network by hand
+   lifts the pause. To lift it without joining: `sudo rm "/Library/Application Support/macwifi/guard"`.
+
+If you report it, include the panic's first line and `sudo macwifictl status`; leave out network names and addresses.
+
 ## Remove everything
 
 ```bash

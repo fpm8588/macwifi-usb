@@ -45,6 +45,8 @@ run_tests() {
     "$B/test_dhcp"
     $cc "${CFLAGS[@]}" Tests/test_bridge.c "$S/bridge.c" -o "$B/test_bridge"
     "$B/test_bridge"
+    $cc "${CFLAGS[@]}" Tests/test_guard.c "$S/guard.c" -o "$B/test_guard"
+    "$B/test_guard"
     $cc "${CFLAGS[@]}" Tests/test_json.c "$S/json.c" "$S/knownnet.c" -o "$B/test_json"
     "$B/test_json"
     $cc "${CFLAGS[@]}" Tests/test_rxq.c "$S/rxq.c" -lpthread -o "$B/test_rxq"
@@ -77,7 +79,7 @@ run_tests() {
         # connect logic from main.c against a simulated firmware + AP, behind stand-in IOKit headers
         $cc "${CFLAGS[@]}" -Wno-unused-function -no-pie -I Tests/macstubs -I Sources/macwifictl Tests/sim_connect.c \
             Sources/macwifictl/descdump.c "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" \
-            "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/json.c" \
+            "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/guard.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/json.c" \
             "$S/knownnet.c" "$S/rxq.c" "$S/reorder.c" "$S/captive.c" "$S/sae.c" "$S/p256.c" "$S/hci.c" "$S/bthost.c" "$S/hidboot.c" "$S/sbc.c" "$S/avdtp.c" "$S/sdp.c" "$S/pcmring.c" $libs -lm -lpthread \
             -Wl,--unresolved-symbols=ignore-all -o "$B/sim_connect"
         "$B/sim_connect" > "$B/sim_connect.log" 2>&1 || { cat "$B/sim_connect.log"; exit 1; }
@@ -96,7 +98,7 @@ build_cli() {
     [[ "$(uname)" == "Darwin" ]] || { echo "macwifictl needs macOS (IOKit)"; exit 1; }
     echo "== macwifictl (arm64)"
     clang "${CFLAGS[@]}" -arch arm64 -mmacosx-version-min=$MINOS -Wno-deprecated-declarations \
-        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c Sources/macwifictl/feth.c Sources/macwifictl/power.c Sources/macwifictl/rx_async.c Sources/macwifictl/bt_usb.c "$S/hci.c" "$S/bthost.c" "$S/hidboot.c" "$S/sbc.c" "$S/avdtp.c" "$S/sdp.c" "$S/pcmring.c" "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/json.c" "$S/knownnet.c" "$S/rxq.c" "$S/reorder.c" "$S/captive.c" "$S/sae.c" "$S/p256.c" \
+        -I Sources/macwifictl Sources/macwifictl/main.c Sources/macwifictl/descdump.c Sources/macwifictl/feth.c Sources/macwifictl/power.c Sources/macwifictl/rx_async.c Sources/macwifictl/bt_usb.c "$S/hci.c" "$S/bthost.c" "$S/hidboot.c" "$S/sbc.c" "$S/avdtp.c" "$S/sdp.c" "$S/pcmring.c" "$S/aic_msg.c" "$S/aic_fwload.c" "$S/aic_fmac.c" "$S/ieee80211.c" "$S/aic_data.c" "$S/dhcp.c" "$S/bridge.c" "$S/guard.c" "$S/eapol.c" "$S/wpa.c" "$S/crypto_backend.c" "$S/json.c" "$S/knownnet.c" "$S/rxq.c" "$S/reorder.c" "$S/captive.c" "$S/sae.c" "$S/p256.c" \
         -framework IOKit -framework CoreFoundation -framework SystemConfiguration -o "$B/macwifictl"
     codesign --force --sign - "$B/macwifictl"
     file "$B/macwifictl"

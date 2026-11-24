@@ -81,6 +81,21 @@ static size_t frame(uint8_t *f, const uint8_t *da, const uint8_t *sa, uint16_t t
     return total;
 }
 
+// A frame with a consistent IPv4 / IPv6 header (the payload stays filler), so the shape check passes.
+static size_t ipframe(uint8_t *f, const uint8_t *da, const uint8_t *sa, uint16_t type, size_t total) {
+    frame(f, da, sa, type, total);
+    if (type == 0x0800 && total >= 34) {
+        f[14] = 0x45;
+        f[16] = (uint8_t)((total - 14) >> 8);
+        f[17] = (uint8_t)(total - 14);
+    } else if (type == 0x86DD && total >= 54) {
+        f[14] = 0x60;
+        f[18] = (uint8_t)((total - 54) >> 8);
+        f[19] = (uint8_t)(total - 54);
+    }
+    return total;
+}
+
 static void test_rules(void) {
     static const uint8_t bcast[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
     static const uint8_t mcast[6] = {0x33, 0x33, 0, 0, 0, 0xfb};
@@ -99,17 +114,46 @@ static void test_rules(void) {
     CHECK(bridge_from_host(f, frame(f, router, kMac, 0x888E, 60), kMac) == BRIDGE_DROP_EAPOL);
 
     // to macOS
-    CHECK(bridge_to_host(f, frame(f, kMac, router, 0x0800, 60), kMac, 1, 1) == BRIDGE_PASS);
-    CHECK(bridge_to_host(f, frame(f, bcast, router, 0x0806, 60), kMac, 1, 1) == BRIDGE_PASS);
-    CHECK(bridge_to_host(f, frame(f, mcast, other, 0x86DD, 90), kMac, 1, 1) == BRIDGE_PASS);
-    CHECK(bridge_to_host(f, frame(f, kMac, router, 0x0800, 60), kMac, 0, 1) == BRIDGE_DROP_PLAIN);
-    CHECK(bridge_to_host(f, frame(f, kMac, router, 0x0800, 60), kMac, 0, 0) == BRIDGE_PASS);   // open network
-    CHECK(bridge_to_host(f, frame(f, bcast, kMac, 0x0806, 60), kMac, 1, 1) == BRIDGE_DROP_ECHO);
-    CHECK(bridge_to_host(f, frame(f, mcast, kMac, 0x86DD, 90), kMac, 1, 1) == BRIDGE_DROP_ECHO);
-    CHECK(bridge_to_host(f, frame(f, other, router, 0x0800, 60), kMac, 1, 1) == BRIDGE_DROP_NOT_OURS);
-    CHECK(bridge_to_host(f, frame(f, kMac, router, 0x888E, 60), kMac, 0, 0) == BRIDGE_DROP_EAPOL);
-    CHECK(bridge_to_host(f, frame(f, kMac, router, 0x0800, 1600), kMac, 1, 1) == BRIDGE_DROP_LONG);
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x0800, 60), kMac, 1, 1) == BRIDGE_PASS);
+    CHECK(bridge_to_host(f, ipframe(f, bcast, router, 0x0806, 60), kMac, 1, 1) == BRIDGE_PASS);
+    CHECK(bridge_to_host(f, ipframe(f, mcast, other, 0x86DD, 90), kMac, 1, 1) == BRIDGE_PASS);
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x0800, 1514), kMac, 1, 1) == BRIDGE_PASS);
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x0800, 34), kMac, 1, 1) == BRIDGE_PASS);   // header only, no payload
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x0800, 60), kMac, 0, 1) == BRIDGE_DROP_PLAIN);
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x0800, 60), kMac, 0, 0) == BRIDGE_PASS);   // open network
+    CHECK(bridge_to_host(f, ipframe(f, bcast, kMac, 0x0806, 60), kMac, 1, 1) == BRIDGE_DROP_ECHO);
+    CHECK(bridge_to_host(f, ipframe(f, mcast, kMac, 0x86DD, 90), kMac, 1, 1) == BRIDGE_DROP_ECHO);
+    CHECK(bridge_to_host(f, ipframe(f, other, router, 0x0800, 60), kMac, 1, 1) == BRIDGE_DROP_NOT_OURS);
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x888E, 60), kMac, 0, 0) == BRIDGE_DROP_EAPOL);
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x0800, 1600), kMac, 1, 1) == BRIDGE_DROP_LONG);
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x0800, 1515), kMac, 1, 1) == BRIDGE_DROP_LONG);   // no VLAN tag room
     CHECK(bridge_to_host(f, 10, kMac, 1, 1) == BRIDGE_DROP_SHORT);
+    // types and shapes macOS never gets
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x8100, 80), kMac, 1, 1) == BRIDGE_DROP_TYPE);   // VLAN tag
+    CHECK(bridge_to_host(f, ipframe(f, mcast, router, 0x0027, 60), kMac, 1, 1) == BRIDGE_DROP_TYPE);  // 802.3 length + LLC
+    CHECK(bridge_to_host(f, ipframe(f, mcast, router, 0x88CC, 60), kMac, 1, 1) == BRIDGE_DROP_TYPE);  // LLDP
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x0800, 14), kMac, 1, 1) == BRIDGE_DROP_SHAPE);   // IPv4, no header
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x0806, 30), kMac, 1, 1) == BRIDGE_DROP_SHAPE);   // ARP, truncated
+    ipframe(f, kMac, router, 0x0800, 60);
+    f[14] = 0x55;                                                                                        // version 5
+    CHECK(bridge_to_host(f, 60, kMac, 1, 1) == BRIDGE_DROP_SHAPE);
+    f[14] = 0x44;                                                                                        // header length 16
+    CHECK(bridge_to_host(f, 60, kMac, 1, 1) == BRIDGE_DROP_SHAPE);
+    f[14] = 0x4F;                                                                                        // header 60 > frame
+    CHECK(bridge_to_host(f, 60, kMac, 1, 1) == BRIDGE_DROP_SHAPE);
+    ipframe(f, kMac, router, 0x0800, 60);
+    f[16] = 0x10;                                                                                        // total length 4142 > frame
+    CHECK(bridge_to_host(f, 60, kMac, 1, 1) == BRIDGE_DROP_SHAPE);
+    ipframe(f, kMac, router, 0x0800, 60);
+    f[16] = 0; f[17] = 10;                                                                               // total length < header
+    CHECK(bridge_to_host(f, 60, kMac, 1, 1) == BRIDGE_DROP_SHAPE);
+    ipframe(f, kMac, router, 0x86DD, 90);
+    f[14] = 0x40;                                                                                        // IPv6 with version 4
+    CHECK(bridge_to_host(f, 90, kMac, 1, 1) == BRIDGE_DROP_SHAPE);
+    ipframe(f, kMac, router, 0x86DD, 90);
+    f[18] = 0x20;                                                                                        // payload longer than frame
+    CHECK(bridge_to_host(f, 90, kMac, 1, 1) == BRIDGE_DROP_SHAPE);
+    CHECK(bridge_to_host(f, ipframe(f, kMac, router, 0x86DD, 53), kMac, 1, 1) == BRIDGE_DROP_SHAPE);   // IPv6, short header
     CHECK(!strcmp(bridge_verdict_name(BRIDGE_DROP_ECHO), "own echo") && !strcmp(bridge_verdict_name(BRIDGE_DROP_COUNT), "?"));
 }
 

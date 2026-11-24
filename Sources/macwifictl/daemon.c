@@ -198,6 +198,58 @@ static void d_save_power(Daemon *d) {
     write_private(p, d->power ? "1\n" : "0\n", 2);
 }
 
+// ---------------------------------------------------------------- crash guard (see guard.h)
+
+static int gGuard;   // GUARD_* level for this run
+
+static void guard_file(const Daemon *d, const char *name, char *out, size_t cap) { d_path(d, name, out, cap); }
+
+static void guard_save(const Daemon *d) {
+    char p[1024];
+    guard_file(d, "guard", p, sizeof p);
+    char t[3] = {(char)('0' + gGuard), '\n', 0};
+    write_private(p, t, 2);
+}
+
+// Reads the stored level and the "running" marker, decides this run's level, and plants the marker again.
+static void guard_begin(Daemon *d) {
+    if (geteuid() != 0) return;
+    char gp[1024], rp[1024];
+    guard_file(d, "guard", gp, sizeof gp);
+    guard_file(d, "running", rp, sizeof rp);
+    size_t n = 0;
+    char *t = read_small(gp, &n);
+    int level = guard_parse(t, n);
+    free(t);
+    int unclean = access(rp, F_OK) == 0;
+    gGuard = guard_after_start(level, unclean);
+    guard_save(d);
+    write_private(rp, "1\n", 2);
+    if (unclean) printf("[macwifid] the last run did not end cleanly (crash, power loss or kernel panic)\n");
+    if (gGuard == GUARD_NET_PAUSED) {
+        printf("[macwifid] crash guard: not joining networks automatically; join one by hand to switch it off\n");
+        d_set_error(d, "Paused after an unclean shutdown: connect to a network by hand to resume");
+    } else if (gGuard >= GUARD_OFF) {
+        d->power = 0;
+        printf("[macwifid] crash guard: the adapter stays off; switch Wi-Fi on to resume\n");
+        d_set_error(d, "Off after repeated unclean shutdowns: switch Wi-Fi on to resume");
+    }
+}
+
+static void guard_end(const Daemon *d) {
+    if (geteuid() != 0) return;
+    char rp[1024];
+    guard_file(d, "running", rp, sizeof rp);
+    unlink(rp);
+}
+
+static void guard_set(const Daemon *d, int level) {
+    if (level == gGuard) return;
+    gGuard = level;
+    if (geteuid() == 0) guard_save(d);
+    printf("[macwifid] crash guard: %s\n", level ? "partly lifted" : "off");
+}
+
 // ---------------------------------------------------------------- control socket (its own thread)
 
 static void reply_status(Daemon *d, JsonOut *j) {
@@ -215,6 +267,7 @@ static void reply_status(Daemon *d, JsonOut *j) {
     }
     jo_str(j, "error", d->error);
     jo_str(j, "version", MW_VERSION);
+    jo_int(j, "guard", gGuard);
 }
 
 static void reply_networks(Daemon *d, JsonOut *j) {
@@ -2044,6 +2097,7 @@ static void d_handle(Daemon *d, Adapter *a, int *manual_off, double *next_autojo
         case DC_POWER:
             d->power = on;
             d_save_power(d);
+            if (on) guard_set(d, guard_after_power_on(gGuard));
             if (!on) { d_release(d, a); d_set_state(d, DS_OFF); }
             *manual_off = 0;
             d_finish(d, 1, "");
@@ -2098,6 +2152,7 @@ static void d_handle(Daemon *d, Adapter *a, int *manual_off, double *next_autojo
                 pthread_mutex_unlock(&d->mu);
                 d_save_known(d);
                 *manual_off = 0;
+                guard_set(d, guard_after_join(gGuard));
             } else {
                 d_set_error(d, err);
                 if (wrong && !has_pass) {   // a remembered key stopped working: stop auto-joining it
@@ -2150,6 +2205,7 @@ static int daemon_main(const DaemonHooks *hooks) {
     setvbuf(stdout, NULL, _IOLBF, 0);
     printf("[macwifid] starting, version %s (pid %d)\n", MW_VERSION, (int)getpid());
     d_load(d);
+    guard_begin(d);
     if (geteuid() == 0) {
         int n = feth_cleanup();
         if (n > 0) printf("[macwifid] removed %d item(s) left over from an earlier run\n", n);
@@ -2304,7 +2360,7 @@ static int daemon_main(const DaemonHooks *hooks) {
         pthread_mutex_lock(&d->mu);
         for (int i = 0; i < d->known.count; i++) any_autojoin |= d->known.n[i].autojoin;
         pthread_mutex_unlock(&d->mu);
-        if (a->up && !a->connected && !manual_off && any_autojoin && now_s() >= next_autojoin) {
+        if (a->up && !a->connected && !manual_off && any_autojoin && !gGuard && now_s() >= next_autojoin) {
             // auto-join: scan, pick the strongest remembered network
             int ok = 0;
             if (d_scan(d, a, NULL, 0) == 0) {
@@ -2373,6 +2429,7 @@ static int daemon_main(const DaemonHooks *hooks) {
     pthread_mutex_lock(&d->mu);
     kn_wipe(&d->known);
     pthread_mutex_unlock(&d->mu);
+    guard_end(d);
     return 0;
 }
 

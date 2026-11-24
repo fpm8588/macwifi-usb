@@ -320,3 +320,12 @@ Found:
   completed, 0 flushed). The missing piece was AVRCP absolute volume: after we opened AVCTP and sent
   SetAbsoluteVolume(127), the user heard the test sound in the AirPods Pro. Headphones that support absolute volume
   can stay silent until the source sets it.
+
+## 2026-11-24: kernel panics with the service running (macOS 27.2)
+
+- Two panics, "Bounds safety trap" at the same kernel offset (kernel thread, no third-party kext in the backtrace), the
+  first about 30 s after the adapter was plugged in, the second about 3 min after the service was started with
+  Bluetooth off. The adapter plugged in with the service stopped: stable for 2 min; the user reports no crash without
+  the service. Both runs were on an open public network (not the home network); the earlier panic run had joined and
+  received an address before it. Third-party drivers (Waves SoundGrid, Digidesign DigiDal) were loaded and a theme
+  changer had been used earlier, so the cause is open. Mitigations: crash guard; strict frames to macOS.

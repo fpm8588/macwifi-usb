@@ -21,6 +21,8 @@ int bridge_bpf_next(const uint8_t *buf, size_t len, size_t *off, const uint8_t *
 
 // Largest Ethernet frame passed either way: 1500-byte MTU + 14-byte header + one 802.1Q tag.
 #define BRIDGE_MAX_FRAME 1518
+// Largest frame passed to macOS: the feth pair has no VLAN, so no tag either.
+#define BRIDGE_MAX_TO_HOST 1514
 
 typedef enum {
     BRIDGE_PASS = 0,
@@ -31,6 +33,8 @@ typedef enum {
     BRIDGE_DROP_PLAIN,       // to macOS: arrived unencrypted although keys are installed
     BRIDGE_DROP_NOT_OURS,    // to macOS: unicast for another address
     BRIDGE_DROP_ECHO,        // to macOS: our own broadcast/multicast reflected by the AP (SA = our address)
+    BRIDGE_DROP_TYPE,        // to macOS: not IPv4, ARP or IPv6 (VLAN-tagged, 802.3/LLC, vendor protocols, ...)
+    BRIDGE_DROP_SHAPE,       // to macOS: IPv4/IPv6/ARP header inconsistent with the frame's length
     BRIDGE_DROP_COUNT
 } BridgeVerdict;
 

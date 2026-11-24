@@ -415,7 +415,7 @@ static void on_msg(uint16_t id, const uint8_t *p, uint16_t plen) {
             eth[12] = 0x08; eth[13] = 0x06;
             in_data(eth, 14 + 28, 1);
             memcpy(eth, "\x33\x33\x00\x00\x00\x01", 6);
-            eth[12] = 0x86; eth[13] = 0xDD;
+            eth[12] = 0x86; eth[13] = 0xDD; eth[14] = 0x60;   // a well-formed (empty) IPv6 header: the bridge checks them
             in_data(eth, 14 + 40, 1);
             // our own broadcast reflected by the AP (must not reach macOS), and a plaintext frame after the
             // keys are in place (must not reach macOS either)
@@ -423,7 +423,7 @@ static void on_msg(uint16_t id, const uint8_t *p, uint16_t plen) {
             eth[12] = 0x08; eth[13] = 0x06;
             in_data(eth, 14 + 28, 1);
             memcpy(eth, kMac, 6); memcpy(eth + 6, "\x02\x00\x00\x00\x00\x09", 6);
-            eth[12] = 0x08; eth[13] = 0x00; eth[14] = 0x45; eth[15] = 0xAB;
+            eth[12] = 0x08; eth[13] = 0x00; eth[14] = 0x45; eth[15] = 0xAB; eth[16] = 0; eth[17] = 40;   // IPv4, total length 40
             in_data(eth, 14 + 40, 0);
             // a block-ack burst arriving out of order (sequence 20, 22, 21): macOS must see 20, 21, 22
             for (int k = 0; k < 3; k++) {

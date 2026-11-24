@@ -50,6 +50,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include "bridge.h"
+#include "guard.h"
 #include "captive.h"
 #include "dhcp.h"
 #include "eapol.h"
