@@ -184,6 +184,40 @@ static void test_ad_edges(void) {
     x.kind = HCI_DEV_LE;
     for (int i = 0; i < HCI_SEEN_MAX + 5; i++) { x.addr[0] = (uint8_t)i; x.addr[1] = (uint8_t)(i >> 8); hci_seen_add(&gSeen, &x); }
     CHECK(gSeen.n == HCI_SEEN_MAX && gSeen.overflow);
+
+    // A crowd: 1000 LE advertisers of every strength, then a keyboard and a mouse (classic) turn up late. The list
+    // stays bounded, the classic devices get in, and the strongest LE devices are the ones kept.
+    memset(&gSeen, 0, sizeof gSeen);
+    srand(99);
+    for (int i = 0; i < 1000; i++) {
+        memset(&x, 0, sizeof x);
+        x.kind = HCI_DEV_LE;
+        x.addr[0] = (uint8_t)i; x.addr[1] = (uint8_t)(i >> 8); x.addr[2] = 7;
+        x.rssi = (int8_t)(-100 + (i % 70));   // -100 .. -31
+        hci_seen_add(&gSeen, &x);
+    }
+    CHECK(gSeen.n == HCI_SEEN_MAX && gSeen.overflow);
+    for (int c = 0; c < 2; c++) {
+        memset(&x, 0, sizeof x);
+        x.kind = HCI_DEV_CLASSIC;
+        x.addr[0] = (uint8_t)(0xA0 + c);
+        x.rssi = -90;
+        hci_seen_add(&gSeen, &x);
+    }
+    int classic = 0, weakest_le = 0;
+    for (int i = 0; i < gSeen.n; i++) {
+        if (gSeen.dev[i].kind == HCI_DEV_CLASSIC) classic++;
+        else if (!weakest_le || gSeen.dev[i].rssi < weakest_le) weakest_le = gSeen.dev[i].rssi;
+    }
+    CHECK(gSeen.n == HCI_SEEN_MAX && classic == 2 && weakest_le > -100);
+    // classic devices only: the list fills, later ones are dropped, nothing overruns
+    memset(&gSeen, 0, sizeof gSeen);
+    for (int i = 0; i < 400; i++) {
+        memset(&x, 0, sizeof x);
+        x.kind = HCI_DEV_CLASSIC; x.addr[0] = (uint8_t)i; x.addr[1] = (uint8_t)(i >> 8);
+        hci_seen_add(&gSeen, &x);
+    }
+    CHECK(gSeen.n == HCI_SEEN_MAX && gSeen.overflow);
 }
 
 static void test_fuzz(void) {

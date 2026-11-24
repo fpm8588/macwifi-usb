@@ -1091,9 +1091,14 @@ static void bt_publish(const HciDevice *d) {
         return;
     }
     int slot = gBt.ndev < HCI_SEEN_MAX ? gBt.ndev++ : -1;
-    if (slot < 0) {                          // full: replace the oldest
-        slot = 0;
-        for (int i = 1; i < gBt.ndev; i++) if (gBt.seen[i] < gBt.seen[slot]) slot = i;
+    if (slot < 0) {                          // full (a crowd): replace the oldest LE advertiser, else the oldest
+        slot = -1;
+        for (int i = 0; i < gBt.ndev; i++)
+            if (gBt.dev[i].kind == HCI_DEV_LE && (slot < 0 || gBt.seen[i] < gBt.seen[slot])) slot = i;
+        if (slot < 0) {
+            slot = 0;
+            for (int i = 1; i < gBt.ndev; i++) if (gBt.seen[i] < gBt.seen[slot]) slot = i;
+        }
     }
     gBt.dev[slot] = *d;
     gBt.seen[slot] = t;

@@ -296,6 +296,22 @@ void hci_seen_add(HciSeen *s, const HciDevice *d) {
         hci_merge(e, d);
         return;
     }
-    if (s->n >= HCI_SEEN_MAX) { s->overflow = 1; return; }
+    if (s->n >= HCI_SEEN_MAX) {
+        // Full (a crowded room: phones and watches advertise constantly). Classic devices answer an inquiry once and
+        // are what people look for (keyboards, mice, headphones), so make room by dropping the weakest LE advertiser,
+        // and ignore a new LE one that isn't stronger. Unknown RSSI (127) counts as the weakest.
+        s->overflow = 1;
+        int w = -1;
+        for (int i = 0; i < s->n; i++) {
+            if (s->dev[i].kind != HCI_DEV_LE) continue;
+            int ri = s->dev[i].rssi == 127 ? -128 : s->dev[i].rssi;
+            if (w < 0 || ri < (s->dev[w].rssi == 127 ? -128 : s->dev[w].rssi)) w = i;
+        }
+        if (w < 0) return;
+        if (d->kind == HCI_DEV_LE && (d->rssi == 127 ? -128 : d->rssi) <= (s->dev[w].rssi == 127 ? -128 : s->dev[w].rssi))
+            return;
+        s->dev[w] = *d;
+        return;
+    }
     s->dev[s->n++] = *d;
 }

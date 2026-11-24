@@ -10,6 +10,10 @@
   its length) are written to macOS's network stack. Motivation: two kernel panics ("Bounds safety trap", macOS 27.2)
   while the service ran on an open public network; none without the service. The cause is not confirmed.
 
+- Crowded rooms: when the Bluetooth device list is full (hundreds of phones and watches advertising), the weakest or
+  oldest LE advertiser is dropped first, so a keyboard, mouse or headphones still show up. All unit tests (and the
+  connection simulator) also pass under AddressSanitizer and UBSan.
+
 **New**
 - Bluetooth, phase B1: `macwifictl bt` opens the adapter's own Bluetooth controller from user space (no kext),
   identifies it and lists nearby Bluetooth LE and classic devices. Plan: `docs/BLUETOOTH_PROMPT.md`.
